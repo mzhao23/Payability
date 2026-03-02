@@ -1,7 +1,5 @@
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const runtime = "nodejs";
-export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
 import { getDailyChangeData } from "@/lib/bigquery";
@@ -14,36 +12,40 @@ export async function GET() {
   try {
     console.log("[risk-report] START", new Date().toISOString());
 
-    // 1️⃣ BigQuery
+    // 1️⃣ Query BigQuery
     console.log("[risk-report] Querying BigQuery...");
     const rows = await getDailyChangeData();
+
     console.log("[risk-report] BigQuery done", {
-      rows_length: rows?.length,
+      rows_length: rows?.length ?? 0,
       ms: Date.now() - start,
     });
 
-    // 2️⃣ Risk Engine
+    // 2️⃣ Run risk engine
     console.log("[risk-report] Running risk engine...");
     const result = flagSuppliers(rows);
+
     console.log("[risk-report] Risk engine done", {
       total: result.total,
       flagged: result.flagged.length,
       ms: Date.now() - start,
     });
 
-    // 3️⃣ LLM (limit to avoid massive prompt)
+    // 3️⃣ Generate AI summary (limit to 20 to avoid huge prompt)
     console.log("[risk-report] Generating AI report...");
-    const report = await generateRiskReport(result.flagged.slice(0, 20));
+    const report = await generateRiskReport(
+      result.flagged.slice(0, 20)
+    );
+
     console.log("[risk-report] AI done", {
       ms: Date.now() - start,
     });
 
-    // 4️⃣ Return JSON with debug
+    // 4️⃣ Return structured JSON
     return NextResponse.json({
       success: true,
       report_date: new Date().toISOString(),
 
-      // 🔍 Debug block
       debug: {
         rows_length: rows?.length ?? 0,
         sample_rows: rows?.slice(0, 3) ?? [],
@@ -53,11 +55,11 @@ export async function GET() {
       summary: {
         total_suppliers: result.total,
         flagged_count: result.flagged.length,
+        unflagged_count: result.total - result.flagged.length,
       },
 
       ai_report: report,
 
-      // return first 10 for inspection
       flagged_details: result.flagged.slice(0, 10),
     });
   } catch (error: any) {
