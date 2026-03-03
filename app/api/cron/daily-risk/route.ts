@@ -5,7 +5,7 @@ export const dynamic = "force-dynamic";
 import { NextResponse } from "next/server";
 import { getDailyChangeData } from "@/lib/bigquery";
 import { flagSuppliers } from "@/lib/risk-engine";
-import { generateRiskReport } from "@/lib/ai-report";
+import { generateRiskReportJSON } from "@/lib/ai-report";
 import { supabaseAdmin } from "@/lib/supabase-admin";
 import type { FlaggedSupplier, DailyChangeRow } from "@/lib/risk-engine";
 
@@ -41,7 +41,7 @@ export async function GET() {
     // 3) AI report (limit top 20)
     console.log("[cron/daily-risk] Generating AI report...");
     const topFlagged: FlaggedSupplier[] = result.flagged.slice(0, 20);
-    const report = await generateRiskReport(topFlagged);
+    const report = await generateRiskReportJSON(topFlagged);
     console.log("[cron/daily-risk] AI report done", { ms: Date.now() - start });
 
     // 4) Insert agent_runs

@@ -1,8 +1,19 @@
 import { BigQuery } from "@google-cloud/bigquery";
 
-const bigquery = new BigQuery({
-  projectId: process.env.GOOGLE_CLOUD_PROJECT || "bigqueryexport-183608",
-});
+function getBigQueryClient() {
+  const projectId = process.env.GOOGLE_CLOUD_PROJECT || "bigqueryexport-183608";
+
+  // Vercel 环境：用环境变量里的凭证
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON) {
+    const credentials = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
+    return new BigQuery({ projectId, credentials });
+  }
+
+  // 本地环境：自动使用 gcloud auth 的凭证
+  return new BigQuery({ projectId });
+}
+
+const bigquery = getBigQueryClient();
 
 export async function getDailyChangeData() {
   const query = `
