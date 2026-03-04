@@ -1,0 +1,155 @@
+# ============================================================
+# Table Schema Configuration
+# Edit this file if the table structure changes or to add
+# business context to fields for better AI understanding.
+# ============================================================
+
+table:
+  project: "payabilitytest"
+  dataset: "tracking"
+  name: "test_tracking"
+  full_path: "payabilitytest.tracking.test_tracking"
+
+columns:
+  - name: tracking_id
+    type: STRING
+    business_note: >
+      Unique identifier for each shipping tracking label.
+      
+      Untracked order definition: tracking_id IS NULL only.
+      DO NOT use pickup_timestamp IS NULL as untracked indicator.
+      pickup_timestamp IS NULL simply means the order has not been 
+      picked up yet, which is normal for recent orders.
+
+  - name: init_timestamp
+    type: STRING
+    business_note: >
+      Timestamp when the shipping label was first created.
+      MUST cast with SAFE.PARSE_TIMESTAMP before any date arithmetic.
+      This is the starting point for all timing calculations.
+
+  - name: pickup_timestamp
+    type: STRING
+    business_note: >
+      Timestamp when the carrier picked up the package.
+      NULL means the package has not been picked up yet - this is normal for recent orders.
+
+      Overdue unpickup definition (ALL conditions must be true):
+      1. pickup_timestamp IS NULL
+      2. delivery_timestamp IS NULL
+      3. DATE(init_timestamp) = report date (today only, not historical dates)
+      4. init_timestamp is older than 48 hours from CURRENT_TIMESTAMP()
+
+      WARNING: NEVER count all historical undelivered orders.
+      ALWAYS filter to the current reporting date only.
+      Example:
+      WHERE pickup_timestamp IS NULL
+      AND delivery_timestamp IS NULL
+      AND DATE(SAFE.PARSE_TIMESTAMP('%FT%T%Ez', init_timestamp)) = CURRENT_DATE()
+      AND SAFE.PARSE_TIMESTAMP('%FT%T%Ez', init_timestamp) < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
+
+  - name: delivery_timestamp
+    type: STRING
+    business_note: >
+      Timestamp when the package was delivered to the destination.
+      NULL means the package has not been delivered yet.
+
+  - name: order_date
+    type: STRING
+    business_note: "Date the order was placed. MUST cast before date arithmetic."
+
+  - name: order_id
+    type: STRING
+    business_note: >
+      Identifier for the customer order.
+      ONE order can contain MULTIPLE packages (multiple tracking_ids).
+      Always deduplicate at order_id level when calculating dollar amounts
+      to avoid overcounting.
+
+  - name: package_id
+    type: STRING
+    business_note: >
+      Identifier for an individual package within an order.
+      Relationship to order_id is many-to-one.
+
+  - name: total_cost
+    type: STRING
+    business_note: >
+      Order value. Format is "14.95 USD" (number + space + currency).
+      To cast to numeric, split by space and take the first part:
+      SAFE_CAST(SPLIT(total_cost, ' ')[OFFSET(0)] AS FLOAT64)
+      Never use SAFE_CAST(total_cost AS FLOAT64) directly as it will return null.
+
+  - name: supplier_key
+    type: STRING
+    business_note: >
+      Unique identifier for the merchant/seller.
+      All risk metrics must be grouped by supplier_key.
+
+  - name: carrier
+    type: STRING
+    business_note: >
+      The shipping carrier used (e.g. UPS, FedEx, USPS, Amazon).
+      Amazon carrier shipments have no external tracking.
+      Exclude Amazon from timing anomaly calculations.
+      A supplier switching to Amazon carrier will show a spike
+      in untracked orders but this is considered lower risk.
+
+  - name: used_proxy
+    type: STRING
+    business_note: "Indicates if a proxy was used for this shipment."
+
+  - name: package_items
+    type: RECORD
+    business_note: "Nested record containing individual item details within the package."
+
+  - name: origin_location
+    type: RECORD
+    business_note: "Nested record containing the shipment origin address."
+
+  - name: destination_address
+    type: RECORD
+    business_note: "Nested record containing the delivery destination address."
+
+  - name: destination_address__st
+    type: STRING
+    business_note: "State field of the destination address."
+
+  - name: sk
+    type: STRING
+    business_note: "DynamoDB sort key. Not used for risk analysis."
+
+  - name: pk
+    type: STRING
+    business_note: "DynamoDB partition key. Not used for risk analysis."
+
+  - name: lsi0sk
+    type: STRING
+    business_note: "DynamoDB local secondary index key. Not used for risk analysis."
+
+  - name: ttl
+    type: INTEGER
+    business_note: "DynamoDB TTL expiry field. Not used for risk analysis."
+
+  # Internal SCD fields - for data pipeline use only
+  - name: _sdc_received_at
+    type: TIMESTAMP
+    business_note: "When this record was received by the data pipeline. Always filter _sdc_deleted_at IS NULL."
+
+  - name: _sdc_batched_at
+    type: TIMESTAMP
+    business_note: "When this record was batched by the data pipeline."
+
+  - name: _sdc_sequence
+    type: INTEGER
+    business_note: "Pipeline sequence number."
+
+  - name: _sdc_table_version
+    type: INTEGER
+    business_note: "Pipeline table version."
+
+  - name: _sdc_deleted_at
+    type: STRING
+    business_note: >
+      If NOT NULL, this record has been soft-deleted.
+      ALWAYS filter with WHERE _sdc_deleted_at IS NULL in every query.

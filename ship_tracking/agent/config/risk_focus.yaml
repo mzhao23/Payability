@@ -1,0 +1,85 @@
+# ============================================================
+# Risk Focus Configuration
+# Edit this file to adjust the agent's analysis focus.
+# No code changes required.
+# ============================================================
+
+table:
+  project: "payabilitytest"
+  dataset: "tracking"
+  name: "track_test"
+  full_path: "payabilitytest.tracking.track_test"
+
+# Thresholds for anomaly detection
+thresholds:
+  overdue_pickup_hours: 48        # Hours before unpickup order is flagged
+  high_value_order_usd: 500       # Order value threshold in USD
+  untracked_rate_alert: 0.10      # Flag if untracked rate exceeds 10%
+  cost_increase_alert: 0.30       # Flag if avg order value increases by 30%
+  lookback_days: 30               # Days of historical data for comparison
+
+# Risk focus areas
+# Each item is passed to Gemini as analysis context
+risk_focus:
+
+  - id: untracked_orders
+    name: "Untracked Orders Rate"
+    description: >
+      Calculate the percentage of untracked orders per supplier.
+      Untracked is defined as: has init_timestamp but missing tracking_id or pickup_timestamp.
+      Flag if the untracked rate is significantly higher than the 30-day historical average.
+    priority: HIGH
+
+  - id: high_value_items
+    name: "High Value Item Monitoring"
+    description: >
+      Monitor the average order value (total_cost) per supplier.
+      IMPORTANT: Deduplicate at the order_id level before calculating averages,
+      since one order can have multiple packages and would otherwise overcount dollar values.
+      Flag if the 7-day average increases more than 30% compared to the 30-day average.
+    priority: HIGH
+
+  - id: logistics_timing
+    name: "Logistics Timing Analysis"
+    description: >
+      Analyze timing across three stages per supplier:
+      1. init to pickup: hours from order creation to carrier pickup
+      2. pickup to delivery: hours from pickup to final delivery
+      3. Overdue unpickup: orders where init_timestamp is older than 48 hours with no pickup_timestamp.
+      Compare against historical averages and flag significant deviations.
+    priority: HIGH
+
+  - id: carrier_analysis
+    name: "Carrier Breakdown Analysis"
+    description: >
+      Break down timing and anomaly rates by carrier.
+      Amazon own-carrier shipments typically have no tracking - exclude these from timing anomaly calculations.
+      Identify if specific carriers show systemic delays affecting multiple suppliers.
+      Carrier-level delays should affect delivery times but generally not pickup times.
+      If a supplier shifts heavily to Amazon carrier, untracked rate may spike but risk is considered low - flag separately.
+    priority: MEDIUM
+
+  - id: order_package_ratio
+    name: "Order to Package Ratio Monitoring"
+    description: >
+      Monitor the number of package_ids per order_id per supplier.
+      An unusually high ratio may indicate order splitting behavior.
+      All dollar amount calculations must be deduplicated at the order_id level to avoid inflated values.
+    priority: MEDIUM
+
+# Report output requirements
+# These instructions tell Gemini how to structure its analysis output
+report:
+  risk_levels:
+    - HIGH
+    - MEDIUM
+    - LOW
+
+  required_sections:
+    - executive_summary      # One paragraph overall risk summary
+    - key_findings           # List of specific findings with evidence
+    - supplier_breakdown     # Risk ranking and details per supplier
+    - carrier_breakdown      # Timing and anomaly analysis per carrier
+    - recommendations        # Suggested actions
+
+  language: "English"

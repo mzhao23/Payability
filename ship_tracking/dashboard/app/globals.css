@@ -1,0 +1,47 @@
+/* 1. 必须排在最前面的 @import */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+/* 2. 主题定义 */
+@theme {
+  --font-sans: 'Inter', ui-sans-serif, system-ui;
+  --font-mono: 'JetBrains Mono', monospace;
+  
+  /* 自定义 Payability 品牌色调 */
+  --color-brand-primary: #4f46e5;
+  --color-risk-high: #ef4444;
+  --color-risk-medium: #f59e0b;
+  --color-risk-low: #10b981;
+}
+
+/* 3. 全局基础样式 */
+@layer base {
+  body {
+    @apply bg-slate-50 text-slate-900;
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+}
+
+/* 4. 组件级样式封装 */
+@layer components {
+  .glass-card {
+    @apply bg-white border border-slate-200/60 shadow-[0_2px_12px_-3px_rgba(0,0,0,0.04)] rounded-2xl transition-all duration-200;
+  }
+  
+  .mono { 
+    font-family: var(--font-mono); 
+  }
+
+  /* 针对表格滚动条的微调 */
+  .custom-scrollbar::-webkit-scrollbar {
+    height: 4px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    @apply bg-slate-200 rounded-full hover:bg-slate-300;
+  }
+}
