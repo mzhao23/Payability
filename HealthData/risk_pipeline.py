@@ -38,12 +38,9 @@ def risk_level(score: float) -> str:
         return "Medium"
     return "Low"
 
-def fetch_metrics() -> list[dict]:
+def fetch_metrics():
     query = f"""
-    DECLARE report_date DATE DEFAULT DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);
-
-    WITH latest AS (
-      SELECT
+    SELECT
         DATE(snapshot_date) AS report_date,
         mp_sup_key,
         policyViolation_status,
@@ -53,29 +50,13 @@ def fetch_metrics() -> list[dict]:
         contactResponseTime_status,
         productSafetyStatus_status,
         lateShipmentRate_status,
-        intellectualProperty_status,
-        snapshot_date,
-        ROW_NUMBER() OVER(
-          PARTITION BY DATE(snapshot_date), mp_sup_key
-          ORDER BY snapshot_date DESC
-        ) AS rn
-      FROM `{BIGQUERY_PROJECT}.{DATASET}.{TABLE}`
-      WHERE DATE(snapshot_date) = report_date
-    )
-    SELECT
-      report_date,
-      mp_sup_key,
-      policyViolation_status,
-      listingPolicyStatus_status,
-      customerServiceDissatisfactionRate_status,
-      returnDissatisfactionRate_status,
-      contactResponseTime_status,
-      productSafetyStatus_status,
-      lateShipmentRate_status,
-      intellectualProperty_status
-    FROM latest
-    WHERE rn = 1
+        intellectualProperty_status
+    FROM `{BIGQUERY_PROJECT}.{DATASET}.{TABLE}`
+    WHERE DATE(snapshot_date) >= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+    LIMIT 1000
     """
+    query_job = bq_client.query(query)
+    return [dict(row) for row in query_job]
 
     query_job = bq_client.query(query)
     return [dict(row) for row in query_job]
