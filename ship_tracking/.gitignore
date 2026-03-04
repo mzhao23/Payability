@@ -1,0 +1,12 @@
+# Secrets
+agent/.env
+agent/*.json
+
+# Python
+__pycache__/
+*.pyc
+.DS_Store
+
+# Node
+node_modules/
+.next/
