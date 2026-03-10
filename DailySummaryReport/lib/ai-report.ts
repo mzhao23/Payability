@@ -1,38 +1,43 @@
 // lib/ai-report.ts
-//import { anthropic } from "@ai-sdk/anthropic";
 import { generateText } from "ai";
 import type { FlaggedSupplier } from "@/lib/risk-engine";
-//import { openai } from "@ai-sdk/openai";
 
-export type RiskTier = "CRITICAL" | "HIGH" | "MONITOR";
+export type FinalMetricEntry = {
+  metric_id: string;
+  value: number | null;
+  unit: string;
+};
 
-export type RiskReportJSON = {
+export type FinalSupplierRiskReport = {
+  table_name: string;
+  supplier_key: string;
+  supplier_name: string;
+  report_date: string;
+  metrics: FinalMetricEntry[];
+  trigger_reason: string;
+  overall_risk_score: number;
+};
+
+export type RiskReportOutput = {
   report_date: string;
   suppliers_reviewed: number;
-  portfolio_summary: {
-    critical_count: number;
-    high_count: number;
-    monitor_count: number;
-    notes: string[];
-  };
-  suppliers: Array<{
-    supplier_key: string;
-    supplier_name: string;
-    risk_tier: RiskTier;
-    headline: string;
-    key_metrics: {
-      receivable: number;
-      chargeback: number;
-      computed_net_earning: number;
-      available_balance: number;
-      outstanding_balance: number;
-      receivable_wow_pct: number | null;
-      liability_wow_pct: number | null;
-    };
-    triggers: string[];
-    assessment: string[];
-    actions: string[];
-  }>;
+  suppliers: FinalSupplierRiskReport[];
+};
+
+type InputMetricForLLM = {
+  metric_id: string;
+  value: number | null;
+  unit: string;
+  explanation: string;
+  score_contribution: number;
+};
+
+type InputSupplierForLLM = {
+  supplier_key: string;
+  supplier_name: string;
+  overall_risk_score: number;
+  trigger_reasons: string[];
+  metrics: InputMetricForLLM[];
 };
 
 function safeNum(x: unknown): number {
@@ -40,102 +45,104 @@ function safeNum(x: unknown): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-function coerceTier(x: unknown): RiskTier {
-  return x === "CRITICAL" || x === "HIGH" || x === "MONITOR" ? x : "HIGH";
-}
-
 function stripCodeFences(s: string) {
   return s.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
 }
 
-/**
- * ✅ Main API: JSON structured report.
- */
+function dedupeStrings(arr: string[]): string[] {
+  return [...new Set(arr.map((x) => x.trim()).filter(Boolean))];
+}
+
 export async function generateRiskReportJSON(
-  flagged: FlaggedSupplier[],
-  opts?: { model?: string }
-): Promise<RiskReportJSON> {
+  flagged: FlaggedSupplier[]
+): Promise<RiskReportOutput> {
   const reportDate = new Date().toISOString().slice(0, 10);
 
-  const payload = flagged.map((s) => {
-    const receivable = safeNum(s.today_receivable);
-    const chargeback = safeNum(s.today_chargeback);
-    const computedNet = receivable - chargeback;
-
-    return {
-      supplier_key: s.supplier_key,
-      supplier_name: s.supplier_name,
-      receivable,
-      chargeback,
-      computed_net_earning: computedNet,
-      available_balance: safeNum(s.today_available_balance),
-      outstanding_balance: safeNum(s.today_outstanding_bal),
-      receivable_wow_pct: s.receivable_change_pct ?? null,
-      liability_wow_pct: s.liability_change_pct ?? null,
-      flag_reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
-    };
-  });
+  const payload: InputSupplierForLLM[] = flagged.map((s) => ({
+    supplier_key: s.supplier_key,
+    supplier_name: s.supplier_name,
+    overall_risk_score: safeNum(s.engine_suggested_risk_score),
+    trigger_reasons: Array.isArray(s.flag_reasons) ? s.flag_reasons : [],
+    metrics: Array.isArray(s.metrics)
+      ? s.metrics
+          .filter((m) => safeNum(m?.score_contribution) > 0)
+          .map((m) => ({
+            metric_id: String(m?.metric_id ?? ""),
+            value: m?.value === null ? null : safeNum(m?.value),
+            unit: String(m?.unit ?? ""),
+            explanation: String(m?.explanation ?? ""),
+            score_contribution: safeNum(m?.score_contribution ?? 0),
+          }))
+      : [],
+  }));
 
   const system = `
-You are a risk analyst.
-You MUST output valid JSON and NOTHING else (no markdown, no backticks, no commentary).
+You are a senior financial risk analyst at Payability.
+You MUST output valid JSON and NOTHING else.
+
+You are NOT responsible for recalculating the risk engine.
+The rule engine has already:
+- selected flagged suppliers
+- determined which metrics materially triggered
+- assigned an initial risk score
+
+Your role is only to:
+1) convert the structured triggered signals into a concise final trigger_reason
+2) lightly calibrate the final overall_risk_score
 
 Rules:
-- Do NOT invent triggers. "triggers" must be derived ONLY from input.flag_reasons (you may shorten/rephrase).
-- Use tiers:
-  - CRITICAL: immediate escalation/freeze recommended
-  - HIGH: manual review required within 24-72h
-  - MONITOR: watchlist
-
-Return a single JSON object exactly matching the schema.
+- Use ONLY the triggered metrics and trigger reasons already provided.
+- Do NOT invent new metrics, new numbers, or new risk drivers.
+- Do NOT include metrics with score_contribution = 0.
+- overall_risk_score must remain close to the engine score.
+- You may adjust the score by at most 1 point up or down.
+- If the engine score already matches the severity pattern, keep it unchanged.
+- Do NOT include recommendations.
 `.trim();
 
   const prompt = `
-Return JSON matching this schema:
+Return JSON matching this schema exactly:
 
 {
-  "report_date": string,
-  "suppliers_reviewed": number,
-  "portfolio_summary": {
-    "critical_count": number,
-    "high_count": number,
-    "monitor_count": number,
-    "notes": string[]
-  },
+  "report_date": "${reportDate}",
+  "suppliers_reviewed": ${payload.length},
   "suppliers": [
     {
+      "table_name": "vm_transaction_summary",
       "supplier_key": string,
       "supplier_name": string,
-      "risk_tier": "CRITICAL" | "HIGH" | "MONITOR",
-      "headline": string,
-      "key_metrics": {
-        "receivable": number,
-        "chargeback": number,
-        "computed_net_earning": number,
-        "available_balance": number,
-        "outstanding_balance": number,
-        "receivable_wow_pct": number|null,
-        "liability_wow_pct": number|null
-      },
-      "triggers": string[],
-      "assessment": string[],
-      "actions": string[]
+      "report_date": "${reportDate}",
+      "metrics": [
+        {
+          "metric_id": string,
+          "value": number|null,
+          "unit": string
+        }
+      ],
+      "trigger_reason": string,
+      "overall_risk_score": integer
     }
   ]
 }
 
-Constraints:
-- report_date must be "${reportDate}"
-- suppliers_reviewed must be ${payload.length}
+Rules:
 - suppliers array length must equal ${payload.length}
-- triggers must be based ONLY on flag_reasons for each supplier.
+- metrics must only include metrics from input where score_contribution > 0
+- each metric object must contain ONLY:
+  - metric_id
+  - value
+  - unit
+- trigger_reason should be one concise paragraph based only on the provided trigger reasons and metric facts
+- do not include recommendations
+- do not include engine_score_100
+- do not include engine_suggested_risk_score
+- overall_risk_score may differ from input score by at most 1 point
 
 Input suppliers:
 ${JSON.stringify(payload)}
 `.trim();
 
   const { text } = await generateText({
-    //model: openai("gpt-4o-mini"),
     model: "openai/gpt-4o-mini",
     system,
     prompt,
@@ -144,68 +151,79 @@ ${JSON.stringify(payload)}
 
   const raw = stripCodeFences(text);
 
-  let parsed: any;
+  let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
     const start = raw.indexOf("{");
     const end = raw.lastIndexOf("}");
-    if (start >= 0 && end > start) parsed = JSON.parse(raw.slice(start, end + 1));
-    else throw new Error("AI report is not valid JSON.");
+    if (start >= 0 && end > start) {
+      parsed = JSON.parse(raw.slice(start, end + 1));
+    } else {
+      throw new Error("AI report is not valid JSON.");
+    }
   }
 
-  const suppliers = Array.isArray(parsed?.suppliers) ? parsed.suppliers : [];
+  const parsedObj = (parsed ?? {}) as {
+    report_date?: string;
+    suppliers_reviewed?: number;
+    suppliers?: Array<{
+      table_name?: string;
+      supplier_key?: string;
+      supplier_name?: string;
+      report_date?: string;
+      metrics?: Array<{
+        metric_id?: string;
+        value?: number | null;
+        unit?: string;
+      }>;
+      trigger_reason?: string;
+      overall_risk_score?: number;
+    }>;
+  };
 
-  const report: RiskReportJSON = {
-    report_date: String(parsed?.report_date ?? reportDate),
-    suppliers_reviewed: safeNum(parsed?.suppliers_reviewed ?? payload.length),
-    portfolio_summary: {
-      critical_count: safeNum(parsed?.portfolio_summary?.critical_count),
-      high_count: safeNum(parsed?.portfolio_summary?.high_count),
-      monitor_count: safeNum(parsed?.portfolio_summary?.monitor_count),
-      notes: Array.isArray(parsed?.portfolio_summary?.notes)
-        ? parsed.portfolio_summary.notes.map(String)
-        : [],
-    },
-    suppliers: suppliers.map((x: any) => ({
-      supplier_key: String(x?.supplier_key ?? ""),
-      supplier_name: String(x?.supplier_name ?? ""),
-      risk_tier: coerceTier(x?.risk_tier),
-      headline: String(x?.headline ?? ""),
-      key_metrics: {
-        receivable: safeNum(x?.key_metrics?.receivable),
-        chargeback: safeNum(x?.key_metrics?.chargeback),
-        computed_net_earning: safeNum(x?.key_metrics?.computed_net_earning),
-        available_balance: safeNum(x?.key_metrics?.available_balance),
-        outstanding_balance: safeNum(x?.key_metrics?.outstanding_balance),
-        receivable_wow_pct:
-          x?.key_metrics?.receivable_wow_pct === null
-            ? null
-            : Number.isFinite(Number(x?.key_metrics?.receivable_wow_pct))
-            ? Number(x?.key_metrics?.receivable_wow_pct)
-            : null,
-        liability_wow_pct:
-          x?.key_metrics?.liability_wow_pct === null
-            ? null
-            : Number.isFinite(Number(x?.key_metrics?.liability_wow_pct))
-            ? Number(x?.key_metrics?.liability_wow_pct)
-            : null,
-      },
-      triggers: Array.isArray(x?.triggers) ? x.triggers.map(String) : [],
-      assessment: Array.isArray(x?.assessment) ? x.assessment.map(String) : [],
-      actions: Array.isArray(x?.actions) ? x.actions.map(String) : [],
-    })),
+  const suppliers = Array.isArray(parsedObj.suppliers) ? parsedObj.suppliers : [];
+
+  const report: RiskReportOutput = {
+    report_date: String(parsedObj.report_date ?? reportDate),
+    suppliers_reviewed: safeNum(parsedObj.suppliers_reviewed ?? payload.length),
+    suppliers: suppliers.map((x, idx) => {
+      const inputSupplier: InputSupplierForLLM | undefined = payload[idx];
+
+      const metrics: FinalMetricEntry[] = Array.isArray(x?.metrics)
+        ? x.metrics.map((m) => ({
+            metric_id: String(m?.metric_id ?? ""),
+            value: m?.value === null ? null : safeNum(m?.value),
+            unit: String(m?.unit ?? ""),
+          }))
+        : [];
+
+      const filteredMetrics = metrics.filter((m) =>
+        inputSupplier?.metrics?.some((im: { metric_id: string }) => im.metric_id === m.metric_id)
+      );
+
+      const fallbackTriggerReason = dedupeStrings([
+        ...(inputSupplier?.trigger_reasons ?? []),
+        "This supplier shows risk signals requiring review based on the triggered metrics above.",
+      ]).join(" ");
+
+      return {
+        table_name: "vm_transaction_summary",
+        supplier_key: String(x?.supplier_key ?? inputSupplier?.supplier_key ?? ""),
+        supplier_name: String(x?.supplier_name ?? inputSupplier?.supplier_name ?? ""),
+        report_date: String(x?.report_date ?? reportDate),
+        metrics: filteredMetrics,
+        trigger_reason: String(x?.trigger_reason ?? fallbackTriggerReason),
+        overall_risk_score: Math.max(
+          1,
+          Math.min(
+            10,
+            Math.round(safeNum(x?.overall_risk_score ?? inputSupplier?.overall_risk_score ?? 5))
+          )
+        ),
+      };
+    }),
   };
 
   return report;
-}
-
-/**
- * ✅ Compatibility alias (optional).
- * If any old code still imports generateRiskReport, it will still work.
- * You can remove this alias later once everything is migrated.
- */
-export async function generateRiskReport(flagged: FlaggedSupplier[]) {
-  const json = await generateRiskReportJSON(flagged);
-  return JSON.stringify(json, null, 2);
 }
