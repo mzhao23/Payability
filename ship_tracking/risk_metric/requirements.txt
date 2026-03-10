@@ -1,0 +1,4 @@
+google-cloud-bigquery
+supabase
+python-dotenv
+openai>=1.0.0

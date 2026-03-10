@@ -1,0 +1,15 @@
+# Environment variables
+.env
+
+# BigQuery service account credentials
+*.json
+
+# Supabase migration files (local only)
+supabse/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
