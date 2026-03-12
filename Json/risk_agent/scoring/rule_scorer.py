@@ -159,11 +159,17 @@ def score(fs: FeatureSet) -> PreScoreResult:
     # ══════════════════════════════════════════════════════════════════════════
 
     # ── Performance metrics ───────────────────────────────────────────────────
-    if fs.order_defect_rate is not None:
-        if fs.order_defect_rate > ODR_THRESHOLD:
-            hard(8, f"ORDER_DEFECT_RATE: {fs.order_defect_rate:.2f}% > {ODR_THRESHOLD}% (Amazon red line)")
-        elif fs.order_defect_rate > ODR_ELEVATED:
-            soft(1, f"ORDER_DEFECT_RATE: {fs.order_defect_rate:.2f}% (elevated)")
+    # ODR: only evaluated using seller-fulfilled data from Performance Over Time.
+    # FBA-only sellers skip entirely. If no SF data available, skip — no fallback.
+    _odr = None
+    if not fs.is_fba_only:
+        _odr = fs.seller_fulfilled_odr  # None if no SF data → rule skipped
+
+    if _odr is not None:
+        if _odr > ODR_THRESHOLD:
+            hard(8, f"ORDER_DEFECT_RATE: {_odr:.2f}% > {ODR_THRESHOLD}% (Amazon red line, seller-fulfilled)")
+        elif _odr > ODR_ELEVATED:
+            soft(1, f"ORDER_DEFECT_RATE: {_odr:.2f}% (elevated, seller-fulfilled)")
 
     if fs.late_shipment_rate is not None:
         if fs.late_shipment_rate > LATE_SHIPMENT_THRESHOLD:

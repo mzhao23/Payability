@@ -30,7 +30,14 @@ class RiskReport(BaseModel):
     data_quality_flag: Optional[str] = None  # e.g. "login_error", "bank_page_error", "ok"
 
     def to_supabase_dict(self) -> dict:
-        d = self.model_dump()
-        # Supabase expects metrics as JSON-serialisable list
-        d["metrics"] = [m.model_dump() for m in self.metrics]
-        return d
+        """Return only the columns that exist in the Supabase risk table."""
+        return {
+            "table_name":         self.table_name,
+            "supplier_key":       self.supplier_key,
+            "mp_sup_key":         self.mp_sup_key,
+            "supplier_name":      self.supplier_name,
+            "report_date":        self.report_date,
+            "metrics":            [m.model_dump() for m in self.metrics],
+            "trigger_reason":     self.trigger_reason,
+            "overall_risk_score": self.overall_risk_score,
+        }

@@ -13,12 +13,15 @@ risk_agent/
 ├── .env.example                   # Copy to .env and fill in your values
 ├── supabase_migration.sql         # Run once in Supabase SQL editor
 │
+├── input/                         # Auto-saved BQ snapshots for regression testing
+│   └── 2026-03-10.json            # One file per date, named by report date
+│
 ├── config/
 │   ├── settings.py                # Env-var loader
 │   └── models.py                  # Pydantic output models (RiskReport, Metric)
 │
 ├── extractors/
-│   ├── bq_loader.py               # BigQuery → two-query fetch (current rows + prev policy totals)
+│   ├── bq_loader.py               # BigQuery → two-query fetch + local file loader
 │   └── feature_extractor.py      # JSON data column → FeatureSet dataclass
 │
 ├── scoring/
@@ -56,7 +59,20 @@ Run `supabase_migration.sql` in your Supabase SQL editor.
 
 ### 4. Run the pipeline
 ```bash
+# Fetch latest data from BigQuery (default)
 python main.py
+
+# Fetch a specific date from BigQuery (saves snapshot to input/YYYY-MM-DD.json)
+python main.py --date 2026-03-10
+
+# Re-run using a saved local snapshot (no BQ cost)
+python main.py --source local
+
+# Re-run a specific date from local snapshot
+python main.py --source local --date 2026-03-10
+
+# Re-run using a specific local file
+python main.py --source local --input-file input/2026-03-10.json
 ```
 
 ### 5. Run tests (offline, no cloud required)
@@ -78,7 +94,7 @@ python -m pytest tests/ -v
 | `BQ_LOOKBACK_HOURS` | Only process rows newer than N hours (0 = all rows) |
 | `SUPABASE_URL` | Your Supabase project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key |
-| `SUPABASE_RISK_TABLE` | Target table name (default: `supplier_risk_reports`) |
+| `SUPABASE_RISK_TABLE` | Target table name (default: `json_risk_report`) |
 | `MAX_ROWS` | Max rows per run (0 = no limit) |
 | `DRY_RUN` | If `true`, skips writing to Supabase |
 | `LOG_LEVEL` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
@@ -88,10 +104,17 @@ python -m pytest tests/ -v
 
 The pipeline runs **two queries per run** to keep costs low:
 
-1. **Main query** — fetches all current-window rows with full columns
-2. **Prev policy query** — for each `mp_sup_key` in the current window, fetches the summed `policy_compliance` total from the immediately preceding record. Only scalar values are extracted in BQ (no full `data` column transfer), so this query is very lightweight.
+1. **Main query** — fetches one row per `mp_sup_key` for the target window (deduped via `ROW_NUMBER() ORDER BY create_ts DESC`), with all columns needed for feature extraction
+2. **Prev policy query** — for each `mp_sup_key` in the current window, fetches the summed `policy_compliance` total from the immediately preceding record. Only scalar values are extracted in BQ, keeping this query lightweight.
 
 The prev policy total is injected into each row as `prev_policy_total` before feature extraction, enabling cross-period compliance trend detection.
+
+### Regression Testing / Local Snapshots
+
+Every BQ run automatically saves the fetched rows to `input/<date>.json`. This allows you to:
+- Re-run the pipeline on historical data without hitting BigQuery
+- Test rule changes against the same input data
+- Debug issues on a specific day's dataset
 
 ## Scoring Mechanism
 
@@ -104,7 +127,7 @@ Hard rules represent clear, directional risk signals. Each hard rule sets the sc
 |---|---|---|
 | `ACCOUNT_STATUS` | Account not OK or Active | 8 |
 | `LOAN_PAST_DUE` | Past-due loan amount > $0 | 9 |
-| `ORDER_DEFECT_RATE` | ODR > 1% (Amazon red line) | 8 |
+| `ORDER_DEFECT_RATE` | Seller-fulfilled ODR > 1% (from Performance Over Time SF rows only; FBA-only or no SF data → skipped) | 8 |
 | `LATE_SHIPMENT_RATE` | LSR > 4% (Amazon red line) | 8 |
 | `NEG_FEEDBACK_TREND` | 30d neg rate ≥ 10pp above 60d window (min 10 orders) | 7 |
 | `PERF_DEGRADATION` | Account Health defect rate up ≥ 0.5pp WoW | 7 |
@@ -119,7 +142,7 @@ Soft rules add penalty points to the score. They represent weaker signals that a
 
 | Category | Rule | Condition | Points |
 |---|---|---|---|
-| Fulfillment | ODR elevated | 0.5–1% | +1 |
+| Fulfillment | ODR elevated (seller-fulfilled only) | 0.5–1% | +1 |
 | Fulfillment | LSR elevated | 2–4% | +1 |
 | Fulfillment | Cancellation rate | > 2.5% / 1.5–2.5% | +2 / +1 |
 | Fulfillment | Valid tracking rate | < 95% | +2 |
@@ -149,6 +172,12 @@ final = min(10, hard_floor + min(soft_penalty, soft_cap))
 ```
 
 A score of 10 requires `LOAN_PAST_DUE` (floor 9) + soft signals, or multiple hard rules stacking.
+
+### FBA vs Seller-Fulfilled ODR
+ODR is only evaluated using seller-fulfilled data from the `Performance Over Time` section:
+- **FBA-only sellers** (no seller-fulfilled orders): ODR skipped entirely
+- **Mixed or self-ship sellers with SF data**: uses `seller_fulfilled_odr` from Performance Over Time SF rows
+- **No SF data available**: ODR skipped — no fallback to global ODR field
 
 ### Data Quality Short-Circuit
 If the data collection returned an error flag, the supplier is scored directly — no rules evaluated, no LLM called:
@@ -182,7 +211,7 @@ Claude AI is only called when the rule engine pre-score is **≥ 5**. Rows scori
   "supplier_key": "uuid",
   "mp_sup_key": "uuid",
   "supplier_name": "Seller Name",
-  "report_date": "2026-03-02",
+  "report_date": "2026-03-10",
   "metrics": [
     {"metric_id": "order_defect_rate", "value": 0.13, "unit": "%"},
     {"metric_id": "feedback_negative_30d", "value": 18.5, "unit": "%"},
@@ -198,6 +227,53 @@ Claude AI is only called when the rule engine pre-score is **≥ 5**. Rows scori
 }
 ```
 
+## Supabase Table Setup
+
+Run this in Supabase SQL editor:
+
+```sql
+CREATE TABLE IF NOT EXISTS json_risk_report (
+    id                  BIGSERIAL PRIMARY KEY,
+    table_name          TEXT,
+    supplier_key        TEXT,
+    mp_sup_key          TEXT,
+    supplier_name       TEXT,
+    report_date         DATE,
+    metrics             JSONB,
+    trigger_reason      TEXT,
+    overall_risk_score  INT,
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (supplier_key, report_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_json_risk_report_mp_sup_key ON json_risk_report (mp_sup_key);
+CREATE INDEX IF NOT EXISTS idx_json_risk_report_report_date ON json_risk_report (report_date);
+CREATE INDEX IF NOT EXISTS idx_json_risk_report_score ON json_risk_report (overall_risk_score);
+```
+
+To clear all records and reset IDs:
+```sql
+TRUNCATE TABLE json_risk_report RESTART IDENTITY;
+```
+
+## Tooling
+
+**`export_reports.py`** — Download risk reports from Supabase to a local JSON file:
+```bash
+python export_reports.py                        # all reports
+python export_reports.py --date 2026-03-10      # specific date
+python export_reports.py --limit 100            # latest 100
+python export_reports.py --output my_file.json  # custom filename
+```
+
+**`sync_suppliers.py`** — Sync unique suppliers from BQ to a `suppliers` table. Tracks field changes in an append-only `notes` column:
+```bash
+python sync_suppliers.py                # last 3 days
+python sync_suppliers.py --days 7       # last 7 days
+python sync_suppliers.py --dry-run      # preview without writing
+python sync_suppliers.py --print-migration  # print setup SQL
+```
+
 ## Swapping AI Provider (Future: Vertex AI / Gemini)
 
 Only one function needs to change — `_call_llm()` in `agent/claude_agent.py`:
@@ -210,7 +286,7 @@ def _call_llm(user_message: str) -> str:
 
 # Future: Vertex AI / Gemini
 def _call_llm(user_message: str) -> str:
-    model = GenerativeModel("gemini-1.5-pro")
+    model = GenerativeModel("gemini-2.0-flash-001")
     response = model.generate_content([_SYSTEM_PROMPT, user_message])
     return response.text
 ```
