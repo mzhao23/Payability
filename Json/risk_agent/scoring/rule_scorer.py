@@ -25,15 +25,12 @@ from extractors.feature_extractor import FeatureSet
 POLICY_DELTA_HARD        = 5       # compliance total increase to trigger hard rule
 NEG_FEEDBACK_TREND_HARD  = 10.0    # pp increase in 30d vs prior 30d
 NEG_FEEDBACK_MIN_SAMPLE  = 10      # minimum orders for feedback rules
-PERF_DEGRADATION_HARD    = 0.5     # pp WoW defect rate increase
-B2B_RESERVE_CONSEC_HARD  = 2       # consecutive negative reserve periods
-B2B_RESERVE_AMOUNT_HARD  = 5000.0  # single-period negative reserve magnitude
+STMT_RESERVE_CONSEC_HARD  = 2       # consecutive negative reserve periods
+STMT_RESERVE_AMOUNT_HARD  = 5000.0  # single-period negative reserve magnitude
 
 # Soft rule thresholds
 ODR_THRESHOLD            = 1.0     # %
-ODR_ELEVATED             = 0.5     # %
 LATE_SHIPMENT_THRESHOLD  = 4.0     # %
-LATE_SHIPMENT_ELEVATED   = 2.0     # %
 CANCELLATION_THRESHOLD   = 2.5     # %
 CANCELLATION_ELEVATED    = 1.5     # %
 VALID_TRACKING_MIN       = 95.0    # %
@@ -123,17 +120,7 @@ def score(fs: FeatureSet) -> PreScoreResult:
             f"(+{fs.feedback_negative_trend_delta:.1f}pp, threshold +{NEG_FEEDBACK_TREND_HARD}pp, n={_neg_sample})"
         ))
 
-    # ── 4. Performance Over Time degradation ──────────────────────────────────
-    if fs.perf_over_time_defect_trend_delta is not None:
-        delta  = fs.perf_over_time_defect_trend_delta
-        recent = fs.perf_over_time_recent_defect_pct or 0
-        if delta >= PERF_DEGRADATION_HARD:
-            hard(7, (
-                f"PERF_DEGRADATION: defect rate {recent:.2f}% "
-                f"(+{delta:.2f}pp WoW, threshold +{PERF_DEGRADATION_HARD}pp)"
-            ))
-
-    # ── 5. Policy compliance increase ─────────────────────────────────────────
+    # ── 4. Policy compliance increase ─────────────────────────────────────────
     if fs.policy_total_delta is not None:
         if fs.policy_total_delta >= POLICY_DELTA_HARD:
             hard(7, (
@@ -143,17 +130,17 @@ def score(fs: FeatureSet) -> PreScoreResult:
             ))
 
     # ── 6. B2B Account Level Reserve ─────────────────────────────────────────
-    if fs.b2b_reserve_consecutive_negative >= B2B_RESERVE_CONSEC_HARD:
+    if fs.stmt_reserve_consecutive_negative >= STMT_RESERVE_CONSEC_HARD:
         hard(7, (
             f"ACCOUNT_LEVEL_RESERVE: negative reserve for "
-            f"{fs.b2b_reserve_consecutive_negative} consecutive periods "
-            f"(max ${fs.b2b_reserve_max_negative:,.0f}, threshold {B2B_RESERVE_CONSEC_HARD} periods)"
+            f"{fs.stmt_reserve_consecutive_negative} consecutive periods "
+            f"(max ${fs.stmt_reserve_max_negative:,.0f}, threshold {STMT_RESERVE_CONSEC_HARD} periods)"
         ))
-    elif fs.b2b_reserve_max_negative >= B2B_RESERVE_AMOUNT_HARD:
+    elif fs.stmt_reserve_max_negative >= STMT_RESERVE_AMOUNT_HARD:
         hard(7, (
             f"ACCOUNT_LEVEL_RESERVE: single-period reserve "
-            f"${fs.b2b_reserve_max_negative:,.0f} "
-            f"(threshold ${B2B_RESERVE_AMOUNT_HARD:,.0f})"
+            f"${fs.stmt_reserve_max_negative:,.0f} "
+            f"(threshold ${STMT_RESERVE_AMOUNT_HARD:,.0f})"
         ))
 
     # ── 7. Failed / cancelled disbursement ───────────────────────────────────
@@ -174,14 +161,10 @@ def score(fs: FeatureSet) -> PreScoreResult:
     if _odr is not None:
         if _odr > ODR_THRESHOLD:
             hard(8, f"ORDER_DEFECT_RATE: {_odr:.2f}% > {ODR_THRESHOLD}% (Amazon red line, seller-fulfilled)")
-        elif _odr > ODR_ELEVATED:
-            soft(1, f"ORDER_DEFECT_RATE: {_odr:.2f}% (elevated, seller-fulfilled)")
 
     if fs.late_shipment_rate is not None:
         if fs.late_shipment_rate > LATE_SHIPMENT_THRESHOLD:
             hard(8, f"LATE_SHIPMENT_RATE: {fs.late_shipment_rate:.2f}% > {LATE_SHIPMENT_THRESHOLD}% (Amazon red line)")
-        elif fs.late_shipment_rate > LATE_SHIPMENT_ELEVATED:
-            soft(1, f"LATE_SHIPMENT_RATE: {fs.late_shipment_rate:.2f}% (elevated)")
 
     if fs.cancellation_rate is not None:
         if fs.cancellation_rate > CANCELLATION_THRESHOLD:
@@ -235,21 +218,15 @@ def score(fs: FeatureSet) -> PreScoreResult:
     ):
         soft(1, f"DEFERRED_TRANSACTIONS: {fs.deferred_transactions_pct:.0f}% of balance deferred")
 
-    if fs.b2b_reserve_consecutive_negative == 1:
-        soft(1, f"ACCOUNT_LEVEL_RESERVE: 1 period with negative reserve (${fs.b2b_reserve_max_negative:,.0f})")
-    if fs.b2b_reserve_is_worsening and fs.b2b_reserve_consecutive_negative < B2B_RESERVE_CONSEC_HARD:
+    if fs.stmt_reserve_consecutive_negative == 1:
+        soft(1, f"ACCOUNT_LEVEL_RESERVE: 1 period with negative reserve (${fs.stmt_reserve_max_negative:,.0f})")
+    if fs.stmt_reserve_is_worsening and fs.stmt_reserve_consecutive_negative < STMT_RESERVE_CONSEC_HARD:
         soft(1, f"ACCOUNT_LEVEL_RESERVE: reserve worsening across periods")
 
     if fs.failed_disbursement_count == 0 and fs.unavailable_balance_amount >= 1000:
         soft(1, f"UNAVAILABLE_BALANCE: ${fs.unavailable_balance_amount:,.0f} in recent statement")
 
-    # ── Performance Over Time (no WoW data — single period elevated) ──────────
-    if fs.perf_over_time_defect_trend_delta is None and fs.perf_over_time_recent_defect_pct is not None:
-        recent = fs.perf_over_time_recent_defect_pct
-        if recent >= 1.0:
-            soft(2, f"PERF_OVER_TIME_HIGH: defect rate {recent:.2f}%")
-        elif recent >= 0.5:
-            soft(1, f"PERF_OVER_TIME_ELEVATED: defect rate {recent:.2f}%")
+
 
     # ── Customer complaints ────────────────────────────────────────────────────
     for label, val in [

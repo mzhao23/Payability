@@ -130,20 +130,17 @@ Hard rules represent clear, directional risk signals. Each hard rule sets the sc
 | `ORDER_DEFECT_RATE` | Seller-fulfilled ODR > 1% (from Performance Over Time SF rows only; FBA-only or no SF data → skipped) | 8 |
 | `LATE_SHIPMENT_RATE` | LSR > 4% (Amazon red line) | 8 |
 | `NEG_FEEDBACK_TREND` | 30d neg rate ≥ 10pp above 60d window (min 10 orders) | 7 |
-| `PERF_DEGRADATION` | Account Health defect rate up ≥ 0.5pp WoW | 7 |
 | `POLICY_COMPLIANCE_INCREASE` | Total policy violations up ≥ 5 vs previous BQ record | 7 |
-| `ACCOUNT_LEVEL_RESERVE` | Negative reserve in ≥ 2 consecutive B2B statement periods | 7 |
+| `ACCOUNT_LEVEL_RESERVE` | Negative reserve in ≥ 2 consecutive statement periods | 7 |
 | `ACCOUNT_LEVEL_RESERVE` | Single-period negative reserve > $5,000 | 7 |
-| `FAILED_DISBURSEMENT` | ≥ 2 cancelled/failed payout transfers | 7 |
-| `FAILED_DISBURSEMENT` | 1 cancelled/failed payout transfer | 6 |
+| `FAILED_DISBURSEMENT` | ≥ 2 cancelled/failed payout transfers within 90 days | 7 |
+| `FAILED_DISBURSEMENT` | 1 cancelled/failed payout transfer within 90 days | 6 |
 
 ### Soft Rules — additive penalty points
 Soft rules add penalty points to the score. They represent weaker signals that are only meaningful in combination.
 
 | Category | Rule | Condition | Points |
 |---|---|---|---|
-| Fulfillment | ODR elevated (seller-fulfilled only) | 0.5–1% | +1 |
-| Fulfillment | LSR elevated | 2–4% | +1 |
 | Fulfillment | Cancellation rate | > 2.5% / 1.5–2.5% | +2 / +1 |
 | Fulfillment | Valid tracking rate | < 95% | +2 |
 | Fulfillment | Delivered on time | < 85% | +1 |
@@ -155,9 +152,9 @@ Soft rules add penalty points to the score. They represent weaker signals that a
 | Policy | Violations increase | +2 to +4 vs prior record | +1 |
 | Notifications | High-risk notifications | ≥ 10 / 5–9 / 2–4 | +2 / +2 / +1 |
 | Payout | Deferred transactions | ≥ 50% and > $5,000 | +1 |
-| Payout | B2B reserve | 1 period negative | +1 |
-| Payout | B2B reserve | Worsening across periods | +1 |
-| Payout | Unavailable balance | ≥ $1,000 | +1 |
+| Payout | Reserve | 1 period negative | +1 |
+| Payout | Reserve | Worsening across periods | +1 |
+| Payout | Unavailable balance (most recent statement only) | ≥ $1,000 | +1 |
 | Account Health | Defect rate (no WoW data) | ≥ 1% / 0.5–1% | +2 / +1 |
 | Complaints | Authenticity/Safety/IP/Policy | Each > 0 | +1 each |
 
@@ -236,8 +233,8 @@ Claude AI is only called when the rule engine pre-score is **≥ 5**. Rows scori
     {"metric_id": "feedback_negative_trend_delta", "value": 12.3, "unit": "pp"},
     {"metric_id": "policy_compliance_total", "value": 14, "unit": null},
     {"metric_id": "policy_compliance_delta", "value": 6, "unit": null},
-    {"metric_id": "b2b_reserve_consecutive_negative", "value": 3, "unit": "periods"},
-    {"metric_id": "b2b_reserve_max_negative", "value": 8200.0, "unit": "USD"},
+    {"metric_id": "stmt_reserve_consecutive_negative", "value": 3, "unit": "periods"},
+    {"metric_id": "stmt_reserve_max_negative", "value": 8200.0, "unit": "USD"},
     {"metric_id": "failed_disbursement_count", "value": 2, "unit": null}
   ],
   "trigger_reason": "Negative feedback rate has increased 12.3pp in the last 30 days vs the prior 60-day window, and policy compliance violations have risen by 6 vs the previous record. Account level reserve has been negative for 3 consecutive statement periods.",

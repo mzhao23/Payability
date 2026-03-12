@@ -66,7 +66,7 @@ REQUIRED metrics to include (use null if data is unavailable):
   outstanding_loan_amount, past_due_amount,
   policy_compliance_total, policy_compliance_delta,
   sales_30_days, total_balance, funds_available,
-  b2b_reserve_consecutive_negative, b2b_reserve_max_negative, b2b_reserve_is_worsening,
+  stmt_reserve_consecutive_negative, stmt_reserve_max_negative, stmt_reserve_is_worsening,
   failed_disbursement_count,
   high_risk_notification_count, account_status
 
@@ -109,9 +109,9 @@ def _build_user_message(
         "total_balance_usd": fs.total_balance,
         "funds_available_usd": fs.funds_available,
         "recent_statement_deposits": fs.recent_deposits[:6],
-        "b2b_reserve_consecutive_negative": fs.b2b_reserve_consecutive_negative,
-        "b2b_reserve_max_negative_usd": fs.b2b_reserve_max_negative,
-        "b2b_reserve_is_worsening": fs.b2b_reserve_is_worsening,
+        "stmt_reserve_consecutive_negative": fs.stmt_reserve_consecutive_negative,
+        "stmt_reserve_max_negative_usd": fs.stmt_reserve_max_negative,
+        "stmt_reserve_is_worsening": fs.stmt_reserve_is_worsening,
         "failed_disbursement_count": fs.failed_disbursement_count,
         "unavailable_balance_usd": fs.unavailable_balance_amount,
         # Feedback
@@ -423,8 +423,8 @@ def _build_fallback_metrics(fs: FeatureSet) -> list[Metric]:
         Metric(metric_id="past_due_amount",                  value=fs.past_due_amount,                      unit="USD"),
         Metric(metric_id="policy_compliance_total",          value=fs.curr_policy_total,                    unit=None),
         Metric(metric_id="policy_compliance_delta",          value=fs.policy_total_delta,                   unit=None),
-        Metric(metric_id="b2b_reserve_consecutive_negative", value=fs.b2b_reserve_consecutive_negative,     unit="periods"),
-        Metric(metric_id="b2b_reserve_max_negative",         value=fs.b2b_reserve_max_negative or None,     unit="USD"),
+        Metric(metric_id="stmt_reserve_consecutive_negative", value=fs.stmt_reserve_consecutive_negative,     unit="periods"),
+        Metric(metric_id="stmt_reserve_max_negative",         value=fs.stmt_reserve_max_negative or None,     unit="USD"),
         Metric(metric_id="failed_disbursement_count",        value=fs.failed_disbursement_count or None,    unit=None),
         Metric(metric_id="high_risk_notification_count",     value=fs.high_risk_notification_count,         unit=None),
         Metric(metric_id="account_status",                   value=fs.account_status,                       unit=None),

@@ -125,6 +125,11 @@ class FeatureSet:
     deferred_transactions_amount: Optional[float] = None  # from StatementsSummary
     deferred_transactions_pct: Optional[float] = None     # deferred / total balance
     account_level_reserve_amount: float = 0.0             # max reserve seen across statements
+    # Regular Statements account level reserve history
+    stmt_reserve_periods: list[float] = field(default_factory=list)
+    stmt_reserve_consecutive_negative: int = 0
+    stmt_reserve_max_negative: float = 0.0
+    stmt_reserve_is_worsening: bool = False
     unavailable_balance_amount: float = 0.0               # max unavailable seen across statements
     failed_disbursement_count: int = 0                    # count of cancelled/failed transfers in statements
 
@@ -166,6 +171,8 @@ class FeatureSet:
     negative_feedback_orders_short_term: Optional[float] = None
     a_to_z_orders_short_term: Optional[float] = None
 
+
+FAILED_DISB_WINDOW_DAYS = 90   # only count failed disbursements within this many days
 
 # ── Risk notification keywords ─────────────────────────────────────────────────
 
@@ -487,22 +494,50 @@ def extract_features(row: dict) -> FeatureSet:
         if deferred_amt and total_amt and total_amt > 0:
             fs.deferred_transactions_pct = deferred_amt / total_amt * 100
 
+    from datetime import datetime, timedelta, timezone
+    _now = datetime.now(timezone.utc)
+    _disb_cutoff = _now - timedelta(days=FAILED_DISB_WINDOW_DAYS)
+
+    stmt_reserve_values: list[float] = []
     for stmt in d.get("Statements", []):
         det = stmt.get("details", {}) or {}
+
         # Account Level Reserve
         reserve_str = det.get("Account Level Reserve", {}).get("Reserve", "$0") or "$0"
         reserve_amt = _money_to_float(reserve_str) or 0.0
         if reserve_amt > fs.account_level_reserve_amount:
             fs.account_level_reserve_amount = reserve_amt
-        # Unavailable balance
-        unavail_str = det.get("Closing Balance", {}).get("Unavailable balance", "$0") or "$0"
-        unavail_amt = _money_to_float(unavail_str) or 0.0
-        if unavail_amt > fs.unavailable_balance_amount:
-            fs.unavailable_balance_amount = unavail_amt
-        # Failed/cancelled disbursement in InfoBox
-        infobox = det.get("InfoBox", "") or ""
-        if any(kw in infobox.lower() for kw in ["canceled your transfer", "cancelled your transfer", "failed disbursement"]):
-            fs.failed_disbursement_count += 1
+        stmt_reserve_values.append(reserve_amt)
+
+        # Unavailable balance — only from the most recent statement (first in list)
+        if stmt == d.get("Statements", [])[0]:
+            unavail_str = det.get("Closing Balance", {}).get("Unavailable balance", "$0") or "$0"
+            fs.unavailable_balance_amount = _money_to_float(unavail_str) or 0.0
+
+        # Failed/cancelled disbursement in InfoBox — only within time window
+        end_date_str = stmt.get("end_date", "") or ""
+        try:
+            stmt_end = datetime.strptime(end_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            within_window = stmt_end >= _disb_cutoff
+        except (ValueError, TypeError):
+            within_window = True  # if date unparseable, include it
+        if within_window:
+            infobox = det.get("InfoBox", "") or ""
+            if any(kw in infobox.lower() for kw in ["canceled your transfer", "cancelled your transfer", "failed disbursement"]):
+                fs.failed_disbursement_count += 1
+
+    if stmt_reserve_values:
+        fs.stmt_reserve_periods = stmt_reserve_values
+        consec = 0
+        for v in stmt_reserve_values:
+            if v < 0:
+                consec += 1
+            else:
+                break
+        fs.stmt_reserve_consecutive_negative = consec
+        fs.stmt_reserve_max_negative = abs(min(stmt_reserve_values))
+        if len(stmt_reserve_values) >= 2 and stmt_reserve_values[0] < 0 and stmt_reserve_values[1] < 0:
+            fs.stmt_reserve_is_worsening = stmt_reserve_values[0] < stmt_reserve_values[1]
 
     # ── 12. Loans ─────────────────────────────────────────────────────────────
     # Active loans
