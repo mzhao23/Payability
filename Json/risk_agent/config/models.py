@@ -21,7 +21,7 @@ class RiskReport(BaseModel):
     report_date: str  # ISO-8601 date string
     metrics: list[Metric] = Field(default_factory=list)
     trigger_reason: str
-    overall_risk_score: int = Field(ge=1, le=10)
+    overall_risk_score: float = Field(ge=1.0, le=10.0)
 
     # Internal housekeeping — stored in Supabase but not part of the public spec
     mp_sup_key: Optional[str] = None              # raw key from BQ source table

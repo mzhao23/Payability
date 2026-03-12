@@ -47,11 +47,19 @@ NOTIFICATIONS_HARD       = 10      # count for hard floor
 NOTIFICATIONS_SOFT_HI    = 5       # count for soft +2
 NOTIFICATIONS_SOFT_LO    = 2       # count for soft +1
 
+# Scoring formula caps
+SOFT_ONLY_MAX            = 6.0     # max score when no hard rules fire
+SOFT_WITH_HARD_MAX       = 6.0     # max soft_penalty considered when hard rules fire
+SCORE_MAX                = 10.0    # absolute ceiling
+HARD_FLOOR_DIVISOR       = 6.0     # divisor for additional hard rule floors
+SOFT_HARD_DIVISOR        = 6.0     # divisor for soft penalty when hard rules fire
+
 
 @dataclass
 class PreScoreResult:
-    preliminary_score: int = 1
+    preliminary_score: float = 1.0
     triggered_rules: list[str] = field(default_factory=list)
+    hard_floors: list[int] = field(default_factory=list)  # all fired hard rule floors
     # but may be scored based on error type alone.
 
 
@@ -81,7 +89,7 @@ def score(fs: FeatureSet) -> PreScoreResult:
     penalty = 0
 
     def hard(floor: int, msg: str) -> None:
-        result.preliminary_score = max(result.preliminary_score, floor)
+        result.hard_floors.append(floor)
         rules.append(msg)
 
     def soft(pts: int, msg: str) -> None:
@@ -160,10 +168,8 @@ def score(fs: FeatureSet) -> PreScoreResult:
 
     # ── Performance metrics ───────────────────────────────────────────────────
     # ODR: only evaluated using seller-fulfilled data from Performance Over Time.
-    # FBA-only sellers skip entirely. If no SF data available, skip — no fallback.
-    _odr = None
-    if not fs.is_fba_only:
-        _odr = fs.seller_fulfilled_odr  # None if no SF data → rule skipped
+    # If no SF data available (None), rule is skipped — no fallback to global ODR.
+    _odr = fs.seller_fulfilled_odr
 
     if _odr is not None:
         if _odr > ODR_THRESHOLD:
@@ -258,9 +264,16 @@ def score(fs: FeatureSet) -> PreScoreResult:
     # ══════════════════════════════════════════════════════════════════════════
     # Final score
     # ══════════════════════════════════════════════════════════════════════════
-    hard_fired = result.preliminary_score > 1
-    soft_cap   = 2 if hard_fired else 6
-    final = min(10, max(1, result.preliminary_score + min(penalty, soft_cap)))
+    if result.hard_floors:
+        # Hard path: max_floor + sum(other_floors)/6 + min(soft, SOFT_WITH_HARD_MAX)/6
+        sorted_floors = sorted(result.hard_floors, reverse=True)
+        max_floor   = sorted_floors[0]
+        other_sum   = sum(sorted_floors[1:])
+        final = min(SCORE_MAX, max_floor + other_sum / HARD_FLOOR_DIVISOR + min(penalty, SOFT_WITH_HARD_MAX) / SOFT_HARD_DIVISOR)
+    else:
+        # Soft only: capped at SOFT_ONLY_MAX — never exceeds the lowest hard rule floor
+        final = min(SOFT_ONLY_MAX, 1 + penalty)
+
     result.preliminary_score = final
 
     if not rules:

@@ -79,7 +79,7 @@ def _process_row(row: dict) -> tuple[str, str, RiskReport | None]:
             and pre.preliminary_score >= _LLM_SCORE_THRESHOLD
         )
         log.info(
-            "[%s] %s — score=%d/10 | flag=%s | llm=%s",
+            "[%s] %s — score=%.2f/10 | flag=%s | llm=%s",
             supplier_key[:8],
             (report.supplier_name or "?")[:30],
             report.overall_risk_score,
@@ -148,7 +148,7 @@ def run_pipeline(
 
     processed = 0
     errors = 0
-    scores: list[int] = []
+    scores: list[float] = []
 
     with ThreadPoolExecutor(max_workers=settings.PIPELINE_WORKERS) as executor:
         futures = {executor.submit(_process_row, row): row for row in rows}

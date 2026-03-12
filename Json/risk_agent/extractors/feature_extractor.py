@@ -156,10 +156,7 @@ class FeatureSet:
     inv_report_amazon_fulfilled_value: Optional[float] = None
 
     # Fulfillment type (from Performance Over Time)
-    perf_amazon_fulfilled_orders: int = 0      # FBA orders in most recent period
-    perf_seller_fulfilled_orders: int = 0      # self-ship orders in most recent period
-    is_fba_only: bool = False                  # True if no seller-fulfilled orders
-    seller_fulfilled_odr: Optional[float] = None  # ODR from Seller Fulfilled rows only
+    seller_fulfilled_odr: Optional[float] = None  # ODR from Seller Fulfilled rows only; None if no SF data
 
     # short/long term order metrics
     cancellation_orders_short_term: Optional[float] = None
@@ -447,13 +444,6 @@ def extract_features(row: dict) -> FeatureSet:
     pot = d.get("Performance Over Time", {})
     af_rows = pot.get("Amazon Fulfilled", [])
     sf_rows = pot.get("Seller Fulfilled", [])
-
-    # Fulfillment type — use most recent period's order counts
-    if af_rows:
-        fs.perf_amazon_fulfilled_orders = _safe_int(af_rows[0].get("Total Orders", "0") or "0") or 0
-    if sf_rows:
-        fs.perf_seller_fulfilled_orders = _safe_int(sf_rows[0].get("Total Orders", "0") or "0") or 0
-    fs.is_fba_only = fs.perf_amazon_fulfilled_orders > 0 and fs.perf_seller_fulfilled_orders == 0
 
     # Seller-fulfilled ODR: use most recent SF row that has actual order data (orders > 0)
     sf_with_orders = [

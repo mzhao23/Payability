@@ -55,7 +55,7 @@ OUTPUT FORMAT — respond ONLY with a valid JSON object, no markdown, no preambl
     {"metric_id": "<string>", "value": <number|string|null>, "unit": "<string|null>"}
   ],
   "trigger_reason": "<concise 2-4 sentence English explanation of the key risk drivers>",
-  "overall_risk_score": <integer 1-10>
+  "overall_risk_score": <float 1.0-10.0, e.g. 7.83>
 }
 
 REQUIRED metrics to include (use null if data is unavailable):
@@ -95,7 +95,7 @@ def _build_user_message(
         "two_step_verification": fs.two_step_verification,
         "all_accounts_in_us": fs.all_accounts_in_us,
         # Performance
-        "order_defect_rate_pct": fs.order_defect_rate,
+        "order_defect_rate_pct": fs.seller_fulfilled_odr,  # None for FBA-only sellers
         "late_shipment_rate_pct": fs.late_shipment_rate,
         "cancellation_rate_pct": fs.cancellation_rate,
         "valid_tracking_rate_pct": fs.valid_tracking_rate,
@@ -276,8 +276,8 @@ def analyse(
             for m in parsed.get("metrics", [])
         ]
 
-        score = int(parsed.get("overall_risk_score", pre.preliminary_score))
-        score = max(1, min(10, score))
+        score = float(parsed.get("overall_risk_score", pre.preliminary_score))
+        score = max(1.0, min(10.0, score))
 
         report = RiskReport(
             table_name=table_name,
@@ -410,7 +410,7 @@ def _fallback_report(
 
 def _build_fallback_metrics(fs: FeatureSet) -> list[Metric]:
     return [
-        Metric(metric_id="order_defect_rate",                value=fs.order_defect_rate,                    unit="%"),
+        Metric(metric_id="order_defect_rate",                value=fs.seller_fulfilled_odr,                 unit="%"),  # None for FBA-only sellers
         Metric(metric_id="late_shipment_rate",               value=fs.late_shipment_rate,                   unit="%"),
         Metric(metric_id="cancellation_rate",                value=fs.cancellation_rate,                    unit="%"),
         Metric(metric_id="valid_tracking_rate",              value=fs.valid_tracking_rate,                  unit="%"),

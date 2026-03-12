@@ -161,17 +161,35 @@ Soft rules add penalty points to the score. They represent weaker signals that a
 | Account Health | Defect rate (no WoW data) | ≥ 1% / 0.5–1% | +2 / +1 |
 | Complaints | Authenticity/Safety/IP/Policy | Each > 0 | +1 each |
 
-### Soft Cap
-To prevent soft rules from stacking a hard-rule case all the way to 10:
+### Scoring Formula
 
+Scores are **floats** (e.g. 8.33, 9.17) rounded to 2 decimal places.
+
+**Hard rules fired:**
 ```
-soft_cap = +2   if any hard rule fired
-soft_cap = +6   if no hard rules fired (pure soft max score = 7)
-
-final = min(10, hard_floor + min(soft_penalty, soft_cap))
+final = min(10, max_floor + sum(other_floors) / 6 + min(soft_penalty, 6) / 6)
 ```
+- `max_floor` — highest fired hard rule floor
+- `sum(other_floors) / 6` — every additional hard rule contributes its floor divided by 6
+- `min(soft_penalty, 6) / 6` — soft signals contribute at most +1 on top of hard rules
 
-A score of 10 requires `LOAN_PAST_DUE` (floor 9) + soft signals, or multiple hard rules stacking.
+**No hard rules (soft only):**
+```
+final = min(6.0, 1 + soft_penalty)
+```
+- Pure soft path maxes out at **6.0** — by design, never exceeds the lowest possible hard rule floor (6)
+
+**Examples:**
+
+| Case | Calculation | Score |
+|---|---|---|
+| Single floor 8, no soft | 8 + 0 + 0 | 8.0 |
+| Single floor 8, 2 soft | 8 + 0 + 2/6 | 8.33 |
+| Floor 8 + floor 6, no soft | 8 + 6/6 + 0 | 9.0 |
+| Floor 8 + floor 6, 2 soft | 8 + 6/6 + 2/6 | 9.33 |
+| Floor 9 + floor 8, no soft | 9 + 8/6 + 0 | 10.0 (capped) |
+| Soft only, 5 signals | 1 + 5 | 6.0 |
+| Soft only, 10 signals | 1 + 10 → capped | 6.0 |
 
 ### FBA vs Seller-Fulfilled ODR
 ODR is only evaluated using seller-fulfilled data from the `Performance Over Time` section:
@@ -223,7 +241,7 @@ Claude AI is only called when the rule engine pre-score is **≥ 5**. Rows scori
     {"metric_id": "failed_disbursement_count", "value": 2, "unit": null}
   ],
   "trigger_reason": "Negative feedback rate has increased 12.3pp in the last 30 days vs the prior 60-day window, and policy compliance violations have risen by 6 vs the previous record. Account level reserve has been negative for 3 consecutive statement periods.",
-  "overall_risk_score": 8
+  "overall_risk_score": 8.33
 }
 ```
 
@@ -241,7 +259,7 @@ CREATE TABLE IF NOT EXISTS json_risk_report (
     report_date         DATE,
     metrics             JSONB,
     trigger_reason      TEXT,
-    overall_risk_score  INT,
+    overall_risk_score  NUMERIC(5,2),
     created_at          TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE (supplier_key, report_date)
 );
