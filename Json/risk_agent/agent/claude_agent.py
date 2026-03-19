@@ -23,6 +23,7 @@ from tenacity import (
 )
 
 from config import settings
+from config.agent_config import cfg_int as _cfg_int
 from config.models import Metric, RiskReport
 from extractors.feature_extractor import FeatureSet
 from scoring.rule_scorer import PreScoreResult
@@ -72,6 +73,34 @@ REQUIRED metrics to include (use null if data is unavailable):
 
 You may add additional metrics if they are significant for the risk assessment.
 Do NOT include the raw_error or data_quality_flag in the metrics array.
+
+IMPORTANT JUDGEMENT GUIDELINES:
+1. Rule engine signals are alerts, not conclusions. Use them as starting points, not as
+   mechanical score inputs. Weigh them against the full picture.
+
+2. Prioritise current account health over historical events:
+   - If ODR, LSR, feedback, and account_status are all healthy, this is a strong positive
+     signal that should meaningfully offset historical flags.
+   - A seller with excellent current metrics should not score above 6 based solely on
+     historical issues unless there is evidence of ongoing risk.
+
+3. Interpreting failed_disbursements:
+   - Check statements_detail for context. If the failed disbursement was followed by
+     normal successful transfers in subsequent periods, treat it as a resolved historical
+     event, not an active risk.
+   - Only treat as active risk if the most recent statement(s) show a failed transfer.
+
+4. Interpreting reserve (stmt_reserve_periods_usd):
+   - Reserve being negative means Amazon is holding funds — this is common for high-volume
+     sellers and not inherently risky.
+   - Focus on whether the reserve is growing (worsening) or stable/shrinking.
+   - A large but stable reserve on a high-volume account is normal operational behaviour.
+
+5. Policy compliance:
+   - High violation counts are only meaningful if they are actively impacting the account
+     (e.g. listings removed, account suspended, enforcement actions in notifications).
+   - If the account status is OK and fulfillment metrics are healthy, elevated historic
+     violation counts should be treated as a moderate signal, not a critical one.
 """.strip()
 
 
@@ -113,7 +142,10 @@ def _build_user_message(
         "stmt_reserve_max_negative_usd": fs.stmt_reserve_max_negative,
         "stmt_reserve_is_worsening": fs.stmt_reserve_is_worsening,
         "failed_disbursement_count": fs.failed_disbursement_count,
+        "failed_disbursement_most_recent": fs.failed_disbursement_most_recent,
         "unavailable_balance_usd": fs.unavailable_balance_amount,
+        "statements_detail": fs.statements_detail,         # per-statement: period, reserve, deposit, infobox
+        "stmt_reserve_periods_usd": fs.stmt_reserve_periods,  # reserve amounts most-recent-first
         # Feedback
         "feedback_summary": fs.feedback_rating_summary,
         "feedback_positive_30d_pct": fs.feedback_positive_30d,
@@ -188,7 +220,7 @@ def _call_llm(user_message: str) -> str:
     """Call Claude and return the raw text response."""
     response = _client.messages.create(
         model=settings.ANTHROPIC_MODEL,
-        max_tokens=1500,
+        max_tokens=2000,
         system=_SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_message}],
     )
@@ -236,7 +268,7 @@ def analyse(
     # Skip LLM if score is below threshold AND no hard rules were triggered
     # Hard rules push score to 6+ on their own, so score>=5 also catches hard rule rows.
     # Threshold: preliminary_score >= 5 OR any hard rule triggered.
-    _LLM_SCORE_THRESHOLD = 5
+    _LLM_SCORE_THRESHOLD = _cfg_int("llm_score_threshold")
     _NO_RISK_MSG = "No significant risk indicators detected by rule engine."
 
     should_use_llm = pre.preliminary_score >= _LLM_SCORE_THRESHOLD
@@ -254,16 +286,34 @@ def analyse(
 
     user_msg = _build_user_message(fs, pre, table_name)
 
-    try:
-        raw_text = _call_llm(user_msg)
-        log.debug("Raw LLM response: %s", raw_text[:500])
-        parsed = _parse_llm_response(raw_text)
-    except Exception as exc:
+    parsed = None
+    last_exc = None
+    for attempt in range(1, 3):  # up to 2 attempts
+        try:
+            raw_text = _call_llm(user_msg)
+            log.debug("Raw LLM response (attempt %d): %s", attempt, raw_text[:500])
+            parsed = _parse_llm_response(raw_text)
+            break
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+            log.warning(
+                "LLM returned invalid JSON for supplier_key=%s (attempt %d/2): %s — retrying.",
+                fs.supplier_key, attempt, exc,
+            )
+        except Exception as exc:
+            last_exc = exc
+            log.error(
+                "LLM call failed for supplier_key=%s: %s — falling back to rule-only report.",
+                fs.supplier_key, exc,
+            )
+            return _fallback_report(fs, pre, table_name, error=str(exc))
+
+    if parsed is None:
         log.error(
-            "LLM call failed for supplier_key=%s: %s — falling back to rule-only report.",
-            fs.supplier_key, exc,
+            "LLM returned invalid JSON for supplier_key=%s after 2 attempts — falling back.",
+            fs.supplier_key,
         )
-        return _fallback_report(fs, pre, table_name, error=str(exc))
+        return _fallback_report(fs, pre, table_name, error=str(last_exc))
 
     # ── Validate and coerce ────────────────────────────────────────────────────
     try:

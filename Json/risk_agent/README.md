@@ -18,7 +18,11 @@ risk_agent/
 │
 ├── config/
 │   ├── settings.py                # Env-var loader
-│   └── models.py                  # Pydantic output models (RiskReport, Metric)
+│   ├── models.py                  # Pydantic output models (RiskReport, Metric)
+│   └── agent_config.py            # Dynamic config loader from json_risk_agent_config
+│
+├── sql/
+│   └── create_risk_agent_config.sql  # Run once to create + seed config table
 │
 ├── extractors/
 │   ├── bq_loader.py               # BigQuery → two-query fetch + local file loader
@@ -54,8 +58,10 @@ cp .env.example .env
 # Edit .env and fill in all values
 ```
 
-### 3. Set up Supabase table
-Run `supabase_migration.sql` in your Supabase SQL editor.
+### 3. Set up Supabase tables
+Run the following in your Supabase SQL editor:
+1. `supabase_migration.sql` — creates the `json_risk_report` output table
+2. `sql/create_risk_agent_config.sql` — creates and seeds the `json_risk_agent_config` tuning table
 
 ### 4. Run the pipeline
 ```bash
@@ -133,8 +139,7 @@ Hard rules represent clear, directional risk signals. Each hard rule sets the sc
 | `POLICY_COMPLIANCE_INCREASE` | Total policy violations up ≥ 5 vs previous BQ record | 7 |
 | `ACCOUNT_LEVEL_RESERVE` | Negative reserve in ≥ 2 consecutive statement periods | 7 |
 | `ACCOUNT_LEVEL_RESERVE` | Single-period negative reserve > $5,000 | 7 |
-| `FAILED_DISBURSEMENT` | ≥ 2 cancelled/failed payout transfers within 90 days | 7 |
-| `FAILED_DISBURSEMENT` | 1 cancelled/failed payout transfer within 90 days | 6 |
+| `FAILED_DISBURSEMENT` | Most recent closed statement is a failed disbursement | 7 |
 
 ### Soft Rules — additive penalty points
 Soft rules add penalty points to the score. They represent weaker signals that are only meaningful in combination.
@@ -152,10 +157,11 @@ Soft rules add penalty points to the score. They represent weaker signals that a
 | Policy | Violations increase | +2 to +4 vs prior record | +1 |
 | Notifications | High-risk notifications | ≥ 10 / 5–9 / 2–4 | +2 / +2 / +1 |
 | Payout | Deferred transactions | ≥ 50% and > $5,000 | +1 |
+| Payout | Failed disbursement | Historical (90d) but since recovered | +1 |
 | Payout | Reserve | 1 period negative | +1 |
 | Payout | Reserve | Worsening across periods | +1 |
 | Payout | Unavailable balance (most recent statement only) | ≥ $1,000 | +1 |
-| Account Health | Defect rate (no WoW data) | ≥ 1% / 0.5–1% | +2 / +1 |
+| Payout | Historical failed disbursement (recovered, within 90 days) | ≥ 1 | +1 |
 | Complaints | Authenticity/Safety/IP/Policy | Each > 0 | +1 each |
 
 ### Scoring Formula
@@ -207,6 +213,49 @@ If the data collection returned an error flag, the supplier is scored directly �
 
 ### LLM Usage
 Claude AI is only called when the rule engine pre-score is **≥ 5**. Rows scoring below 5 receive a rule-engine-only report. The LLM may adjust the final score up or down from the pre-score based on contextual analysis.
+
+The LLM receives the full feature set including per-statement detail (period, deposit, reserve, InfoBox) and reserve period history, enabling it to distinguish historical noise from active risk. It follows these judgement guidelines:
+
+1. **Rule engine signals are alerts, not conclusions** — weigh them against the full picture
+2. **Current account health takes priority** — healthy ODR, LSR, feedback, and account status meaningfully offset historical flags; a seller with excellent current metrics should not score above 6 based solely on historical issues
+3. **Failed disbursements** — if followed by normal successful transfers, treat as resolved; only flag as active risk if most recent statement shows a failed transfer
+4. **Reserve** — large but stable reserve on a high-volume account is normal; focus on whether it is growing (worsening) or stable/shrinking
+5. **Policy compliance** — high violation counts only matter if actively impacting the account (listings removed, enforcement actions); if account status is OK and fulfillment metrics are healthy, treat as moderate signal only
+
+## Dynamic Configuration
+
+All scoring thresholds, rule floors, and pipeline parameters are stored in the `json_risk_agent_config` Supabase table and loaded once at pipeline startup. If the table is unavailable, hardcoded defaults in `config/agent_config.py` are used as fallback.
+
+To tune a parameter, update the `value` column directly in Supabase — no code changes or redeployment needed:
+
+```sql
+UPDATE json_risk_agent_config SET value = 1.5 WHERE key = 'odr_threshold_pct';
+UPDATE json_risk_agent_config SET value = 10  WHERE key = 'llm_score_threshold';
+```
+
+### Key Parameters
+
+| Key | Default | Description |
+|---|---|---|
+| `floor_account_status` | 8 | Hard rule floor — account not OK/Active |
+| `floor_loan_past_due` | 9 | Hard rule floor — past-due loan |
+| `floor_order_defect_rate` | 8 | Hard rule floor — ODR > threshold |
+| `floor_late_shipment_rate` | 8 | Hard rule floor — LSR > threshold |
+| `floor_neg_feedback_trend` | 7 | Hard rule floor — feedback spike |
+| `floor_policy_compliance` | 7 | Hard rule floor — policy violations increase |
+| `floor_reserve_consecutive` | 7 | Hard rule floor — consecutive negative reserve |
+| `floor_reserve_amount` | 7 | Hard rule floor — large single-period reserve |
+| `floor_failed_disbursement` | 7 | Hard rule floor — most recent statement failed |
+| `odr_threshold_pct` | 1.0 | ODR % to trigger hard rule |
+| `late_shipment_threshold_pct` | 4.0 | LSR % to trigger hard rule |
+| `stmt_reserve_amount_hard_usd` | 5000 | Reserve USD to trigger hard rule |
+| `failed_disb_window_days` | 90 | Lookback window for failed disbursements |
+| `llm_score_threshold` | 5 | Min pre-score to trigger LLM analysis |
+| `soft_only_max` | 6.0 | Max score when no hard rules fire |
+| `score_max` | 10.0 | Absolute score ceiling |
+| `dq_score_not_authorized` | 8 | Score for not_authorized data quality flag |
+| `dq_score_login_error` | 7 | Score for login_error data quality flag |
+| `dq_score_default` | 3 | Default score for unknown data quality flags |
 
 ## Risk Score Guide
 

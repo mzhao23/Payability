@@ -31,6 +31,7 @@ import pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 
 from config import settings
+from config.agent_config import load_config, cfg_int as _cfg_int
 import argparse
 from extractors.bq_loader import fetch_rows, fetch_rows_from_file
 from extractors.feature_extractor import extract_features
@@ -46,6 +47,27 @@ TABLE_NAME = f"{settings.BQ_PROJECT_ID}.{settings.BQ_DATASET}.{settings.BQ_TABLE
 
 _lock = threading.Lock()
 
+# ── Checkpoint helpers ────────────────────────────────────────────────────────
+def _checkpoint_path(date_filter: str | None) -> pathlib.Path:
+    label = date_filter or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return pathlib.Path(__file__).parent / "checkpoints" / f"{label}.txt"
+
+def _load_checkpoint(date_filter: str | None) -> set[str]:
+    cp = _checkpoint_path(date_filter)
+    if cp.exists():
+        keys = {line.strip() for line in cp.read_text().splitlines() if line.strip()}
+        if keys:
+            log.info("Resuming from checkpoint — %d already processed", len(keys))
+        return keys
+    return set()
+
+def _save_checkpoint(date_filter: str | None, supplier_key: str) -> None:
+    cp = _checkpoint_path(date_filter)
+    cp.parent.mkdir(parents=True, exist_ok=True)
+    with _lock:
+        with cp.open("a") as f:
+            f.write(supplier_key + "\n")
+
 
 def _process_row(row: dict) -> tuple[str, str, RiskReport | None]:
     """
@@ -58,6 +80,16 @@ def _process_row(row: dict) -> tuple[str, str, RiskReport | None]:
         # Step 1: Feature extraction
         fs = extract_features(row)
 
+        # Skip suspended or missing account status — no assessment needed
+        if not fs.account_status or "suspend" in fs.account_status.lower():
+            log.info(
+                "[%s] %s — skipped (account_status=%r)",
+                supplier_key[:8],
+                (fs.supplier_name or fs.store_name or "?")[:30],
+                fs.account_status,
+            )
+            return supplier_key, "skipped", None
+
         # Step 2: Rule-based pre-scoring
         pre = rule_score(fs)
 
@@ -69,7 +101,7 @@ def _process_row(row: dict) -> tuple[str, str, RiskReport | None]:
         upsert_report(report)
 
         # Mirror the same logic used in claude_agent.py
-        _LLM_SCORE_THRESHOLD = 5
+        _LLM_SCORE_THRESHOLD = _cfg_int("llm_score_threshold")
         used_llm = (
             fs.data_quality_flag not in {
                 "login_error","not_authorized","wrong_password",
@@ -99,6 +131,7 @@ def run_pipeline(
     date_filter: str | None = None,
 ) -> None:
     start = time.time()
+    load_config()  # Load tuning params from Supabase once at startup
     log.info("=" * 60)
     log.info(
         "Risk Analysis Pipeline started at %s",
@@ -146,12 +179,19 @@ def run_pipeline(
 
     log.info("Loaded %d rows. Starting concurrent processing ...", len(rows))
 
-    processed = 0
+    # ── Resume from checkpoint if available ──────────────────────────────────
+    done_keys = _load_checkpoint(date_filter)
+    pending_rows = [r for r in rows if r.get("mp_sup_key") not in done_keys]
+    if done_keys:
+        log.info("Skipping %d already-processed rows, %d remaining", len(done_keys), len(pending_rows))
+
+    processed = len(done_keys)
     errors = 0
+    skipped = 0
     scores: list[float] = []
 
     with ThreadPoolExecutor(max_workers=settings.PIPELINE_WORKERS) as executor:
-        futures = {executor.submit(_process_row, row): row for row in rows}
+        futures = {executor.submit(_process_row, row): row for row in pending_rows}
 
         for future in as_completed(futures):
             supplier_key, status, report = future.result()
@@ -159,6 +199,10 @@ def run_pipeline(
                 processed += 1
                 if report:
                     scores.append(report.overall_risk_score)
+                _save_checkpoint(date_filter, supplier_key)
+            elif status == "skipped":
+                skipped += 1
+                _save_checkpoint(date_filter, supplier_key)
             else:
                 errors += 1
 
@@ -166,8 +210,8 @@ def run_pipeline(
 
     log.info("=" * 60)
     log.info(
-        "Pipeline finished in %.1fs (%.1f min) — processed=%d, errors=%d",
-        elapsed, elapsed / 60, processed, errors,
+        "Pipeline finished in %.1fs (%.1f min) — processed=%d, skipped=%d, errors=%d",
+        elapsed, elapsed / 60, processed, skipped, errors,
     )
     if scores:
         avg_score = sum(scores) / len(scores)

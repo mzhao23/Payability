@@ -82,6 +82,7 @@ class FeatureSet:
 
     # statement deposits (list of recent closed periods)
     recent_deposits: list[dict] = field(default_factory=list)   # [{period, amount}]
+    statements_detail: list[dict] = field(default_factory=list) # [{period, end_date, deposit, reserve, infobox}] most recent first
     total_balance: Optional[float] = None
     funds_available: Optional[float] = None
 
@@ -131,7 +132,8 @@ class FeatureSet:
     stmt_reserve_max_negative: float = 0.0
     stmt_reserve_is_worsening: bool = False
     unavailable_balance_amount: float = 0.0               # max unavailable seen across statements
-    failed_disbursement_count: int = 0                    # count of cancelled/failed transfers in statements
+    failed_disbursement_count: int = 0                    # count of cancelled/failed transfers in statements (90d)
+    failed_disbursement_most_recent: bool = False         # True if most recent closed statement is a failed disbursement
 
     # policy compliance trend (cross-period)
     curr_policy_total: Optional[int] = None       # sum of all policy_compliance fields
@@ -172,7 +174,7 @@ class FeatureSet:
     a_to_z_orders_short_term: Optional[float] = None
 
 
-FAILED_DISB_WINDOW_DAYS = 90   # only count failed disbursements within this many days
+# FAILED_DISB_WINDOW_DAYS moved to json_risk_agent_config Supabase table (key: failed_disb_window_days)
 
 # ── Risk notification keywords ─────────────────────────────────────────────────
 
@@ -495,36 +497,61 @@ def extract_features(row: dict) -> FeatureSet:
             fs.deferred_transactions_pct = deferred_amt / total_amt * 100
 
     from datetime import datetime, timedelta, timezone
+    from config.agent_config import cfg_int as _cfg_int
     _now = datetime.now(timezone.utc)
-    _disb_cutoff = _now - timedelta(days=FAILED_DISB_WINDOW_DAYS)
+    _disb_cutoff = _now - timedelta(days=_cfg_int("failed_disb_window_days"))
 
     stmt_reserve_values: list[float] = []
-    for stmt in d.get("Statements", []):
+    statements_list = d.get("Statements", [])
+    for stmt in statements_list:
         det = stmt.get("details", {}) or {}
 
         # Account Level Reserve
         reserve_str = det.get("Account Level Reserve", {}).get("Reserve", "$0") or "$0"
         reserve_amt = _money_to_float(reserve_str) or 0.0
-        if reserve_amt > fs.account_level_reserve_amount:
-            fs.account_level_reserve_amount = reserve_amt
+        # track max absolute reserve held (negative = Amazon holding funds)
+        if abs(reserve_amt) > fs.account_level_reserve_amount:
+            fs.account_level_reserve_amount = abs(reserve_amt)
         stmt_reserve_values.append(reserve_amt)
 
         # Unavailable balance — only from the most recent statement (first in list)
-        if stmt == d.get("Statements", [])[0]:
+        if stmt == statements_list[0]:
             unavail_str = det.get("Closing Balance", {}).get("Unavailable balance", "$0") or "$0"
             fs.unavailable_balance_amount = _money_to_float(unavail_str) or 0.0
 
         # Failed/cancelled disbursement in InfoBox — only within time window
         end_date_str = stmt.get("end_date", "") or ""
         try:
-            stmt_end = datetime.strptime(end_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            # Handle both "2026-03-13" and "2026-3-13" formats
+            parts = [int(x) for x in end_date_str.split("-")]
+            from datetime import date as _date
+            stmt_end = datetime(parts[0], parts[1], parts[2], tzinfo=timezone.utc)
             within_window = stmt_end >= _disb_cutoff
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, IndexError):
             within_window = True  # if date unparseable, include it
-        if within_window:
-            infobox = det.get("InfoBox", "") or ""
-            if any(kw in infobox.lower() for kw in ["canceled your transfer", "cancelled your transfer", "failed disbursement"]):
-                fs.failed_disbursement_count += 1
+
+        infobox = det.get("InfoBox", "") or ""
+        is_failed = any(kw in infobox.lower() for kw in ["canceled your transfer", "cancelled your transfer", "failed disbursement"])
+
+        if within_window and is_failed:
+            fs.failed_disbursement_count += 1
+
+        # Check if most recent closed statement is a failed disbursement
+        if not fs.failed_disbursement_most_recent:
+            stmt_status = det.get("Status", "") or stmt.get("ProcessingStatus", "") or ""
+            if stmt_status.lower() == "closed":
+                fs.failed_disbursement_most_recent = is_failed
+
+        # Build statements_detail for LLM context (most recent 8)
+        if len(fs.statements_detail) < 8:
+            fs.statements_detail.append({
+                "period": stmt.get("Settlement Period", ""),
+                "end_date": end_date_str,
+                "deposit_usd": _money_to_float(stmt.get("Deposit Total", "")) or 0.0,
+                "reserve_usd": reserve_amt,
+                "status": det.get("Status", ""),
+                "infobox": infobox[:120] if infobox else "",
+            })
 
     if stmt_reserve_values:
         fs.stmt_reserve_periods = stmt_reserve_values
