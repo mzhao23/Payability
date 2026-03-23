@@ -1,11 +1,11 @@
 """agent/claude_agent.py
 
-Sends the FeatureSet + pre-score context to Claude and parses the structured
+Sends the FeatureSet + pre-score context to an LLM and parses the structured
 JSON risk report back.
 
-The module is intentionally structured so that the AI provider can be swapped
-(e.g. Vertex AI / Gemini) by replacing _call_llm() without touching anything
-else in the codebase.
+Provider is controlled by the LLM_PROVIDER env var:
+  LLM_PROVIDER=claude   → Anthropic Claude (default)
+  LLM_PROVIDER=gemini   → Google Gemini (Google AI Studio)
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import re
 from typing import Any
 
 import anthropic
+from google import genai
+from google.genai import errors as genai_errors
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -23,14 +25,14 @@ from tenacity import (
 )
 
 from config import settings
+from config.agent_config import cfg_int as _cfg_int
+
 from config.models import Metric, RiskReport
 from extractors.feature_extractor import FeatureSet
 from scoring.rule_scorer import PreScoreResult
 from utils.logger import get_logger
 
 log = get_logger("claude_agent")
-
-_client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 _SYSTEM_PROMPT = """
@@ -55,7 +57,7 @@ OUTPUT FORMAT — respond ONLY with a valid JSON object, no markdown, no preambl
     {"metric_id": "<string>", "value": <number|string|null>, "unit": "<string|null>"}
   ],
   "trigger_reason": "<concise 2-4 sentence English explanation of the key risk drivers>",
-  "overall_risk_score": <integer 1-10>
+  "overall_risk_score": <float 1.0-10.0, e.g. 7.83>
 }
 
 REQUIRED metrics to include (use null if data is unavailable):
@@ -64,15 +66,62 @@ REQUIRED metrics to include (use null if data is unavailable):
   feedback_negative_30d, feedback_negative_60d_window, feedback_negative_trend_delta,
   feedback_count_30d,
   outstanding_loan_amount, past_due_amount,
-  policy_compliance_total, policy_compliance_delta,
+  policy_compliance_total,
   sales_30_days, total_balance, funds_available,
-  b2b_reserve_consecutive_negative, b2b_reserve_max_negative, b2b_reserve_is_worsening,
+  stmt_reserve_consecutive_negative, stmt_reserve_max_negative, stmt_reserve_is_worsening,
   failed_disbursement_count,
   high_risk_notification_count, account_status
 
 You may add additional metrics if they are significant for the risk assessment.
 Do NOT include the raw_error or data_quality_flag in the metrics array.
+
+IMPORTANT JUDGEMENT GUIDELINES:
+1. Rule engine signals are alerts, not conclusions. Use them as starting points, not as
+   mechanical score inputs. Weigh them against the full picture.
+
+2. Prioritise current account health over historical events:
+   - If ODR, LSR, feedback, and account_status are all healthy, this is a strong positive
+     signal that should meaningfully offset historical flags.
+   - A seller with excellent current metrics should not score above 6 based solely on
+     historical issues unless there is evidence of ongoing risk.
+
+3. Interpreting failed_disbursements:
+   - Check statements_detail for context. If the failed disbursement was followed by
+     normal successful transfers in subsequent periods, treat it as a resolved historical
+     event, not an active risk.
+   - Only treat as active risk if the most recent statement(s) show a failed transfer.
+
+4. Interpreting reserve (stmt_reserve_periods_usd):
+   - Reserve being negative means Amazon is holding funds — this is common for high-volume
+     sellers and not inherently risky.
+   - Focus on whether the reserve is growing (worsening) or stable/shrinking.
+   - A large but stable reserve on a high-volume account is normal operational behaviour.
+
+5. Policy compliance:
+   - Policy violation counts are provided for context ONLY — do NOT use them to drive
+     the risk score up. The rule engine has disabled policy compliance scoring because
+     violations cannot yet be distinguished by whether they impact account health.
+   - Food safety violations are especially common for food/grocery sellers and rarely
+     indicate real risk. Ignore them unless there is direct evidence of account suspension.
+   - Deferred transactions are normal under Amazon's DD+7 policy (payments held until
+     7 days after delivery). Do NOT treat deferred balance as a risk signal.
 """.strip()
+
+# ── Provider clients (initialised lazily based on LLM_PROVIDER) ──────────────
+_anthropic_client: anthropic.Anthropic | None = None
+_gemini_model: genai.Client | None = None
+
+def _get_anthropic_client() -> anthropic.Anthropic:
+    global _anthropic_client
+    if _anthropic_client is None:
+        _anthropic_client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    return _anthropic_client
+
+def _get_gemini_client() -> genai.Client:
+    global _gemini_model
+    if _gemini_model is None:
+        _gemini_model = genai.Client(api_key=settings.GEMINI_API_KEY)
+    return _gemini_model
 
 
 def _build_user_message(
@@ -95,7 +144,7 @@ def _build_user_message(
         "two_step_verification": fs.two_step_verification,
         "all_accounts_in_us": fs.all_accounts_in_us,
         # Performance
-        "order_defect_rate_pct": fs.order_defect_rate,
+        "order_defect_rate_pct": fs.seller_fulfilled_odr,  # None for FBA-only sellers
         "late_shipment_rate_pct": fs.late_shipment_rate,
         "cancellation_rate_pct": fs.cancellation_rate,
         "valid_tracking_rate_pct": fs.valid_tracking_rate,
@@ -109,11 +158,14 @@ def _build_user_message(
         "total_balance_usd": fs.total_balance,
         "funds_available_usd": fs.funds_available,
         "recent_statement_deposits": fs.recent_deposits[:6],
-        "b2b_reserve_consecutive_negative": fs.b2b_reserve_consecutive_negative,
-        "b2b_reserve_max_negative_usd": fs.b2b_reserve_max_negative,
-        "b2b_reserve_is_worsening": fs.b2b_reserve_is_worsening,
+        "stmt_reserve_consecutive_negative": fs.stmt_reserve_consecutive_negative,
+        "stmt_reserve_max_negative_usd": fs.stmt_reserve_max_negative,
+        "stmt_reserve_is_worsening": fs.stmt_reserve_is_worsening,
         "failed_disbursement_count": fs.failed_disbursement_count,
+        "failed_disbursement_most_recent": fs.failed_disbursement_most_recent,
         "unavailable_balance_usd": fs.unavailable_balance_amount,
+        "statements_detail": fs.statements_detail,         # per-statement: period, reserve, deposit, infobox
+        "stmt_reserve_periods_usd": fs.stmt_reserve_periods,  # reserve amounts most-recent-first
         # Feedback
         "feedback_summary": fs.feedback_rating_summary,
         "feedback_positive_30d_pct": fs.feedback_positive_30d,
@@ -177,22 +229,39 @@ def _parse_llm_response(text: str) -> dict:
     return json.loads(text[start:end])
 
 
-# ── LLM call — swap this function to change AI provider ───────────────────────
+# ── LLM call — provider selected via LLM_PROVIDER env var ───────────────────
 
 @retry(
-    retry=retry_if_exception_type((anthropic.RateLimitError, anthropic.APIStatusError)),
+    retry=retry_if_exception_type((
+        anthropic.RateLimitError, anthropic.APIStatusError,
+        genai_errors.APIError,
+    )),
     wait=wait_exponential(multiplier=2, min=4, max=60),
     stop=stop_after_attempt(4),
 )
 def _call_llm(user_message: str) -> str:
-    """Call Claude and return the raw text response."""
-    response = _client.messages.create(
-        model=settings.ANTHROPIC_MODEL,
-        max_tokens=1500,
-        system=_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
-    )
-    return response.content[0].text
+    """Call the configured LLM provider and return the raw text response."""
+    provider = settings.LLM_PROVIDER.lower()
+    if provider == "gemini":
+        response = _get_gemini_client().models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=user_message,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=_SYSTEM_PROMPT,
+                max_output_tokens=4000,
+                thinking_config=genai.types.ThinkingConfig(thinking_budget=0),  # disable thinking to save tokens
+            ),
+        )
+        return response.text
+    else:
+        # Default: Claude
+        response = _get_anthropic_client().messages.create(
+            model=settings.ANTHROPIC_MODEL,
+            max_tokens=2000,
+            system=_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        return response.content[0].text
 
 
 # ── Flags that mean there is nothing useful for the LLM to analyse -----------
@@ -236,7 +305,7 @@ def analyse(
     # Skip LLM if score is below threshold AND no hard rules were triggered
     # Hard rules push score to 6+ on their own, so score>=5 also catches hard rule rows.
     # Threshold: preliminary_score >= 5 OR any hard rule triggered.
-    _LLM_SCORE_THRESHOLD = 5
+    _LLM_SCORE_THRESHOLD = _cfg_int("llm_score_threshold")
     _NO_RISK_MSG = "No significant risk indicators detected by rule engine."
 
     should_use_llm = pre.preliminary_score >= _LLM_SCORE_THRESHOLD
@@ -254,16 +323,34 @@ def analyse(
 
     user_msg = _build_user_message(fs, pre, table_name)
 
-    try:
-        raw_text = _call_llm(user_msg)
-        log.debug("Raw LLM response: %s", raw_text[:500])
-        parsed = _parse_llm_response(raw_text)
-    except Exception as exc:
+    parsed = None
+    last_exc = None
+    for attempt in range(1, 3):  # up to 2 attempts
+        try:
+            raw_text = _call_llm(user_msg)
+            log.debug("Raw LLM response (attempt %d): %s", attempt, raw_text[:500])
+            parsed = _parse_llm_response(raw_text)
+            break
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+            log.warning(
+                "LLM returned invalid JSON for supplier_key=%s (attempt %d/2): %s — retrying.",
+                fs.supplier_key, attempt, exc,
+            )
+        except Exception as exc:
+            last_exc = exc
+            log.error(
+                "LLM call failed for supplier_key=%s: %s — falling back to rule-only report.",
+                fs.supplier_key, exc,
+            )
+            return _fallback_report(fs, pre, table_name, error=str(exc))
+
+    if parsed is None:
         log.error(
-            "LLM call failed for supplier_key=%s: %s — falling back to rule-only report.",
-            fs.supplier_key, exc,
+            "LLM returned invalid JSON for supplier_key=%s after 2 attempts — falling back.",
+            fs.supplier_key,
         )
-        return _fallback_report(fs, pre, table_name, error=str(exc))
+        return _fallback_report(fs, pre, table_name, error=str(last_exc))
 
     # ── Validate and coerce ────────────────────────────────────────────────────
     try:
@@ -276,8 +363,8 @@ def analyse(
             for m in parsed.get("metrics", [])
         ]
 
-        score = int(parsed.get("overall_risk_score", pre.preliminary_score))
-        score = max(1, min(10, score))
+        score = float(parsed.get("overall_risk_score", pre.preliminary_score))
+        score = max(1.0, min(10.0, score))
 
         report = RiskReport(
             table_name=table_name,
@@ -410,7 +497,7 @@ def _fallback_report(
 
 def _build_fallback_metrics(fs: FeatureSet) -> list[Metric]:
     return [
-        Metric(metric_id="order_defect_rate",                value=fs.order_defect_rate,                    unit="%"),
+        Metric(metric_id="order_defect_rate",                value=fs.seller_fulfilled_odr,                 unit="%"),  # None for FBA-only sellers
         Metric(metric_id="late_shipment_rate",               value=fs.late_shipment_rate,                   unit="%"),
         Metric(metric_id="cancellation_rate",                value=fs.cancellation_rate,                    unit="%"),
         Metric(metric_id="valid_tracking_rate",              value=fs.valid_tracking_rate,                  unit="%"),
@@ -423,8 +510,8 @@ def _build_fallback_metrics(fs: FeatureSet) -> list[Metric]:
         Metric(metric_id="past_due_amount",                  value=fs.past_due_amount,                      unit="USD"),
         Metric(metric_id="policy_compliance_total",          value=fs.curr_policy_total,                    unit=None),
         Metric(metric_id="policy_compliance_delta",          value=fs.policy_total_delta,                   unit=None),
-        Metric(metric_id="b2b_reserve_consecutive_negative", value=fs.b2b_reserve_consecutive_negative,     unit="periods"),
-        Metric(metric_id="b2b_reserve_max_negative",         value=fs.b2b_reserve_max_negative or None,     unit="USD"),
+        Metric(metric_id="stmt_reserve_consecutive_negative", value=fs.stmt_reserve_consecutive_negative,     unit="periods"),
+        Metric(metric_id="stmt_reserve_max_negative",         value=fs.stmt_reserve_max_negative or None,     unit="USD"),
         Metric(metric_id="failed_disbursement_count",        value=fs.failed_disbursement_count or None,    unit=None),
         Metric(metric_id="high_risk_notification_count",     value=fs.high_risk_notification_count,         unit=None),
         Metric(metric_id="account_status",                   value=fs.account_status,                       unit=None),

@@ -21,7 +21,7 @@ class RiskReport(BaseModel):
     report_date: str  # ISO-8601 date string
     metrics: list[Metric] = Field(default_factory=list)
     trigger_reason: str
-    overall_risk_score: int = Field(ge=1, le=10)
+    overall_risk_score: float = Field(ge=1.0, le=10.0)
 
     # Internal housekeeping — stored in Supabase but not part of the public spec
     mp_sup_key: Optional[str] = None              # raw key from BQ source table
@@ -30,7 +30,14 @@ class RiskReport(BaseModel):
     data_quality_flag: Optional[str] = None  # e.g. "login_error", "bank_page_error", "ok"
 
     def to_supabase_dict(self) -> dict:
-        d = self.model_dump()
-        # Supabase expects metrics as JSON-serialisable list
-        d["metrics"] = [m.model_dump() for m in self.metrics]
-        return d
+        """Return only the columns that exist in the Supabase risk table."""
+        return {
+            "table_name":         self.table_name,
+            "supplier_key":       self.supplier_key,
+            "mp_sup_key":         self.mp_sup_key,
+            "supplier_name":      self.supplier_name,
+            "report_date":        self.report_date,
+            "metrics":            [m.model_dump() for m in self.metrics],
+            "trigger_reason":     self.trigger_reason,
+            "overall_risk_score": self.overall_risk_score,
+        }

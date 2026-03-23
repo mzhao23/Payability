@@ -18,53 +18,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from extractors.feature_extractor import FeatureSet
-
-# ── Thresholds ─────────────────────────────────────────────────────────────────
-
-# Hard rule thresholds
-POLICY_DELTA_HARD        = 5       # compliance total increase to trigger hard rule
-NEG_FEEDBACK_TREND_HARD  = 10.0    # pp increase in 30d vs prior 30d
-NEG_FEEDBACK_MIN_SAMPLE  = 10      # minimum orders for feedback rules
-PERF_DEGRADATION_HARD    = 0.5     # pp WoW defect rate increase
-B2B_RESERVE_CONSEC_HARD  = 2       # consecutive negative reserve periods
-B2B_RESERVE_AMOUNT_HARD  = 5000.0  # single-period negative reserve magnitude
-
-# Soft rule thresholds
-ODR_THRESHOLD            = 1.0     # %
-ODR_ELEVATED             = 0.5     # %
-LATE_SHIPMENT_THRESHOLD  = 4.0     # %
-LATE_SHIPMENT_ELEVATED   = 2.0     # %
-CANCELLATION_THRESHOLD   = 2.5     # %
-CANCELLATION_ELEVATED    = 1.5     # %
-VALID_TRACKING_MIN       = 95.0    # %
-DELIVERED_ON_TIME_MIN    = 85.0    # %
-NEGATIVE_FEEDBACK_HIGH   = 10.0    # %
-NEGATIVE_FEEDBACK_ELEV   = 5.0     # %
-POLICY_DELTA_SOFT        = 2       # compliance total increase for soft signal
-DEFERRED_SOFT_PCT        = 50.0    # %
-DEFERRED_SOFT_AMT        = 5000.0  # USD
-NOTIFICATIONS_HARD       = 10      # count for hard floor
-NOTIFICATIONS_SOFT_HI    = 5       # count for soft +2
-NOTIFICATIONS_SOFT_LO    = 2       # count for soft +1
+from config.agent_config import cfg, cfg_int
 
 
 @dataclass
 class PreScoreResult:
-    preliminary_score: int = 1
+    preliminary_score: float = 1.0
     triggered_rules: list[str] = field(default_factory=list)
+    hard_floors: list[int] = field(default_factory=list)  # all fired hard rule floors
     # but may be scored based on error type alone.
 
 
-_DATA_QUALITY_SCORES: dict[str, int] = {
-    "not_authorized":  8,
-    "login_error":     7,
-    "wrong_password":  7,
-    "bank_page_error": 5,
-    "internal_error":  4,
-    "json_parse_error": 4,
-    "advance_only":    2,
-    "onboarding_only": 2,
-}
+# Data quality scores loaded dynamically from json_risk_agent_config via cfg()
 
 
 def score(fs: FeatureSet) -> PreScoreResult:
@@ -73,7 +38,7 @@ def score(fs: FeatureSet) -> PreScoreResult:
 
     # ── Data quality short-circuit ────────────────────────────────────────────
     if fs.data_quality_flag != "ok":
-        score_val = _DATA_QUALITY_SCORES.get(fs.data_quality_flag, 3)
+        score_val = cfg_int(f"dq_score_{fs.data_quality_flag}", cfg_int("dq_score_default"))
         result.preliminary_score = score_val
         rules.append(f"DATA_QUALITY: flag={fs.data_quality_flag} (score={score_val})")
         return result
@@ -81,7 +46,7 @@ def score(fs: FeatureSet) -> PreScoreResult:
     penalty = 0
 
     def hard(floor: int, msg: str) -> None:
-        result.preliminary_score = max(result.preliminary_score, floor)
+        result.hard_floors.append(floor)
         rules.append(msg)
 
     def soft(pts: int, msg: str) -> None:
@@ -95,102 +60,96 @@ def score(fs: FeatureSet) -> PreScoreResult:
 
     # ── 1. Account status ─────────────────────────────────────────────────────
     if fs.account_status and fs.account_status.upper() not in ("OK", "ACTIVE", ""):
-        hard(8, f"ACCOUNT_STATUS: '{fs.account_status}' (not OK/Active, threshold OK)")
+        hard(cfg_int("floor_account_status"), f"ACCOUNT_STATUS: '{fs.account_status}' (not OK/Active, threshold OK)")
 
     # ── 2. Loan past due ──────────────────────────────────────────────────────
     if fs.past_due_amount > 0:
-        hard(9, f"LOAN_PAST_DUE: past due amount = ${fs.past_due_amount:,.2f} (threshold >$0)")
+        hard(cfg_int("floor_loan_past_due"), f"LOAN_PAST_DUE: past due amount = ${fs.past_due_amount:,.2f} (threshold >$0)")
 
     # ── 3. Negative feedback trend (30d vs prior 30d) ─────────────────────────
     _neg_sample = fs.feedback_count_30d or 0
     if (
         fs.feedback_negative_trend_delta is not None
-        and _neg_sample >= NEG_FEEDBACK_MIN_SAMPLE
-        and fs.feedback_negative_trend_delta >= NEG_FEEDBACK_TREND_HARD
+        and _neg_sample >= cfg_int("neg_feedback_min_sample")
+        and fs.feedback_negative_trend_delta >= cfg("neg_feedback_trend_hard_pp")
     ):
         neg_30 = fs.feedback_negative_30d or 0
         prior  = neg_30 - fs.feedback_negative_trend_delta
-        hard(7, (
+        hard(cfg_int("floor_neg_feedback_trend"), (
             f"NEG_FEEDBACK_TREND: 30d neg rate {neg_30:.1f}% vs 60d window {prior:.1f}% "
-            f"(+{fs.feedback_negative_trend_delta:.1f}pp, threshold +{NEG_FEEDBACK_TREND_HARD}pp, n={_neg_sample})"
+            f"(+{fs.feedback_negative_trend_delta:.1f}pp, threshold +{cfg('neg_feedback_trend_hard_pp')}pp, n={_neg_sample})"
         ))
 
-    # ── 4. Performance Over Time degradation ──────────────────────────────────
-    if fs.perf_over_time_defect_trend_delta is not None:
-        delta  = fs.perf_over_time_defect_trend_delta
-        recent = fs.perf_over_time_recent_defect_pct or 0
-        if delta >= PERF_DEGRADATION_HARD:
-            hard(7, (
-                f"PERF_DEGRADATION: defect rate {recent:.2f}% "
-                f"(+{delta:.2f}pp WoW, threshold +{PERF_DEGRADATION_HARD}pp)"
-            ))
-
-    # ── 5. Policy compliance increase ─────────────────────────────────────────
-    if fs.policy_total_delta is not None:
-        if fs.policy_total_delta >= POLICY_DELTA_HARD:
-            hard(7, (
-                f"POLICY_COMPLIANCE_INCREASE: total violations up +{fs.policy_total_delta} "
-                f"vs prior record (curr={fs.curr_policy_total}, "
-                f"prev={fs.prev_policy_total}, threshold +{POLICY_DELTA_HARD})"
-            ))
+    # ── 4. Policy compliance increase ─────────────────────────────────────────
+    # TEMPORARILY DISABLED — policy violations not yet distinguished by health impact
+    # Re-enable when account_health_impact flag is available in data
+    # if fs.policy_total_delta is not None:
+    #     if fs.policy_total_delta >= cfg_int("policy_delta_hard"):
+    #         hard(cfg_int("floor_policy_compliance"), (
+    #             f"POLICY_COMPLIANCE_INCREASE: total violations up +{fs.policy_total_delta} "
+    #             f"vs prior record (curr={fs.curr_policy_total}, "
+    #             f"prev={fs.prev_policy_total}, threshold +{cfg_int('policy_delta_hard')})"
+    #         ))
 
     # ── 6. B2B Account Level Reserve ─────────────────────────────────────────
-    if fs.b2b_reserve_consecutive_negative >= B2B_RESERVE_CONSEC_HARD:
-        hard(7, (
+    if fs.stmt_reserve_consecutive_negative >= cfg_int("stmt_reserve_consec_hard"):
+        hard(cfg_int("floor_reserve_consecutive"), (
             f"ACCOUNT_LEVEL_RESERVE: negative reserve for "
-            f"{fs.b2b_reserve_consecutive_negative} consecutive periods "
-            f"(max ${fs.b2b_reserve_max_negative:,.0f}, threshold {B2B_RESERVE_CONSEC_HARD} periods)"
+            f"{fs.stmt_reserve_consecutive_negative} consecutive periods "
+            f"(max ${fs.stmt_reserve_max_negative:,.0f}, threshold {cfg_int('stmt_reserve_consec_hard')} periods)"
         ))
-    elif fs.b2b_reserve_max_negative >= B2B_RESERVE_AMOUNT_HARD:
-        hard(7, (
+    elif fs.stmt_reserve_max_negative >= cfg("stmt_reserve_amount_hard_usd"):
+        hard(cfg_int("floor_reserve_amount"), (
             f"ACCOUNT_LEVEL_RESERVE: single-period reserve "
-            f"${fs.b2b_reserve_max_negative:,.0f} "
-            f"(threshold ${B2B_RESERVE_AMOUNT_HARD:,.0f})"
+            f"${fs.stmt_reserve_max_negative:,.0f} "
+            f"(threshold ${cfg("stmt_reserve_amount_hard_usd"):,.0f})"
         ))
 
     # ── 7. Failed / cancelled disbursement ───────────────────────────────────
-    if fs.failed_disbursement_count >= 2:
-        hard(7, f"FAILED_DISBURSEMENT: {fs.failed_disbursement_count} cancelled transfers (threshold 2)")
-    elif fs.failed_disbursement_count == 1:
-        hard(6, f"FAILED_DISBURSEMENT: 1 cancelled/failed transfer detected")
+    # Most recent closed statement is a failed disbursement → active risk
+    if fs.failed_disbursement_most_recent:
+        hard(cfg_int("floor_failed_disbursement"), "FAILED_DISBURSEMENT: most recent closed statement is a failed disbursement")
+    # Historical failed disbursements within 90 days (but since recovered) → soft signal
+    elif fs.failed_disbursement_count >= 1:
+        soft(1, f"FAILED_DISBURSEMENT: {fs.failed_disbursement_count} historical failed transfer(s) in past 90 days (since recovered)")
 
     # ══════════════════════════════════════════════════════════════════════════
     # SOFT RULES — weak signals, additive penalty only
     # ══════════════════════════════════════════════════════════════════════════
 
     # ── Performance metrics ───────────────────────────────────────────────────
-    if fs.order_defect_rate is not None:
-        if fs.order_defect_rate > ODR_THRESHOLD:
-            hard(8, f"ORDER_DEFECT_RATE: {fs.order_defect_rate:.2f}% > {ODR_THRESHOLD}% (Amazon red line)")
-        elif fs.order_defect_rate > ODR_ELEVATED:
-            soft(1, f"ORDER_DEFECT_RATE: {fs.order_defect_rate:.2f}% (elevated)")
+    # ODR: only evaluated using seller-fulfilled data from Performance Over Time.
+    # If no SF data available (None), rule is skipped — no fallback to global ODR.
+    _odr = fs.seller_fulfilled_odr
+
+    if _odr is not None:
+        if _odr > cfg("odr_threshold_pct"):
+            hard(cfg_int("floor_order_defect_rate"), f"ORDER_DEFECT_RATE: {_odr:.2f}% > {cfg('odr_threshold_pct')}% (Amazon red line, seller-fulfilled)")
 
     if fs.late_shipment_rate is not None:
-        if fs.late_shipment_rate > LATE_SHIPMENT_THRESHOLD:
-            hard(8, f"LATE_SHIPMENT_RATE: {fs.late_shipment_rate:.2f}% > {LATE_SHIPMENT_THRESHOLD}% (Amazon red line)")
-        elif fs.late_shipment_rate > LATE_SHIPMENT_ELEVATED:
-            soft(1, f"LATE_SHIPMENT_RATE: {fs.late_shipment_rate:.2f}% (elevated)")
+        if fs.late_shipment_rate > cfg("late_shipment_threshold_pct"):
+            hard(cfg_int("floor_late_shipment_rate"), f"LATE_SHIPMENT_RATE: {fs.late_shipment_rate:.2f}% > {cfg('late_shipment_threshold_pct')}% (Amazon red line)")
 
     if fs.cancellation_rate is not None:
-        if fs.cancellation_rate > CANCELLATION_THRESHOLD:
-            soft(2, f"CANCELLATION_RATE: {fs.cancellation_rate:.2f}% > {CANCELLATION_THRESHOLD}%")
-        elif fs.cancellation_rate > CANCELLATION_ELEVATED:
+        if fs.cancellation_rate > cfg("cancellation_threshold_pct"):
+            soft(2, f"CANCELLATION_RATE: {fs.cancellation_rate:.2f}% > {cfg('cancellation_threshold_pct')}%")
+        elif fs.cancellation_rate > cfg("cancellation_elevated_pct"):
             soft(1, f"CANCELLATION_RATE: {fs.cancellation_rate:.2f}% (elevated)")
 
-    if fs.valid_tracking_rate is not None and fs.valid_tracking_rate < VALID_TRACKING_MIN:
-        soft(2, f"VALID_TRACKING_RATE: {fs.valid_tracking_rate:.2f}% < {VALID_TRACKING_MIN}%")
+    if fs.valid_tracking_rate is not None and fs.valid_tracking_rate < cfg("valid_tracking_min_pct"):
+        soft(2, f"VALID_TRACKING_RATE: {fs.valid_tracking_rate:.2f}% < {cfg('valid_tracking_min_pct')}%")
 
-    if fs.delivered_on_time is not None and fs.delivered_on_time < DELIVERED_ON_TIME_MIN:
-        soft(1, f"DELIVERED_ON_TIME: {fs.delivered_on_time:.1f}% < {DELIVERED_ON_TIME_MIN}%")
+    if fs.delivered_on_time is not None and fs.delivered_on_time < cfg("delivered_on_time_min_pct"):
+        soft(1, f"DELIVERED_ON_TIME: {fs.delivered_on_time:.1f}% < {cfg('delivered_on_time_min_pct')}%")
 
     if fs.two_step_verification and fs.two_step_verification.lower() not in ("active", ""):
         soft(1, f"TWO_STEP_VERIFICATION: status='{fs.two_step_verification}'")
 
     # ── Feedback ──────────────────────────────────────────────────────────────
-    if fs.feedback_negative_30d is not None and _neg_sample >= NEG_FEEDBACK_MIN_SAMPLE:
-        if fs.feedback_negative_30d > NEGATIVE_FEEDBACK_HIGH:
+    if fs.feedback_negative_30d is not None and _neg_sample >= cfg_int("neg_feedback_min_sample"):
+        if fs.feedback_negative_30d > cfg("negative_feedback_high_pct"):
             soft(2, f"NEGATIVE_FEEDBACK_30D: {fs.feedback_negative_30d:.1f}% (n={_neg_sample})")
-        elif fs.feedback_negative_30d > NEGATIVE_FEEDBACK_ELEV:
+        elif fs.feedback_negative_30d > cfg("negative_feedback_elev_pct"):
             soft(1, f"NEGATIVE_FEEDBACK_30D: {fs.feedback_negative_30d:.1f}% (elevated, n={_neg_sample})")
 
     # ── Loans ─────────────────────────────────────────────────────────────────
@@ -198,46 +157,34 @@ def score(fs: FeatureSet) -> PreScoreResult:
         soft(1, f"LOAN_OUTSTANDING: balance = ${fs.outstanding_loan_amount:,.0f}")
 
     # ── Policy compliance (absolute levels as weak signals) ───────────────────
-    if fs.curr_policy_total is not None and fs.curr_policy_total > 0:
-        if fs.curr_policy_total >= 20:
-            soft(2, f"POLICY_TOTAL_HIGH: {fs.curr_policy_total} total violations")
-        elif fs.curr_policy_total >= 5:
-            soft(1, f"POLICY_TOTAL_ELEVATED: {fs.curr_policy_total} total violations")
-
-    if fs.policy_total_delta is not None and POLICY_DELTA_SOFT <= fs.policy_total_delta < POLICY_DELTA_HARD:
-        soft(1, f"POLICY_COMPLIANCE_INCREASE: +{fs.policy_total_delta} vs prior record (soft)")
+    # TEMPORARILY DISABLED — policy violations not yet distinguished by health impact
+    # Re-enable when account_health_impact flag is available in data
+    # if fs.curr_policy_total is not None and fs.curr_policy_total > 0:
+    #     if fs.curr_policy_total >= 20:
+    #         soft(2, f"POLICY_TOTAL_HIGH: {fs.curr_policy_total} total violations")
+    #     elif fs.curr_policy_total >= 5:
+    #         soft(1, f"POLICY_TOTAL_ELEVATED: {fs.curr_policy_total} total violations")
+    #
+    # if fs.policy_total_delta is not None and cfg_int("policy_delta_soft") <= fs.policy_total_delta < cfg_int("policy_delta_hard"):
+    #     soft(1, f"POLICY_COMPLIANCE_INCREASE: +{fs.policy_total_delta} vs prior record (soft)")
 
     # ── Notifications ─────────────────────────────────────────────────────────
-    if fs.high_risk_notification_count >= NOTIFICATIONS_HARD:
+    if fs.high_risk_notification_count >= cfg_int("notifications_hard_count"):
         soft(2, f"HIGH_RISK_NOTIFICATIONS: {fs.high_risk_notification_count} (high)")
-    elif fs.high_risk_notification_count >= NOTIFICATIONS_SOFT_HI:
+    elif fs.high_risk_notification_count >= cfg_int("notifications_soft_hi_count"):
         soft(2, f"HIGH_RISK_NOTIFICATIONS: {fs.high_risk_notification_count}")
-    elif fs.high_risk_notification_count >= NOTIFICATIONS_SOFT_LO:
+    elif fs.high_risk_notification_count >= cfg_int("notifications_soft_lo_count"):
         soft(1, f"HIGH_RISK_NOTIFICATIONS: {fs.high_risk_notification_count}")
 
-    # ── Payout / deferred ─────────────────────────────────────────────────────
-    if (
-        fs.deferred_transactions_pct is not None
-        and (fs.deferred_transactions_amount or 0) > DEFERRED_SOFT_AMT
-        and fs.deferred_transactions_pct >= DEFERRED_SOFT_PCT
-    ):
-        soft(1, f"DEFERRED_TRANSACTIONS: {fs.deferred_transactions_pct:.0f}% of balance deferred")
-
-    if fs.b2b_reserve_consecutive_negative == 1:
-        soft(1, f"ACCOUNT_LEVEL_RESERVE: 1 period with negative reserve (${fs.b2b_reserve_max_negative:,.0f})")
-    if fs.b2b_reserve_is_worsening and fs.b2b_reserve_consecutive_negative < B2B_RESERVE_CONSEC_HARD:
+    if fs.stmt_reserve_consecutive_negative == 1:
+        soft(1, f"ACCOUNT_LEVEL_RESERVE: 1 period with negative reserve (${fs.stmt_reserve_max_negative:,.0f})")
+    if fs.stmt_reserve_is_worsening and fs.stmt_reserve_consecutive_negative < cfg_int("stmt_reserve_consec_hard"):
         soft(1, f"ACCOUNT_LEVEL_RESERVE: reserve worsening across periods")
 
-    if fs.failed_disbursement_count == 0 and fs.unavailable_balance_amount >= 1000:
+    if not fs.failed_disbursement_most_recent and fs.unavailable_balance_amount >= cfg("unavailable_balance_soft_usd"):
         soft(1, f"UNAVAILABLE_BALANCE: ${fs.unavailable_balance_amount:,.0f} in recent statement")
 
-    # ── Performance Over Time (no WoW data — single period elevated) ──────────
-    if fs.perf_over_time_defect_trend_delta is None and fs.perf_over_time_recent_defect_pct is not None:
-        recent = fs.perf_over_time_recent_defect_pct
-        if recent >= 1.0:
-            soft(2, f"PERF_OVER_TIME_HIGH: defect rate {recent:.2f}%")
-        elif recent >= 0.5:
-            soft(1, f"PERF_OVER_TIME_ELEVATED: defect rate {recent:.2f}%")
+
 
     # ── Customer complaints ────────────────────────────────────────────────────
     for label, val in [
@@ -252,9 +199,16 @@ def score(fs: FeatureSet) -> PreScoreResult:
     # ══════════════════════════════════════════════════════════════════════════
     # Final score
     # ══════════════════════════════════════════════════════════════════════════
-    hard_fired = result.preliminary_score > 1
-    soft_cap   = 2 if hard_fired else 6
-    final = min(10, max(1, result.preliminary_score + min(penalty, soft_cap)))
+    if result.hard_floors:
+        # Hard path: max_floor + sum(other_floors)/6 + min(soft, cfg("soft_with_hard_max"))/6
+        sorted_floors = sorted(result.hard_floors, reverse=True)
+        max_floor   = sorted_floors[0]
+        other_sum   = sum(sorted_floors[1:])
+        final = min(cfg("score_max"), max_floor + other_sum / cfg("hard_floor_divisor") + min(penalty, cfg("soft_with_hard_max")) / cfg("soft_hard_divisor"))
+    else:
+        # Soft only: capped at soft_only_max — never exceeds the lowest hard rule floor
+        final = min(cfg("soft_only_max"), 1 + penalty)
+
     result.preliminary_score = final
 
     if not rules:

@@ -13,12 +13,19 @@ risk_agent/
 ├── .env.example                   # Copy to .env and fill in your values
 ├── supabase_migration.sql         # Run once in Supabase SQL editor
 │
+├── input/                         # Auto-saved BQ snapshots for regression testing
+│   └── 2026-03-10.json            # One file per date, named by report date
+│
 ├── config/
 │   ├── settings.py                # Env-var loader
-│   └── models.py                  # Pydantic output models (RiskReport, Metric)
+│   ├── models.py                  # Pydantic output models (RiskReport, Metric)
+│   └── agent_config.py            # Dynamic config loader from json_risk_agent_config
+│
+├── sql/
+│   └── create_risk_agent_config.sql  # Run once to create + seed config table
 │
 ├── extractors/
-│   ├── bq_loader.py               # BigQuery → two-query fetch (current rows + prev policy totals)
+│   ├── bq_loader.py               # BigQuery → two-query fetch + local file loader
 │   └── feature_extractor.py      # JSON data column → FeatureSet dataclass
 │
 ├── scoring/
@@ -51,12 +58,27 @@ cp .env.example .env
 # Edit .env and fill in all values
 ```
 
-### 3. Set up Supabase table
-Run `supabase_migration.sql` in your Supabase SQL editor.
+### 3. Set up Supabase tables
+Run the following in your Supabase SQL editor:
+1. `supabase_migration.sql` — creates the `json_risk_report` output table
+2. `sql/create_risk_agent_config.sql` — creates and seeds the `json_risk_agent_config` tuning table
 
 ### 4. Run the pipeline
 ```bash
+# Fetch latest data from BigQuery (default)
 python main.py
+
+# Fetch a specific date from BigQuery (saves snapshot to input/YYYY-MM-DD.json)
+python main.py --date 2026-03-10
+
+# Re-run using a saved local snapshot (no BQ cost)
+python main.py --source local
+
+# Re-run a specific date from local snapshot
+python main.py --source local --date 2026-03-10
+
+# Re-run using a specific local file
+python main.py --source local --input-file input/2026-03-10.json
 ```
 
 ### 5. Run tests (offline, no cloud required)
@@ -78,7 +100,7 @@ python -m pytest tests/ -v
 | `BQ_LOOKBACK_HOURS` | Only process rows newer than N hours (0 = all rows) |
 | `SUPABASE_URL` | Your Supabase project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | Supabase service role key |
-| `SUPABASE_RISK_TABLE` | Target table name (default: `supplier_risk_reports`) |
+| `SUPABASE_RISK_TABLE` | Target table name (default: `json_risk_report`) |
 | `MAX_ROWS` | Max rows per run (0 = no limit) |
 | `DRY_RUN` | If `true`, skips writing to Supabase |
 | `LOG_LEVEL` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
@@ -88,10 +110,17 @@ python -m pytest tests/ -v
 
 The pipeline runs **two queries per run** to keep costs low:
 
-1. **Main query** — fetches all current-window rows with full columns
-2. **Prev policy query** — for each `mp_sup_key` in the current window, fetches the summed `policy_compliance` total from the immediately preceding record. Only scalar values are extracted in BQ (no full `data` column transfer), so this query is very lightweight.
+1. **Main query** — fetches one row per `mp_sup_key` for the target window (deduped via `ROW_NUMBER() ORDER BY create_ts DESC`), with all columns needed for feature extraction
+2. **Prev policy query** — for each `mp_sup_key` in the current window, fetches the summed `policy_compliance` total from the immediately preceding record. Only scalar values are extracted in BQ, keeping this query lightweight.
 
 The prev policy total is injected into each row as `prev_policy_total` before feature extraction, enabling cross-period compliance trend detection.
+
+### Regression Testing / Local Snapshots
+
+Every BQ run automatically saves the fetched rows to `input/<date>.json`. This allows you to:
+- Re-run the pipeline on historical data without hitting BigQuery
+- Test rule changes against the same input data
+- Debug issues on a specific day's dataset
 
 ## Scoring Mechanism
 
@@ -104,23 +133,19 @@ Hard rules represent clear, directional risk signals. Each hard rule sets the sc
 |---|---|---|
 | `ACCOUNT_STATUS` | Account not OK or Active | 8 |
 | `LOAN_PAST_DUE` | Past-due loan amount > $0 | 9 |
-| `ORDER_DEFECT_RATE` | ODR > 1% (Amazon red line) | 8 |
+| `ORDER_DEFECT_RATE` | Seller-fulfilled ODR > 1% (from Performance Over Time SF rows only; FBA-only or no SF data → skipped) | 8 |
 | `LATE_SHIPMENT_RATE` | LSR > 4% (Amazon red line) | 8 |
 | `NEG_FEEDBACK_TREND` | 30d neg rate ≥ 10pp above 60d window (min 10 orders) | 7 |
-| `PERF_DEGRADATION` | Account Health defect rate up ≥ 0.5pp WoW | 7 |
-| `POLICY_COMPLIANCE_INCREASE` | Total policy violations up ≥ 5 vs previous BQ record | 7 |
-| `ACCOUNT_LEVEL_RESERVE` | Negative reserve in ≥ 2 consecutive B2B statement periods | 7 |
+| ~~`POLICY_COMPLIANCE_INCREASE`~~ | *Temporarily disabled — violations not distinguished by health impact* | 7 |
+| `ACCOUNT_LEVEL_RESERVE` | Negative reserve in ≥ 2 consecutive statement periods | 7 |
 | `ACCOUNT_LEVEL_RESERVE` | Single-period negative reserve > $5,000 | 7 |
-| `FAILED_DISBURSEMENT` | ≥ 2 cancelled/failed payout transfers | 7 |
-| `FAILED_DISBURSEMENT` | 1 cancelled/failed payout transfer | 6 |
+| `FAILED_DISBURSEMENT` | Most recent closed statement is a failed disbursement | 7 |
 
 ### Soft Rules — additive penalty points
 Soft rules add penalty points to the score. They represent weaker signals that are only meaningful in combination.
 
 | Category | Rule | Condition | Points |
 |---|---|---|---|
-| Fulfillment | ODR elevated | 0.5–1% | +1 |
-| Fulfillment | LSR elevated | 2–4% | +1 |
 | Fulfillment | Cancellation rate | > 2.5% / 1.5–2.5% | +2 / +1 |
 | Fulfillment | Valid tracking rate | < 95% | +2 |
 | Fulfillment | Delivered on time | < 85% | +1 |
@@ -128,27 +153,51 @@ Soft rules add penalty points to the score. They represent weaker signals that a
 | Feedback | 30d negative rate | > 10% (min 10 orders) | +2 |
 | Feedback | 30d negative rate | 5–10% (min 10 orders) | +1 |
 | Loans | Outstanding balance | > $0 | +1 |
-| Policy | Total violations | ≥ 20 / 5–19 | +2 / +1 |
-| Policy | Violations increase | +2 to +4 vs prior record | +1 |
+| ~~Policy~~ | *Total violations — temporarily disabled* | ≥ 20 / 5–19 | +2 / +1 |
+| ~~Policy~~ | *Violations increase — temporarily disabled* | +2 to +4 vs prior record | +1 |
 | Notifications | High-risk notifications | ≥ 10 / 5–9 / 2–4 | +2 / +2 / +1 |
-| Payout | Deferred transactions | ≥ 50% and > $5,000 | +1 |
-| Payout | B2B reserve | 1 period negative | +1 |
-| Payout | B2B reserve | Worsening across periods | +1 |
-| Payout | Unavailable balance | ≥ $1,000 | +1 |
-| Account Health | Defect rate (no WoW data) | ≥ 1% / 0.5–1% | +2 / +1 |
+| Payout | Failed disbursement | Historical (90d) but since recovered | +1 |
+| Payout | Reserve | 1 period negative | +1 |
+| Payout | Reserve | Worsening across periods | +1 |
+| Payout | Unavailable balance (most recent statement only) | ≥ $1,000 | +1 |
+| Payout | Historical failed disbursement (recovered, within 90 days) | ≥ 1 | +1 |
 | Complaints | Authenticity/Safety/IP/Policy | Each > 0 | +1 each |
 
-### Soft Cap
-To prevent soft rules from stacking a hard-rule case all the way to 10:
+### Scoring Formula
 
+Scores are **floats** (e.g. 8.33, 9.17) rounded to 2 decimal places.
+
+**Hard rules fired:**
 ```
-soft_cap = +2   if any hard rule fired
-soft_cap = +6   if no hard rules fired (pure soft max score = 7)
-
-final = min(10, hard_floor + min(soft_penalty, soft_cap))
+final = min(10, max_floor + sum(other_floors) / 6 + min(soft_penalty, 6) / 6)
 ```
+- `max_floor` — highest fired hard rule floor
+- `sum(other_floors) / 6` — every additional hard rule contributes its floor divided by 6
+- `min(soft_penalty, 6) / 6` — soft signals contribute at most +1 on top of hard rules
 
-A score of 10 requires `LOAN_PAST_DUE` (floor 9) + soft signals, or multiple hard rules stacking.
+**No hard rules (soft only):**
+```
+final = min(6.0, 1 + soft_penalty)
+```
+- Pure soft path maxes out at **6.0** — by design, never exceeds the lowest possible hard rule floor (6)
+
+**Examples:**
+
+| Case | Calculation | Score |
+|---|---|---|
+| Single floor 8, no soft | 8 + 0 + 0 | 8.0 |
+| Single floor 8, 2 soft | 8 + 0 + 2/6 | 8.33 |
+| Floor 8 + floor 6, no soft | 8 + 6/6 + 0 | 9.0 |
+| Floor 8 + floor 6, 2 soft | 8 + 6/6 + 2/6 | 9.33 |
+| Floor 9 + floor 8, no soft | 9 + 8/6 + 0 | 10.0 (capped) |
+| Soft only, 5 signals | 1 + 5 | 6.0 |
+| Soft only, 10 signals | 1 + 10 → capped | 6.0 |
+
+### FBA vs Seller-Fulfilled ODR
+ODR is only evaluated using seller-fulfilled data from the `Performance Over Time` section:
+- **FBA-only sellers** (no seller-fulfilled orders): ODR skipped entirely
+- **Mixed or self-ship sellers with SF data**: uses `seller_fulfilled_odr` from Performance Over Time SF rows
+- **No SF data available**: ODR skipped — no fallback to global ODR field
 
 ### Data Quality Short-Circuit
 If the data collection returned an error flag, the supplier is scored directly — no rules evaluated, no LLM called:
@@ -163,6 +212,49 @@ If the data collection returned an error flag, the supplier is scored directly �
 
 ### LLM Usage
 Claude AI is only called when the rule engine pre-score is **≥ 5**. Rows scoring below 5 receive a rule-engine-only report. The LLM may adjust the final score up or down from the pre-score based on contextual analysis.
+
+The LLM receives the full feature set including per-statement detail (period, deposit, reserve, InfoBox) and reserve period history, enabling it to distinguish historical noise from active risk. It follows these judgement guidelines:
+
+1. **Rule engine signals are alerts, not conclusions** — weigh them against the full picture
+2. **Current account health takes priority** — healthy ODR, LSR, feedback, and account status meaningfully offset historical flags; a seller with excellent current metrics should not score above 6 based solely on historical issues
+3. **Failed disbursements** — if followed by normal successful transfers, treat as resolved; only flag as active risk if most recent statement shows a failed transfer
+4. **Reserve** — large but stable reserve on a high-volume account is normal; focus on whether it is growing (worsening) or stable/shrinking
+5. **Policy compliance** — high violation counts only matter if actively impacting the account (listings removed, enforcement actions); if account status is OK and fulfillment metrics are healthy, treat as moderate signal only
+
+## Dynamic Configuration
+
+All scoring thresholds, rule floors, and pipeline parameters are stored in the `json_risk_agent_config` Supabase table and loaded once at pipeline startup. If the table is unavailable, hardcoded defaults in `config/agent_config.py` are used as fallback.
+
+To tune a parameter, update the `value` column directly in Supabase — no code changes or redeployment needed:
+
+```sql
+UPDATE json_risk_agent_config SET value = 1.5 WHERE key = 'odr_threshold_pct';
+UPDATE json_risk_agent_config SET value = 10  WHERE key = 'llm_score_threshold';
+```
+
+### Key Parameters
+
+| Key | Default | Description |
+|---|---|---|
+| `floor_account_status` | 8 | Hard rule floor — account not OK/Active |
+| `floor_loan_past_due` | 9 | Hard rule floor — past-due loan |
+| `floor_order_defect_rate` | 8 | Hard rule floor — ODR > threshold |
+| `floor_late_shipment_rate` | 8 | Hard rule floor — LSR > threshold |
+| `floor_neg_feedback_trend` | 7 | Hard rule floor — feedback spike |
+| `floor_policy_compliance` | 7 | Hard rule floor — policy violations increase |
+| `floor_reserve_consecutive` | 7 | Hard rule floor — consecutive negative reserve |
+| `floor_reserve_amount` | 7 | Hard rule floor — large single-period reserve |
+| `floor_failed_disbursement` | 7 | Hard rule floor — most recent statement failed |
+| `odr_threshold_pct` | 1.0 | ODR % to trigger hard rule |
+| `late_shipment_threshold_pct` | 4.0 | LSR % to trigger hard rule |
+| `stmt_reserve_amount_hard_usd` | 5000 | Reserve USD to trigger hard rule |
+| `failed_disb_window_days` | 90 | Lookback window for failed disbursements |
+| `llm_score_threshold` | 5 | Min pre-score to trigger LLM analysis |
+| `soft_only_max` | 6.0 | Max score when no hard rules fire |
+| `score_max` | 10.0 | Absolute score ceiling |
+| `dq_score_not_authorized` | 8 | Score for not_authorized data quality flag |
+| `dq_score_login_error` | 7 | Score for login_error data quality flag |
+| `dq_score_default` | 3 | Default score for unknown data quality flags |
 
 ## Risk Score Guide
 
@@ -182,20 +274,67 @@ Claude AI is only called when the rule engine pre-score is **≥ 5**. Rows scori
   "supplier_key": "uuid",
   "mp_sup_key": "uuid",
   "supplier_name": "Seller Name",
-  "report_date": "2026-03-02",
+  "report_date": "2026-03-10",
   "metrics": [
     {"metric_id": "order_defect_rate", "value": 0.13, "unit": "%"},
     {"metric_id": "feedback_negative_30d", "value": 18.5, "unit": "%"},
     {"metric_id": "feedback_negative_trend_delta", "value": 12.3, "unit": "pp"},
     {"metric_id": "policy_compliance_total", "value": 14, "unit": null},
     {"metric_id": "policy_compliance_delta", "value": 6, "unit": null},
-    {"metric_id": "b2b_reserve_consecutive_negative", "value": 3, "unit": "periods"},
-    {"metric_id": "b2b_reserve_max_negative", "value": 8200.0, "unit": "USD"},
+    {"metric_id": "stmt_reserve_consecutive_negative", "value": 3, "unit": "periods"},
+    {"metric_id": "stmt_reserve_max_negative", "value": 8200.0, "unit": "USD"},
     {"metric_id": "failed_disbursement_count", "value": 2, "unit": null}
   ],
   "trigger_reason": "Negative feedback rate has increased 12.3pp in the last 30 days vs the prior 60-day window, and policy compliance violations have risen by 6 vs the previous record. Account level reserve has been negative for 3 consecutive statement periods.",
-  "overall_risk_score": 8
+  "overall_risk_score": 8.33
 }
+```
+
+## Supabase Table Setup
+
+Run this in Supabase SQL editor:
+
+```sql
+CREATE TABLE IF NOT EXISTS json_risk_report (
+    id                  BIGSERIAL PRIMARY KEY,
+    table_name          TEXT,
+    supplier_key        TEXT,
+    mp_sup_key          TEXT,
+    supplier_name       TEXT,
+    report_date         DATE,
+    metrics             JSONB,
+    trigger_reason      TEXT,
+    overall_risk_score  NUMERIC(5,2),
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (supplier_key, report_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_json_risk_report_mp_sup_key ON json_risk_report (mp_sup_key);
+CREATE INDEX IF NOT EXISTS idx_json_risk_report_report_date ON json_risk_report (report_date);
+CREATE INDEX IF NOT EXISTS idx_json_risk_report_score ON json_risk_report (overall_risk_score);
+```
+
+To clear all records and reset IDs:
+```sql
+TRUNCATE TABLE json_risk_report RESTART IDENTITY;
+```
+
+## Tooling
+
+**`export_reports.py`** — Download risk reports from Supabase to a local JSON file:
+```bash
+python export_reports.py                        # all reports
+python export_reports.py --date 2026-03-10      # specific date
+python export_reports.py --limit 100            # latest 100
+python export_reports.py --output my_file.json  # custom filename
+```
+
+**`sync_suppliers.py`** — Sync unique suppliers from BQ to a `suppliers` table. Tracks field changes in an append-only `notes` column:
+```bash
+python sync_suppliers.py                # last 3 days
+python sync_suppliers.py --days 7       # last 7 days
+python sync_suppliers.py --dry-run      # preview without writing
+python sync_suppliers.py --print-migration  # print setup SQL
 ```
 
 ## Swapping AI Provider (Future: Vertex AI / Gemini)
@@ -210,7 +349,7 @@ def _call_llm(user_message: str) -> str:
 
 # Future: Vertex AI / Gemini
 def _call_llm(user_message: str) -> str:
-    model = GenerativeModel("gemini-1.5-pro")
+    model = GenerativeModel("gemini-2.0-flash-001")
     response = model.generate_content([_SYSTEM_PROMPT, user_message])
     return response.text
 ```

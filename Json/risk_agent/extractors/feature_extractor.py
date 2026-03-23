@@ -15,6 +15,24 @@ from utils.logger import get_logger
 
 log = get_logger("feature_extractor")
 
+# ── Supplier key cache ────────────────────────────────────────────────────────
+import pathlib as _pathlib
+
+_SUPPLIER_KEY_CACHE_FILE = _pathlib.Path(__file__).parent.parent / "input" / "supplier_key_cache.json"
+_supplier_key_cache: dict[str, str] | None = None
+
+def _get_supplier_key_cache() -> dict[str, str]:
+    global _supplier_key_cache
+    if _supplier_key_cache is None:
+        if _SUPPLIER_KEY_CACHE_FILE.exists():
+            import json as _json
+            _supplier_key_cache = _json.loads(_SUPPLIER_KEY_CACHE_FILE.read_text())
+            log.info("Loaded %d supplier_key mappings from cache.", len(_supplier_key_cache))
+        else:
+            log.warning("supplier_key_cache.json not found — run sync_suppliers.py first.")
+            _supplier_key_cache = {}
+    return _supplier_key_cache
+
 # ── Error classification ───────────────────────────────────────────────────────
 _ERROR_PATTERNS: dict[str, str] = {
     "login_error": r"(error in login|login process|something was wrong in login)",
@@ -82,6 +100,7 @@ class FeatureSet:
 
     # statement deposits (list of recent closed periods)
     recent_deposits: list[dict] = field(default_factory=list)   # [{period, amount}]
+    statements_detail: list[dict] = field(default_factory=list) # [{period, end_date, deposit, reserve, infobox}] most recent first
     total_balance: Optional[float] = None
     funds_available: Optional[float] = None
 
@@ -125,8 +144,14 @@ class FeatureSet:
     deferred_transactions_amount: Optional[float] = None  # from StatementsSummary
     deferred_transactions_pct: Optional[float] = None     # deferred / total balance
     account_level_reserve_amount: float = 0.0             # max reserve seen across statements
+    # Regular Statements account level reserve history
+    stmt_reserve_periods: list[float] = field(default_factory=list)
+    stmt_reserve_consecutive_negative: int = 0
+    stmt_reserve_max_negative: float = 0.0
+    stmt_reserve_is_worsening: bool = False
     unavailable_balance_amount: float = 0.0               # max unavailable seen across statements
-    failed_disbursement_count: int = 0                    # count of cancelled/failed transfers in statements
+    failed_disbursement_count: int = 0                    # count of cancelled/failed transfers in statements (90d)
+    failed_disbursement_most_recent: bool = False         # True if most recent closed statement is a failed disbursement
 
     # policy compliance trend (cross-period)
     curr_policy_total: Optional[int] = None       # sum of all policy_compliance fields
@@ -155,6 +180,9 @@ class FeatureSet:
     inv_report_value: Optional[float] = None
     inv_report_amazon_fulfilled_value: Optional[float] = None
 
+    # Fulfillment type (from Performance Over Time)
+    seller_fulfilled_odr: Optional[float] = None  # ODR from Seller Fulfilled rows only; None if no SF data
+
     # short/long term order metrics
     cancellation_orders_short_term: Optional[float] = None
     order_defect_orders_short_term: Optional[float] = None
@@ -163,6 +191,8 @@ class FeatureSet:
     negative_feedback_orders_short_term: Optional[float] = None
     a_to_z_orders_short_term: Optional[float] = None
 
+
+# FAILED_DISB_WINDOW_DAYS moved to json_risk_agent_config Supabase table (key: failed_disb_window_days)
 
 # ── Risk notification keywords ─────────────────────────────────────────────────
 
@@ -240,11 +270,14 @@ def extract_features(row: dict) -> FeatureSet:
         # Try to at least get supplier info from the JSON
         try:
             d = json.loads(raw_data)
-            fs.supplier_key = d.get("Supplier Key", row.get("mp_sup_key", ""))
+            mp_sup_key = row.get("mp_sup_key", "")
+            cache = _get_supplier_key_cache()
+            fs.supplier_key = cache.get(mp_sup_key, d.get("Supplier Key", mp_sup_key))
             fs.supplier_name = d.get("Supplier Name", "")
             fs.raw_error = d.get("Error", raw_data[:200])
         except json.JSONDecodeError:
-            fs.supplier_key = row.get("mp_sup_key", "")
+            _mp = row.get("mp_sup_key", "")
+            fs.supplier_key = _get_supplier_key_cache().get(_mp, _mp)
             fs.raw_error = raw_data[:200]
         return fs  # nothing more to do
 
@@ -253,13 +286,16 @@ def extract_features(row: dict) -> FeatureSet:
         d: dict = json.loads(raw_data)
     except (json.JSONDecodeError, TypeError):
         log.warning("Could not parse data column for mp_sup_key=%s", row.get("mp_sup_key"))
-        fs.supplier_key = row.get("mp_sup_key", "")
+        _mp = row.get("mp_sup_key", "")
+        fs.supplier_key = _get_supplier_key_cache().get(_mp, _mp)
         fs.data_quality_flag = "json_parse_error"
         fs.raw_error = raw_data[:200] if raw_data else "empty"
         return fs
 
     # ── 4. Identifiers ────────────────────────────────────────────────────────
-    fs.supplier_key = d.get("Supplier Key", row.get("mp_sup_key", ""))
+    mp_sup_key = row.get("mp_sup_key", "")
+    cache = _get_supplier_key_cache()
+    fs.supplier_key = cache.get(mp_sup_key, d.get("Supplier Key", mp_sup_key))
     fs.supplier_name = d.get("Supplier Name", "") or d.get("Legal Business Name", "")
     fs.seller_id = d.get("Seller ID", "")
     fs.store_name = d.get("Store Name", "")
@@ -440,6 +476,17 @@ def extract_features(row: dict) -> FeatureSet:
     # ── 11c. Performance Over Time trend ──────────────────────────────────────
     pot = d.get("Performance Over Time", {})
     af_rows = pot.get("Amazon Fulfilled", [])
+    sf_rows = pot.get("Seller Fulfilled", [])
+
+    # Seller-fulfilled ODR: use most recent SF row that has actual order data (orders > 0)
+    sf_with_orders = [
+        r for r in sf_rows
+        if (_safe_int(r.get("Total Orders", "0") or "0") or 0) > 0
+        and r.get("Total Orders With Defects") not in (None, "", "N/A")
+    ]
+    if sf_with_orders:
+        fs.seller_fulfilled_odr = _pct_str_to_float(sf_with_orders[0].get("Total Orders With Defects", "") or "")
+
     # rows are ordered newest-first; skip same-day snapshots (low order count)
     full_weeks = [
         r for r in af_rows
@@ -473,22 +520,75 @@ def extract_features(row: dict) -> FeatureSet:
         if deferred_amt and total_amt and total_amt > 0:
             fs.deferred_transactions_pct = deferred_amt / total_amt * 100
 
-    for stmt in d.get("Statements", []):
+    from datetime import datetime, timedelta, timezone
+    from config.agent_config import cfg_int as _cfg_int
+    _now = datetime.now(timezone.utc)
+    _disb_cutoff = _now - timedelta(days=_cfg_int("failed_disb_window_days"))
+
+    stmt_reserve_values: list[float] = []
+    statements_list = d.get("Statements", [])
+    for stmt in statements_list:
         det = stmt.get("details", {}) or {}
+
         # Account Level Reserve
         reserve_str = det.get("Account Level Reserve", {}).get("Reserve", "$0") or "$0"
         reserve_amt = _money_to_float(reserve_str) or 0.0
-        if reserve_amt > fs.account_level_reserve_amount:
-            fs.account_level_reserve_amount = reserve_amt
-        # Unavailable balance
-        unavail_str = det.get("Closing Balance", {}).get("Unavailable balance", "$0") or "$0"
-        unavail_amt = _money_to_float(unavail_str) or 0.0
-        if unavail_amt > fs.unavailable_balance_amount:
-            fs.unavailable_balance_amount = unavail_amt
-        # Failed/cancelled disbursement in InfoBox
+        # track max absolute reserve held (negative = Amazon holding funds)
+        if abs(reserve_amt) > fs.account_level_reserve_amount:
+            fs.account_level_reserve_amount = abs(reserve_amt)
+        stmt_reserve_values.append(reserve_amt)
+
+        # Unavailable balance — only from the most recent statement (first in list)
+        if stmt == statements_list[0]:
+            unavail_str = det.get("Closing Balance", {}).get("Unavailable balance", "$0") or "$0"
+            fs.unavailable_balance_amount = _money_to_float(unavail_str) or 0.0
+
+        # Failed/cancelled disbursement in InfoBox — only within time window
+        end_date_str = stmt.get("end_date", "") or ""
+        try:
+            # Handle both "2026-03-13" and "2026-3-13" formats
+            parts = [int(x) for x in end_date_str.split("-")]
+            from datetime import date as _date
+            stmt_end = datetime(parts[0], parts[1], parts[2], tzinfo=timezone.utc)
+            within_window = stmt_end >= _disb_cutoff
+        except (ValueError, TypeError, IndexError):
+            within_window = True  # if date unparseable, include it
+
         infobox = det.get("InfoBox", "") or ""
-        if any(kw in infobox.lower() for kw in ["canceled your transfer", "cancelled your transfer", "failed disbursement"]):
+        is_failed = any(kw in infobox.lower() for kw in ["canceled your transfer", "cancelled your transfer", "failed disbursement"])
+
+        if within_window and is_failed:
             fs.failed_disbursement_count += 1
+
+        # Check if most recent closed statement is a failed disbursement
+        if not fs.failed_disbursement_most_recent:
+            stmt_status = det.get("Status", "") or stmt.get("ProcessingStatus", "") or ""
+            if stmt_status.lower() == "closed":
+                fs.failed_disbursement_most_recent = is_failed
+
+        # Build statements_detail for LLM context (most recent 8)
+        if len(fs.statements_detail) < 8:
+            fs.statements_detail.append({
+                "period": stmt.get("Settlement Period", ""),
+                "end_date": end_date_str,
+                "deposit_usd": _money_to_float(stmt.get("Deposit Total", "")) or 0.0,
+                "reserve_usd": reserve_amt,
+                "status": det.get("Status", ""),
+                "infobox": infobox[:120] if infobox else "",
+            })
+
+    if stmt_reserve_values:
+        fs.stmt_reserve_periods = stmt_reserve_values
+        consec = 0
+        for v in stmt_reserve_values:
+            if v < 0:
+                consec += 1
+            else:
+                break
+        fs.stmt_reserve_consecutive_negative = consec
+        fs.stmt_reserve_max_negative = abs(min(stmt_reserve_values))
+        if len(stmt_reserve_values) >= 2 and stmt_reserve_values[0] < 0 and stmt_reserve_values[1] < 0:
+            fs.stmt_reserve_is_worsening = stmt_reserve_values[0] < stmt_reserve_values[1]
 
     # ── 12. Loans ─────────────────────────────────────────────────────────────
     # Active loans
