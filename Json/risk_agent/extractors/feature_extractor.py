@@ -15,6 +15,24 @@ from utils.logger import get_logger
 
 log = get_logger("feature_extractor")
 
+# ── Supplier key cache ────────────────────────────────────────────────────────
+import pathlib as _pathlib
+
+_SUPPLIER_KEY_CACHE_FILE = _pathlib.Path(__file__).parent.parent / "input" / "supplier_key_cache.json"
+_supplier_key_cache: dict[str, str] | None = None
+
+def _get_supplier_key_cache() -> dict[str, str]:
+    global _supplier_key_cache
+    if _supplier_key_cache is None:
+        if _SUPPLIER_KEY_CACHE_FILE.exists():
+            import json as _json
+            _supplier_key_cache = _json.loads(_SUPPLIER_KEY_CACHE_FILE.read_text())
+            log.info("Loaded %d supplier_key mappings from cache.", len(_supplier_key_cache))
+        else:
+            log.warning("supplier_key_cache.json not found — run sync_suppliers.py first.")
+            _supplier_key_cache = {}
+    return _supplier_key_cache
+
 # ── Error classification ───────────────────────────────────────────────────────
 _ERROR_PATTERNS: dict[str, str] = {
     "login_error": r"(error in login|login process|something was wrong in login)",
@@ -252,11 +270,14 @@ def extract_features(row: dict) -> FeatureSet:
         # Try to at least get supplier info from the JSON
         try:
             d = json.loads(raw_data)
-            fs.supplier_key = d.get("Supplier Key", row.get("mp_sup_key", ""))
+            mp_sup_key = row.get("mp_sup_key", "")
+            cache = _get_supplier_key_cache()
+            fs.supplier_key = cache.get(mp_sup_key, d.get("Supplier Key", mp_sup_key))
             fs.supplier_name = d.get("Supplier Name", "")
             fs.raw_error = d.get("Error", raw_data[:200])
         except json.JSONDecodeError:
-            fs.supplier_key = row.get("mp_sup_key", "")
+            _mp = row.get("mp_sup_key", "")
+            fs.supplier_key = _get_supplier_key_cache().get(_mp, _mp)
             fs.raw_error = raw_data[:200]
         return fs  # nothing more to do
 
@@ -265,13 +286,16 @@ def extract_features(row: dict) -> FeatureSet:
         d: dict = json.loads(raw_data)
     except (json.JSONDecodeError, TypeError):
         log.warning("Could not parse data column for mp_sup_key=%s", row.get("mp_sup_key"))
-        fs.supplier_key = row.get("mp_sup_key", "")
+        _mp = row.get("mp_sup_key", "")
+        fs.supplier_key = _get_supplier_key_cache().get(_mp, _mp)
         fs.data_quality_flag = "json_parse_error"
         fs.raw_error = raw_data[:200] if raw_data else "empty"
         return fs
 
     # ── 4. Identifiers ────────────────────────────────────────────────────────
-    fs.supplier_key = d.get("Supplier Key", row.get("mp_sup_key", ""))
+    mp_sup_key = row.get("mp_sup_key", "")
+    cache = _get_supplier_key_cache()
+    fs.supplier_key = cache.get(mp_sup_key, d.get("Supplier Key", mp_sup_key))
     fs.supplier_name = d.get("Supplier Name", "") or d.get("Legal Business Name", "")
     fs.seller_id = d.get("Seller ID", "")
     fs.store_name = d.get("Store Name", "")

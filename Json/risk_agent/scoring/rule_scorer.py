@@ -81,13 +81,15 @@ def score(fs: FeatureSet) -> PreScoreResult:
         ))
 
     # ── 4. Policy compliance increase ─────────────────────────────────────────
-    if fs.policy_total_delta is not None:
-        if fs.policy_total_delta >= cfg_int("policy_delta_hard"):
-            hard(cfg_int("floor_policy_compliance"), (
-                f"POLICY_COMPLIANCE_INCREASE: total violations up +{fs.policy_total_delta} "
-                f"vs prior record (curr={fs.curr_policy_total}, "
-                f"prev={fs.prev_policy_total}, threshold +{cfg_int('policy_delta_hard')})"
-            ))
+    # TEMPORARILY DISABLED — policy violations not yet distinguished by health impact
+    # Re-enable when account_health_impact flag is available in data
+    # if fs.policy_total_delta is not None:
+    #     if fs.policy_total_delta >= cfg_int("policy_delta_hard"):
+    #         hard(cfg_int("floor_policy_compliance"), (
+    #             f"POLICY_COMPLIANCE_INCREASE: total violations up +{fs.policy_total_delta} "
+    #             f"vs prior record (curr={fs.curr_policy_total}, "
+    #             f"prev={fs.prev_policy_total}, threshold +{cfg_int('policy_delta_hard')})"
+    #         ))
 
     # ── 6. B2B Account Level Reserve ─────────────────────────────────────────
     if fs.stmt_reserve_consecutive_negative >= cfg_int("stmt_reserve_consec_hard"):
@@ -155,14 +157,16 @@ def score(fs: FeatureSet) -> PreScoreResult:
         soft(1, f"LOAN_OUTSTANDING: balance = ${fs.outstanding_loan_amount:,.0f}")
 
     # ── Policy compliance (absolute levels as weak signals) ───────────────────
-    if fs.curr_policy_total is not None and fs.curr_policy_total > 0:
-        if fs.curr_policy_total >= 20:
-            soft(2, f"POLICY_TOTAL_HIGH: {fs.curr_policy_total} total violations")
-        elif fs.curr_policy_total >= 5:
-            soft(1, f"POLICY_TOTAL_ELEVATED: {fs.curr_policy_total} total violations")
-
-    if fs.policy_total_delta is not None and cfg_int("policy_delta_soft") <= fs.policy_total_delta < cfg_int("policy_delta_hard"):
-        soft(1, f"POLICY_COMPLIANCE_INCREASE: +{fs.policy_total_delta} vs prior record (soft)")
+    # TEMPORARILY DISABLED — policy violations not yet distinguished by health impact
+    # Re-enable when account_health_impact flag is available in data
+    # if fs.curr_policy_total is not None and fs.curr_policy_total > 0:
+    #     if fs.curr_policy_total >= 20:
+    #         soft(2, f"POLICY_TOTAL_HIGH: {fs.curr_policy_total} total violations")
+    #     elif fs.curr_policy_total >= 5:
+    #         soft(1, f"POLICY_TOTAL_ELEVATED: {fs.curr_policy_total} total violations")
+    #
+    # if fs.policy_total_delta is not None and cfg_int("policy_delta_soft") <= fs.policy_total_delta < cfg_int("policy_delta_hard"):
+    #     soft(1, f"POLICY_COMPLIANCE_INCREASE: +{fs.policy_total_delta} vs prior record (soft)")
 
     # ── Notifications ─────────────────────────────────────────────────────────
     if fs.high_risk_notification_count >= cfg_int("notifications_hard_count"):
@@ -171,14 +175,6 @@ def score(fs: FeatureSet) -> PreScoreResult:
         soft(2, f"HIGH_RISK_NOTIFICATIONS: {fs.high_risk_notification_count}")
     elif fs.high_risk_notification_count >= cfg_int("notifications_soft_lo_count"):
         soft(1, f"HIGH_RISK_NOTIFICATIONS: {fs.high_risk_notification_count}")
-
-    # ── Payout / deferred ─────────────────────────────────────────────────────
-    if (
-        fs.deferred_transactions_pct is not None
-        and (fs.deferred_transactions_amount or 0) > cfg("deferred_soft_amt_usd")
-        and fs.deferred_transactions_pct >= cfg("deferred_soft_pct")
-    ):
-        soft(1, f"DEFERRED_TRANSACTIONS: {fs.deferred_transactions_pct:.0f}% of balance deferred")
 
     if fs.stmt_reserve_consecutive_negative == 1:
         soft(1, f"ACCOUNT_LEVEL_RESERVE: 1 period with negative reserve (${fs.stmt_reserve_max_negative:,.0f})")

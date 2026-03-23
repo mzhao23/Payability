@@ -136,7 +136,7 @@ Hard rules represent clear, directional risk signals. Each hard rule sets the sc
 | `ORDER_DEFECT_RATE` | Seller-fulfilled ODR > 1% (from Performance Over Time SF rows only; FBA-only or no SF data → skipped) | 8 |
 | `LATE_SHIPMENT_RATE` | LSR > 4% (Amazon red line) | 8 |
 | `NEG_FEEDBACK_TREND` | 30d neg rate ≥ 10pp above 60d window (min 10 orders) | 7 |
-| `POLICY_COMPLIANCE_INCREASE` | Total policy violations up ≥ 5 vs previous BQ record | 7 |
+| ~~`POLICY_COMPLIANCE_INCREASE`~~ | *Temporarily disabled — violations not distinguished by health impact* | 7 |
 | `ACCOUNT_LEVEL_RESERVE` | Negative reserve in ≥ 2 consecutive statement periods | 7 |
 | `ACCOUNT_LEVEL_RESERVE` | Single-period negative reserve > $5,000 | 7 |
 | `FAILED_DISBURSEMENT` | Most recent closed statement is a failed disbursement | 7 |
@@ -153,10 +153,9 @@ Soft rules add penalty points to the score. They represent weaker signals that a
 | Feedback | 30d negative rate | > 10% (min 10 orders) | +2 |
 | Feedback | 30d negative rate | 5–10% (min 10 orders) | +1 |
 | Loans | Outstanding balance | > $0 | +1 |
-| Policy | Total violations | ≥ 20 / 5–19 | +2 / +1 |
-| Policy | Violations increase | +2 to +4 vs prior record | +1 |
+| ~~Policy~~ | *Total violations — temporarily disabled* | ≥ 20 / 5–19 | +2 / +1 |
+| ~~Policy~~ | *Violations increase — temporarily disabled* | +2 to +4 vs prior record | +1 |
 | Notifications | High-risk notifications | ≥ 10 / 5–9 / 2–4 | +2 / +2 / +1 |
-| Payout | Deferred transactions | ≥ 50% and > $5,000 | +1 |
 | Payout | Failed disbursement | Historical (90d) but since recovered | +1 |
 | Payout | Reserve | 1 period negative | +1 |
 | Payout | Reserve | Worsening across periods | +1 |

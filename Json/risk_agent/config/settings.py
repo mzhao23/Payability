@@ -19,8 +19,11 @@ def _require(key: str) -> str:
 
 
 # ── Anthropic ──────────────────────────────────────────────────────────────────
-ANTHROPIC_API_KEY: str = _require("ANTHROPIC_API_KEY")
+ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL: str = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "claude")  # "claude" or "gemini"
 
 # ── BigQuery ───────────────────────────────────────────────────────────────────
 BQ_SERVICE_ACCOUNT_PATH: str | None = os.getenv("BQ_SERVICE_ACCOUNT_PATH")
@@ -40,4 +43,4 @@ MAX_ROWS: int = int(os.getenv("MAX_ROWS", "0"))
 DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 # Number of parallel workers for LLM + Supabase calls (5 is a safe default)
-PIPELINE_WORKERS: int = int(os.getenv("PIPELINE_WORKERS", "3"))
+PIPELINE_WORKERS: int = int(os.getenv("PIPELINE_WORKERS", "5"))

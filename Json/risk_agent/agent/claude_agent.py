@@ -1,11 +1,11 @@
 """agent/claude_agent.py
 
-Sends the FeatureSet + pre-score context to Claude and parses the structured
+Sends the FeatureSet + pre-score context to an LLM and parses the structured
 JSON risk report back.
 
-The module is intentionally structured so that the AI provider can be swapped
-(e.g. Vertex AI / Gemini) by replacing _call_llm() without touching anything
-else in the codebase.
+Provider is controlled by the LLM_PROVIDER env var:
+  LLM_PROVIDER=claude   → Anthropic Claude (default)
+  LLM_PROVIDER=gemini   → Google Gemini (Google AI Studio)
 """
 
 from __future__ import annotations
@@ -15,6 +15,8 @@ import re
 from typing import Any
 
 import anthropic
+from google import genai
+from google.genai import errors as genai_errors
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -24,14 +26,13 @@ from tenacity import (
 
 from config import settings
 from config.agent_config import cfg_int as _cfg_int
+
 from config.models import Metric, RiskReport
 from extractors.feature_extractor import FeatureSet
 from scoring.rule_scorer import PreScoreResult
 from utils.logger import get_logger
 
 log = get_logger("claude_agent")
-
-_client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
 
 # ── System prompt ──────────────────────────────────────────────────────────────
 _SYSTEM_PROMPT = """
@@ -65,7 +66,7 @@ REQUIRED metrics to include (use null if data is unavailable):
   feedback_negative_30d, feedback_negative_60d_window, feedback_negative_trend_delta,
   feedback_count_30d,
   outstanding_loan_amount, past_due_amount,
-  policy_compliance_total, policy_compliance_delta,
+  policy_compliance_total,
   sales_30_days, total_balance, funds_available,
   stmt_reserve_consecutive_negative, stmt_reserve_max_negative, stmt_reserve_is_worsening,
   failed_disbursement_count,
@@ -97,11 +98,30 @@ IMPORTANT JUDGEMENT GUIDELINES:
    - A large but stable reserve on a high-volume account is normal operational behaviour.
 
 5. Policy compliance:
-   - High violation counts are only meaningful if they are actively impacting the account
-     (e.g. listings removed, account suspended, enforcement actions in notifications).
-   - If the account status is OK and fulfillment metrics are healthy, elevated historic
-     violation counts should be treated as a moderate signal, not a critical one.
+   - Policy violation counts are provided for context ONLY — do NOT use them to drive
+     the risk score up. The rule engine has disabled policy compliance scoring because
+     violations cannot yet be distinguished by whether they impact account health.
+   - Food safety violations are especially common for food/grocery sellers and rarely
+     indicate real risk. Ignore them unless there is direct evidence of account suspension.
+   - Deferred transactions are normal under Amazon's DD+7 policy (payments held until
+     7 days after delivery). Do NOT treat deferred balance as a risk signal.
 """.strip()
+
+# ── Provider clients (initialised lazily based on LLM_PROVIDER) ──────────────
+_anthropic_client: anthropic.Anthropic | None = None
+_gemini_model: genai.Client | None = None
+
+def _get_anthropic_client() -> anthropic.Anthropic:
+    global _anthropic_client
+    if _anthropic_client is None:
+        _anthropic_client = anthropic.Anthropic(api_key=settings.ANTHROPIC_API_KEY)
+    return _anthropic_client
+
+def _get_gemini_client() -> genai.Client:
+    global _gemini_model
+    if _gemini_model is None:
+        _gemini_model = genai.Client(api_key=settings.GEMINI_API_KEY)
+    return _gemini_model
 
 
 def _build_user_message(
@@ -209,22 +229,39 @@ def _parse_llm_response(text: str) -> dict:
     return json.loads(text[start:end])
 
 
-# ── LLM call — swap this function to change AI provider ───────────────────────
+# ── LLM call — provider selected via LLM_PROVIDER env var ───────────────────
 
 @retry(
-    retry=retry_if_exception_type((anthropic.RateLimitError, anthropic.APIStatusError)),
+    retry=retry_if_exception_type((
+        anthropic.RateLimitError, anthropic.APIStatusError,
+        genai_errors.APIError,
+    )),
     wait=wait_exponential(multiplier=2, min=4, max=60),
     stop=stop_after_attempt(4),
 )
 def _call_llm(user_message: str) -> str:
-    """Call Claude and return the raw text response."""
-    response = _client.messages.create(
-        model=settings.ANTHROPIC_MODEL,
-        max_tokens=2000,
-        system=_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_message}],
-    )
-    return response.content[0].text
+    """Call the configured LLM provider and return the raw text response."""
+    provider = settings.LLM_PROVIDER.lower()
+    if provider == "gemini":
+        response = _get_gemini_client().models.generate_content(
+            model=settings.GEMINI_MODEL,
+            contents=user_message,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=_SYSTEM_PROMPT,
+                max_output_tokens=4000,
+                thinking_config=genai.types.ThinkingConfig(thinking_budget=0),  # disable thinking to save tokens
+            ),
+        )
+        return response.text
+    else:
+        # Default: Claude
+        response = _get_anthropic_client().messages.create(
+            model=settings.ANTHROPIC_MODEL,
+            max_tokens=2000,
+            system=_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        return response.content[0].text
 
 
 # ── Flags that mean there is nothing useful for the LLM to analyse -----------
