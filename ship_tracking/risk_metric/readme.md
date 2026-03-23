@@ -4,6 +4,11 @@
 
 **Table:** `app_production_tracking_hub_trackingLabels`
 
+**Output Format:**
+
+![carrier](./json.png)
+
+
 **Key characteristics:**
 - CDC (Change Data Capture) table — multiple rows per package, deduplicated by latest `_sdc_sequence` per `sk`
 - Soft deletes via `_sdc_deleted_at`
@@ -35,6 +40,8 @@
 
 ![carrier](./Summary.png)
 
+Is this due to a data entry error, or does the order actually not have tracking information?
+
 **Carriers included:**
 
 | carrier_normalized | Reason |
@@ -48,15 +55,6 @@
 - Only orders older than `ship_sla_days = 3` are evaluated, to avoid flagging same-day orders that haven't shipped yet
 - `diff` is compared against the carrier-level baseline on the same day to distinguish supplier-specific anomalies from systemic carrier issues
 - `FEDEX_UNACTIVATED` is treated separately: `diff ≈ 0` and `untracked_rate = 1.0` are both expected and permanent for this carrier — the risk signal is **order volume**, not rate deviation
-
-**2026 findings:**
-
-| Carrier | Suppliers | Avg Untracked Rate | Avg Diff |
-|---|---|---|---|
-| FEDEX | 65 | 56.6% | +0.121 |
-| FEDEX_UNACTIVATED | 138 | 100% | ~0 |
-| UPS | 331 | 4.9% | +0.030 |
-| USPS | 382 | 28.1% | +0.029 |
 
 **Notable:** 138 suppliers have orders sitting in `FEDEX_UNACTIVATED` status — labels created but never activated in FedEx's system. This warrants further investigation as a potential fraud signal.
 
@@ -105,36 +103,86 @@ We initially designed a "stuck orders" metric for packages with `init` but no `p
 
 ## Risk Scoring
 
-After the three metrics are computed and stored in `supplier_daily_metrics`, an LLM-based scorer evaluates each supplier daily using the last 7 days of metric trends. 
+After the three metrics are computed, an LLM-based scorer evaluates each supplier daily.
 
-`
-You are evaluating the supplier's risk as of today (the most recent date in the data). The 7-day trend is provided as context to help you assess whether signals are improving or deteriorating.
-`
+Suppliers are skipped (score defaulted to 0) if they have insufficient order volume: no carrier with ≥ 5 orders and no price data with ≥ 5 orders.
 
-**Inputs to LLM per supplier:**
-- 7-day trend for price z-score
-- 7-day trend for untracked rate per carrier (where applicable)
-- 7-day trend for FedEx pickup lag (where applicable)
-- FEDEX_UNACTIVATED order volume
+---
 
-**Output written to `supplier_risk_scores`:**
-- `overall_risk_score`: integer 0–10 (higher = more dangerous)
-- `trigger_reason`: natural language explanation of key risk signals
+### Scoring Architecture
+
+Scoring is split between Python (quantitative) and LLM (qualitative + price/lag).
+
+**Step 1 — Python computes `untracked_score` (0–5):**
+
+For each carrier (FEDEX, UPS, USPS):
+
+```
+confidence = min(1.0, exp(order_volume / 100) / exp(1))
+carrier_score = untracked_rate × confidence × 7
+```
+
+All carrier scores are summed and capped at 5. The confidence function uses an exponential curve — volume has a bigger impact at higher order counts (e.g. 100 orders = full confidence, 20 orders ≈ 0.45 confidence).
+
+**Step 2 — Python computes `price_weight` based on `untracked_score`:**
+
+| untracked_score | price_weight |
+|---|---|
+| ≥ 3 | 1.0 |
+| 1.5 – 3 | 0.6 |
+| < 1.5 | 0.3 |
+
+Price signals matter most when untracked activity is already elevated. A supplier with high price escalation but normal shipping behavior is weighted down.
+
+**Step 3 — LLM scores price escalation and pickup lag, then combines:**
+
+Price escalation (raw score before weight):
+
+| Z-score | Raw price score |
+|---|---|
+| NULL or < 2.0 | +0 |
+| 2.0 – 3.0 | +1 |
+| 3.0 – 4.5 | +2 |
+| > 4.5 | +3 |
+
+Additional +1 if `max_zscore` is much higher than `latest_zscore` with ≥ 5 orders (concealed high-value order signal).
+
+`price_contribution = raw_price_score × price_weight`
+
+FedEx pickup lag (supporting signal only, +0 or +1):
+- Only applied when untracked or price is already elevated
+- `diff_vs_baseline > 2 days` → +1
+
+**Final score:**
+```
+overall_risk_score = untracked_score + price_contribution + lag_adjustment
+```
+Capped at 10. Result is a decimal.
+
+---
+
+### Output
+
+**`ship_risk_scores`** (append-only, one row per run per supplier):
+- `overall_risk_score`: decimal 0–10
+- `trigger_reason`: explanation citing specific raw values (rate, order volume, z-score)
 - `metrics`: snapshot of latest metric values
+- `supplier_name`: backfilled from BigQuery at pipeline runtime
 
-**Scoring guidance provided to LLM:**
+**`consolidated_flagged_supplier_list`** (upsert by `supplier_key + source`):
+- Suppliers with `overall_risk_score ≥ 5` are written here
+- Updated each run — always reflects the latest score
+
+---
+
+### Score Interpretation
 
 | Score | Interpretation |
 |---|---|
 | 0–2 | Normal behavior, no action needed |
 | 3–4 | Minor anomalies, worth monitoring |
-| 5–6 | Meaningful risk signals present |
+| 5–6 | Meaningful risk signals, flag for review |
 | 7–8 | Strong signals, multiple metrics elevated |
 | 9–10 | Critical risk, strong fraud or default indicators |
 
----
-
-## Pending
-
-- The thresholds need to confrimed.
-- We right now use llm to evaluate the risk per supplier everyday. Maybe it will miss the overall trend.
+**Authoritative scoring rules:** [`prompts/llm_risk_scorer.md`](./prompts/llm_risk_scorer.md)
