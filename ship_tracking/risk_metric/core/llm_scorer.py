@@ -1,14 +1,18 @@
 import json
 import logging
+import math
 import os
-from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, timedelta
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+
+def _today_et():
+    return datetime.now(ZoneInfo("America/New_York")).date()
 
 from openai import OpenAI
 
 from config.settings import GEMINI_API_KEY, GATEWAY_MODEL, GATEWAY_URL
-from core.supabase_client import SupabaseClient
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +20,44 @@ SYSTEM_PROMPT_PATH = os.path.join(os.path.dirname(__file__), "../prompts/llm_ris
 MAX_WORKERS = 30
 
 # Carriers that have untracked_rate data in metric 1
-TRACKED_CARRIERS = {"FEDEX", "FEDEX_UNACTIVATED", "UPS", "USPS"}
+# FEDEX_UNACTIVATED excluded for now — under engineering investigation
+TRACKED_CARRIERS = {"FEDEX", "UPS", "USPS"}
+
+# Minimum orders required for any carrier's untracked_rate to be a meaningful signal.
+# Below this threshold the rate is too volatile to act on.
+MIN_ORDERS_FOR_SIGNAL = 10
+
+# Minimum orders required for price escalation zscore to be meaningful.
+MIN_ORDERS_FOR_PRICE = 5
+
+
+def _compute_untracked_score(rows: list[dict]) -> float:
+    """Compute untracked score: sqrt(sum of squares) of per-carrier scores, capped at 5.
+    Per-carrier score = rate × exp(n/50)/exp(3) × 10. Carriers with < 10 orders excluded.
+    """
+    carrier_scores = []
+    for carrier in TRACKED_CARRIERS:
+        latest = next(
+            (r for r in sorted(
+                [r for r in rows if r.get("carrier") == carrier and r.get("m1_untracked_rate") is not None],
+                key=lambda r: str(r.get("last_purchase_date") or r.get("run_date") or ""),
+                reverse=True,
+            )),
+            None,
+        )
+        if latest is None:
+            continue
+        volume = latest.get("m1_total_orders") or 0
+        if volume < MIN_ORDERS_FOR_SIGNAL:
+            continue
+        rate = latest["m1_untracked_rate"]
+        confidence = min(1.0, math.exp(volume / 50) / math.exp(3))
+        carrier_scores.append(rate * confidence * 30)
+
+    if not carrier_scores:
+        return 0.0
+    total = math.sqrt(sum(s ** 2 for s in carrier_scores))
+    return round(min(8.0, total), 3)
 
 
 def _load_system_prompt() -> str:
@@ -24,44 +65,30 @@ def _load_system_prompt() -> str:
         return f.read()
 
 
-def _fetch_recent_metrics(sb: SupabaseClient) -> dict[str, list[dict]]:
-    """Fetch last 7 days of supplier_daily_metrics from Supabase, grouped by supplier_key."""
-    cutoff = (date.today() - timedelta(days=7)).isoformat()
-    response = (
-        sb.client.table("supplier_daily_metrics")
-        .select("*")
-        .gte("run_date", cutoff)
-        .order("run_date", desc=False)
-        .execute()
-    )
-    rows = response.data or []
-
-    grouped = defaultdict(list)
-    for row in rows:
-        grouped[row["supplier_key"]].append(row)
-    return dict(grouped)
-
 
 def _build_supplier_context(supplier_key: str, rows: list[dict]) -> dict:
-    """Build the metrics context dict for a supplier from their 7-day rows."""
-    evaluation_date = date.today().isoformat()
+    """Build the metrics context dict for a supplier from their latest Supabase row."""
+    evaluation_date = _today_et().isoformat()
     metrics = {}
 
     # ── Price escalation (carrier = 'ALL') ───────────────────
     price_rows = sorted(
         [r for r in rows if r.get("carrier") == "ALL" and r.get("m2_zscore") is not None],
-        key=lambda r: r["run_date"],
+        key=lambda r: str(r.get("last_purchase_date") or r.get("run_date") or ""),
     )
     if price_rows:
         latest = price_rows[-1]
         price_data = {}
+
+        if latest.get("m2_total_orders") is not None:
+            price_data["order_count_today"] = latest["m2_total_orders"]
         if latest.get("m2_zscore") is not None:
             price_data["latest_zscore"] = latest["m2_zscore"]
         if latest.get("m2_max_zscore") is not None:
             price_data["latest_max_zscore"] = latest["m2_max_zscore"]
-        trend = [r["m2_zscore"] for r in price_rows if r.get("m2_zscore") is not None]
-        if len(trend) > 1:
-            price_data["trend_7d"] = trend
+        if latest.get("m2_avg_of_avg") is not None:
+            price_data["rolling_avg_30d_value"] = latest["m2_avg_of_avg"]
+
         if price_data:
             metrics["price_escalation"] = price_data
 
@@ -70,38 +97,61 @@ def _build_supplier_context(supplier_key: str, rows: list[dict]) -> dict:
     for carrier in TRACKED_CARRIERS:
         carrier_rows = sorted(
             [r for r in rows if r.get("carrier") == carrier and r.get("m1_untracked_rate") is not None],
-            key=lambda r: r["run_date"],
+            key=lambda r: str(r.get("last_purchase_date") or r.get("run_date") or ""),
         )
         if not carrier_rows:
             continue
+
         latest = carrier_rows[-1]
-        carrier_data = {"latest_rate": latest["m1_untracked_rate"]}
+        if (latest.get("m1_total_orders") or 0) < MIN_ORDERS_FOR_SIGNAL:
+            continue
+
+        carrier_data = {
+            "latest_rate": latest["m1_untracked_rate"],
+        }
+
+        if latest.get("m1_rolling_avg_30d") is not None:
+            carrier_data["rolling_avg_30d_rate"] = latest["m1_rolling_avg_30d"]
         if latest.get("m1_diff") is not None:
-            carrier_data["latest_diff"] = latest["m1_diff"]
+            carrier_data["diff_vs_baseline"] = latest["m1_diff"]
         if latest.get("m1_total_orders") is not None:
-            carrier_data["total_orders"] = latest["m1_total_orders"]
-        trend = [r["m1_untracked_rate"] for r in carrier_rows if r.get("m1_untracked_rate") is not None]
-        if len(trend) > 1:
-            carrier_data["trend_7d"] = trend
+            carrier_data["order_volume_today"] = latest["m1_total_orders"]
+        if latest.get("m1_order_volume_7d") is not None:
+            carrier_data["order_volume_7d"] = latest["m1_order_volume_7d"]
+        if latest.get("m1_order_volume_7d_change_rate") is not None:
+            carrier_data["order_volume_7d_change_rate"] = latest["m1_order_volume_7d_change_rate"]
+
         untracked[carrier] = carrier_data
+
     if untracked:
         metrics["untracked_rate"] = untracked
+        untracked_score = _compute_untracked_score(rows)
+        metrics["untracked_score"] = untracked_score
+
+        if untracked_score >= 3:
+            price_weight = 1.0
+        elif untracked_score >= 1.5:
+            price_weight = 0.6
+        else:
+            price_weight = 0.3
+        metrics["price_weight"] = price_weight
 
     # ── FedEx pickup lag (carrier = 'ALL') ───────────────────
     lag_rows = sorted(
         [r for r in rows if r.get("carrier") == "ALL" and r.get("m3a_avg_pickup_lag") is not None],
-        key=lambda r: r["run_date"],
+        key=lambda r: str(r.get("last_purchase_date") or r.get("run_date") or ""),
     )
     if lag_rows:
         latest = lag_rows[-1]
         lag_data = {}
+
         if latest.get("m3a_avg_pickup_lag") is not None:
             lag_data["latest_avg_lag"] = latest["m3a_avg_pickup_lag"]
+        if latest.get("m3a_rolling_avg_30d") is not None:
+            lag_data["rolling_avg_30d_lag"] = latest["m3a_rolling_avg_30d"]
         if latest.get("m3a_diff") is not None:
-            lag_data["latest_diff"] = latest["m3a_diff"]
-        trend = [r["m3a_avg_pickup_lag"] for r in lag_rows if r.get("m3a_avg_pickup_lag") is not None]
-        if len(trend) > 1:
-            lag_data["trend_7d"] = trend
+            lag_data["diff_vs_baseline"] = latest["m3a_diff"]
+
         if lag_data:
             metrics["fedex_pickup_lag"] = lag_data
 
@@ -116,7 +166,7 @@ def _build_output_row(supplier_key: str, rows: list[dict], llm_result: dict) -> 
     """Build the supplier_risk_scores row from latest metric values + LLM output."""
     all_rows = sorted(
         [r for r in rows if r.get("carrier") == "ALL"],
-        key=lambda r: r["run_date"],
+        key=lambda r: str(r.get("last_purchase_date") or r.get("run_date") or ""),
     )
     latest_all = all_rows[-1] if all_rows else {}
 
@@ -124,7 +174,7 @@ def _build_output_row(supplier_key: str, rows: list[dict], llm_result: dict) -> 
     for carrier in TRACKED_CARRIERS:
         c_rows = sorted(
             [r for r in rows if r.get("carrier") == carrier and r.get("m1_untracked_rate") is not None],
-            key=lambda r: r["run_date"],
+            key=lambda r: str(r.get("last_purchase_date") or r.get("run_date") or ""),
         )
         if c_rows:
             latest_by_carrier[carrier] = c_rows[-1]
@@ -135,20 +185,27 @@ def _build_output_row(supplier_key: str, rows: list[dict], llm_result: dict) -> 
         if value is not None:
             metrics.append({"metric_id": metric_id, "value": value, "unit": unit})
 
-    _add("m2_zscore", latest_all.get("m2_zscore"), "standard_deviations")
-    _add("m2_max_zscore", latest_all.get("m2_max_zscore"), "standard_deviations")
+    _add("avg_price_zscore", latest_all.get("m2_zscore"), "standard_deviations")
+    _add("max_order_price_zscore", latest_all.get("m2_max_zscore"), "standard_deviations")
 
     for carrier, row in latest_by_carrier.items():
-        _add(f"m1_untracked_rate_{carrier.lower()}", row.get("m1_untracked_rate"), "rate")
+        _add(f"untracked_rate_{carrier.lower()}", row.get("m1_untracked_rate"), "rate")
+        _add(f"order_count_{carrier.lower()}", row.get("m1_total_orders"), "orders")
 
-    _add("m3a_avg_pickup_lag", latest_all.get("m3a_avg_pickup_lag"), "days")
-    _add("m3a_diff", latest_all.get("m3a_diff"), "days")
+    _add("fedex_pickup_lag_days", latest_all.get("m3a_avg_pickup_lag"), "days")
+    _add("fedex_pickup_lag_vs_baseline", latest_all.get("m3a_diff"), "days")
+
+    last_purchase_date = max(
+        (str(r["last_purchase_date"]) for r in rows if r.get("last_purchase_date")),
+        default=None,
+    )
 
     return {
-        "table_name": "supplier_risk_scores",
+        "table_name": "ship_tracking",
         "supplier_key": supplier_key,
         "supplier_name": None,
-        "report_date": date.today().isoformat(),
+        "report_date": _today_et().isoformat(),
+        "last_purchase_date": str(last_purchase_date) if last_purchase_date else None,
         "metrics": metrics,
         "trigger_reason": llm_result.get("trigger_reason"),
         "overall_risk_score": llm_result.get("overall_risk_score"),
@@ -173,7 +230,6 @@ def _call_llm(client: OpenAI, system_prompt: str, supplier_context: dict) -> dic
                 temperature=0,
             )
             content = response.choices[0].message.content.strip()
-            # Strip markdown code blocks if present (e.g. ```json ... ```)
             if content.startswith("```"):
                 content = content.split("```")[1]
                 if content.startswith("json"):
@@ -193,12 +249,53 @@ def _call_llm(client: OpenAI, system_prompt: str, supplier_context: dict) -> dic
     return None
 
 
+def _has_sufficient_volume(rows: list[dict]) -> bool:
+    """
+    Returns True if at least one carrier has enough orders today to produce
+    a reliable untracked_rate signal, OR if there is price escalation data.
+    Suppliers below the volume threshold are skipped — their metrics are too
+    volatile to score meaningfully.
+    """
+    # Price escalation: only meaningful if there are enough orders today
+    price_row = next(
+        (r for r in sorted(rows, key=lambda r: str(r.get("last_purchase_date") or r.get("run_date") or ""), reverse=True)
+         if r.get("carrier") == "ALL" and r.get("m2_zscore") is not None
+         and (r.get("m2_total_orders") or 0) >= MIN_ORDERS_FOR_PRICE),
+        None,
+    )
+    if price_row:
+        return True
+
+    # Check if any tracked carrier clears the order volume threshold today
+    for carrier in TRACKED_CARRIERS:
+        latest = next(
+            (r for r in sorted(rows, key=lambda r: str(r.get("last_purchase_date") or r.get("run_date") or ""), reverse=True)
+             if r.get("carrier") == carrier and r.get("m1_total_orders") is not None),
+            None,
+        )
+        if latest and latest["m1_total_orders"] >= MIN_ORDERS_FOR_SIGNAL:
+            return True
+
+    return False
+
+
 def _score_supplier(
     supplier_key: str,
     rows: list[dict],
     client: OpenAI,
     system_prompt: str,
 ) -> dict | None:
+    if not _has_sufficient_volume(rows):
+        logger.debug(f"  Skipping {supplier_key}: insufficient order volume")
+        return _build_output_row(
+            supplier_key,
+            rows,
+            {
+                "overall_risk_score": 0,
+                "trigger_reason": "Insufficient order volume across all carriers for a reliable signal. Score defaulted to 0.",
+            },
+        )
+
     context = _build_supplier_context(supplier_key, rows)
     llm_result = _call_llm(client, system_prompt, context)
     if llm_result is None:
@@ -206,13 +303,11 @@ def _score_supplier(
     return _build_output_row(supplier_key, rows, llm_result)
 
 
-def run(sb: SupabaseClient) -> list[dict]:
+def run(grouped: dict[str, list[dict]]) -> list[dict]:
     """
-    Read supplier_daily_metrics, score each supplier with the LLM in parallel,
-    and return list of rows ready for supplier_risk_scores upsert.
+    Score each supplier with the LLM in parallel using today's BQ rows.
+    Returns list of rows ready for supplier_risk_scores upsert.
     """
-    logger.info("[LLM Scorer] Fetching supplier_daily_metrics (last 7 days)...")
-    grouped = _fetch_recent_metrics(sb)
     total = len(grouped)
     logger.info(f"[LLM Scorer] Scoring {total} suppliers with {MAX_WORKERS} workers...")
 

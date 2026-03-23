@@ -10,6 +10,8 @@ Cron (daily at 6am UTC):
 """
 
 import logging
+import uuid
+from collections import defaultdict
 from datetime import date
 
 from core.bigquery_client import BigQueryClient
@@ -41,22 +43,52 @@ def run_pipeline():
     # ── Metric 3: FedEx Pickup Performance ──────────────────
     rows_3, _ = metric_3_pickup_lag.run(bq)
 
-    # ── Write unified daily snapshot ─────────────────────────
-    logger.info("\n[supplier_daily_metrics] Merging and writing daily snapshot...")
-    merged = {}
+    # ── Group BQ rows by supplier for LLM scorer ─────────────
+    run_id = str(uuid.uuid4())
+    supplier_rows = defaultdict(list)
     for row in rows_1 + rows_2 + rows_3:
-        key = (row["run_date"], row["supplier_key"], row["carrier"])
-        if key not in merged:
-            merged[key] = row
-        else:
-            merged[key].update(row)
-
-    sb.upsert("supplier_daily_metrics", list(merged.values()))
+        if row.get("supplier_key"):
+            supplier_rows[row["supplier_key"]].append(row)
 
     # ── LLM Risk Scoring ─────────────────────────────────────
     logger.info("\n[LLM Scorer] Running LLM risk scoring...")
-    risk_scores = llm_scorer.run(sb)
-    sb.upsert("supplier_risk_scores", risk_scores)
+    risk_scores = llm_scorer.run(dict(supplier_rows))
+    for row in risk_scores:
+        row["run_id"] = run_id
+
+    # ── Backfill supplier names from BigQuery ─────────────────
+    logger.info("\n[Supplier Names] Fetching name map from BigQuery...")
+    name_rows = bq.run_query("""
+        SELECT DISTINCT supplier_key, supplier_name
+        FROM `bigqueryexport-183608.PayabilitySheets.vm_transaction_summary`
+        WHERE supplier_name IS NOT NULL AND supplier_key IS NOT NULL
+    """)
+    name_map = {str(r["supplier_key"]): r["supplier_name"] for r in name_rows}
+    logger.info(f"  → {len(name_map)} supplier names loaded")
+
+    for row in risk_scores:
+        row["supplier_name"] = name_map.get(str(row["supplier_key"]))
+
+    sb.upsert("ship_risk_scores", risk_scores)
+
+    # ── Write high-risk suppliers to alerts table ─────────────
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    alerts = [
+        {
+            "supplier_key": r["supplier_key"],
+            "supplier_name": r["supplier_name"],
+            "source": "ship_tracking",
+            "created_at": datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S"),
+            "metrics": r["metrics"],
+            "reasons": [r["trigger_reason"]] if r.get("trigger_reason") else [],
+            "overall_risk_score": r["overall_risk_score"],
+        }
+        for r in risk_scores if float(r.get("overall_risk_score", 0)) >= 5
+    ]
+    if alerts:
+        logger.info(f"\n[Alerts] Writing {len(alerts)} high-risk suppliers to consolidated_flagged_supplier_list...")
+        sb.upsert("consolidated_flagged_supplier_list", alerts)
 
     # ── Summary ──────────────────────────────────────────────
     logger.info("\n✅ Pipeline completed successfully!")

@@ -38,7 +38,11 @@ order_level_aggregation AS (
         supplier_key,
         carrier_normalized,
         order_id,
-        CASE WHEN COUNTIF(init_timestamp IS NOT NULL AND init_timestamp != '') = 0
+        CASE WHEN COUNTIF(
+                 init_timestamp IS NOT NULL AND init_timestamp != ''
+                 AND CAST(init_timestamp AS TIMESTAMP)
+                     <= TIMESTAMP(CAST(order_date AS DATE) + INTERVAL ship_sla_days DAY)
+             ) = 0
              THEN 1 ELSE 0 END AS is_untracked
     FROM filtered_labels
     WHERE order_date IS NOT NULL AND order_date != ''
@@ -62,6 +66,25 @@ rolling_baseline_supplier AS (
             ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
         ) AS rolling_avg_30d
     FROM daily_supplier_carrier_stats
+),
+with_volume_trend AS (
+    SELECT *,
+        ARRAY_AGG(total_orders) OVER (
+            PARTITION BY supplier_key, carrier_normalized
+            ORDER BY order_date
+            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+        ) AS order_volume_7d,
+        SAFE_DIVIDE(
+            total_orders - LAG(total_orders, 6) OVER (
+                PARTITION BY supplier_key, carrier_normalized
+                ORDER BY order_date
+            ),
+            NULLIF(LAG(total_orders, 6) OVER (
+                PARTITION BY supplier_key, carrier_normalized
+                ORDER BY order_date
+            ), 0)
+        ) AS order_volume_7d_change_rate
+    FROM rolling_baseline_supplier
 )
 -- Result A: by supplier + carrier
 SELECT
@@ -73,8 +96,10 @@ SELECT
     untracked_rate,
     rolling_avg_30d,
     untracked_rate - COALESCE(rolling_avg_30d, 0) AS diff,
+    order_volume_7d,
+    order_volume_7d_change_rate,
     'by_supplier' AS result_type
-FROM rolling_baseline_supplier
+FROM with_volume_trend
 WHERE order_date >= DATE_SUB(CURRENT_DATE(), INTERVAL (window_days + ship_sla_days) DAY)
 
 UNION ALL
@@ -90,8 +115,10 @@ SELECT
     SAFE_DIVIDE(SUM(untracked_orders), SUM(total_orders)) AS untracked_rate,
     AVG(rolling_avg_30d) AS rolling_avg_30d,
     SAFE_DIVIDE(SUM(untracked_orders), SUM(total_orders)) - AVG(COALESCE(rolling_avg_30d, 0)) AS diff,
+    NULL AS order_volume_7d,
+    NULL AS order_volume_7d_change_rate,
     'by_carrier' AS result_type
-FROM rolling_baseline_supplier
+FROM with_volume_trend
 WHERE order_date >= DATE_SUB(CURRENT_DATE(), INTERVAL (window_days + ship_sla_days) DAY)
 GROUP BY 1, 3
 

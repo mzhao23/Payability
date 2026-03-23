@@ -1,6 +1,7 @@
 import logging
 import os
-from datetime import date
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from core.bigquery_client import BigQueryClient
 from config.settings import PARAMS, BQ_TABLE
 
@@ -20,7 +21,7 @@ def run(bq: BigQueryClient) -> tuple[list, dict]:
       - risk_dict: { supplier_key -> { pickup_lag: row, stuck_orders: row } } for risk scoring
     """
 
-    run_date = date.today()
+    run_date = datetime.now(ZoneInfo("America/New_York")).date()
 
     # ── 3A: Pickup Lag Trend ─────────────────────────────────
     logger.info("[Metric 3A] Running FedEx Init to Pickup Lag...")
@@ -47,6 +48,7 @@ def run(bq: BigQueryClient) -> tuple[list, dict]:
             "m3a_total_packages": row.get("total_packages"),
             "m3a_rolling_avg_30d": row.get("rolling_avg_30d"),
             "m3a_diff": row.get("diff"),
+            "last_purchase_date": row.get("order_date"),
         }
         for key, row in unified_by_supplier.items()
     }

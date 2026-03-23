@@ -8,8 +8,7 @@ logger = logging.getLogger(__name__)
 # Unique constraint columns per table
 # Must match the UNIQUE constraint defined in migrations
 TABLE_CONFLICT_COLUMNS = {
-    "supplier_daily_metrics": "run_date,supplier_key,carrier",
-    "supplier_risk_scores": "report_date,supplier_key",
+    "consolidated_flagged_supplier_list": "supplier_key,source",
 }
 
 

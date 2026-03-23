@@ -1,6 +1,7 @@
 import logging
 import os
-from datetime import date
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from core.bigquery_client import BigQueryClient
 from config.settings import PARAMS, BQ_TABLE
 
@@ -24,7 +25,7 @@ def run(bq: BigQueryClient) -> tuple[list, dict]:
         "window_days": PARAMS["window_days"],
     })
 
-    run_date = date.today()
+    run_date = datetime.now(ZoneInfo("America/New_York")).date()
 
     # Build unified rows for supplier_daily_metrics
     unified_rows = []
@@ -38,7 +39,10 @@ def run(bq: BigQueryClient) -> tuple[list, dict]:
             "m1_untracked_rate": row.get("untracked_rate"),
             "m1_rolling_avg_30d": row.get("rolling_avg_30d"),
             "m1_diff": row.get("diff"),
+            "m1_order_volume_7d": row.get("order_volume_7d"),
+            "m1_order_volume_7d_change_rate": row.get("order_volume_7d_change_rate"),
             "m1_result_type": row.get("result_type"),
+            "last_purchase_date": row.get("order_date"),
         })
 
     # Return only by_supplier rows, latest per supplier, for risk scoring
