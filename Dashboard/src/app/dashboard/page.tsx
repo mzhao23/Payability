@@ -26,8 +26,8 @@ type AgentMeta = {
 
 const SOURCE_LABELS: Record<string, string> = {
   daily_summary_report: "Daily Summary Agent",
-  shipment_agent: "Shipment Agent",
-  json_agent: "JSON Agent",
+  ship_tracking: "Shipment Agent",
+  json_report: "JSON Agent",
   decision_agent: "Decision Agent",
 };
 
