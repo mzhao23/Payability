@@ -422,7 +422,13 @@ export default function DashboardPage() {
                   {(Array.isArray(selectedRecord.metrics) ? selectedRecord.metrics : []).map((m: any, i: number) => (
                     <div key={i} className="bg-gray-50 dark:bg-zinc-800 rounded p-2 flex justify-between text-sm">
                       <span className="font-mono text-gray-700 dark:text-zinc-300">{m.metric_id}</span>
-                      <span className="text-gray-900 dark:text-zinc-100 font-medium">{m.value != null ? `${m.value} ${m.unit}` : "N/A"}</span>
+                      <span className="text-gray-900 dark:text-zinc-100 font-medium">
+                        {m.value != null
+                          ? m.unit != null && String(m.unit).trim() !== ""
+                            ? `${m.value} ${m.unit}`
+                            : `${m.value}`
+                          : "N/A"}
+                      </span>
                     </div>
                   ))}
                 </div>
