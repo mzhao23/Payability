@@ -1,7 +1,9 @@
 "use client";
 import { useState, useEffect, useCallback } from "react";
 import { getSupabaseBrowser } from "@/lib/supabase-browser";
+import { EASTERN_TZ, easternDateYmd, easternYmdToUtcRange } from "@/lib/eastern-date";
 import { useRouter } from "next/navigation";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 type FlaggedRecord = {
   id: number;
@@ -24,12 +26,49 @@ type AgentMeta = {
   active_rules: string;
 };
 
+function formatEastern(
+  utcString: string | null | undefined,
+  opts?: { dateOnly?: boolean }
+): string {
+  if (!utcString) return "—";
+  const normalized = utcString.includes("T") ? utcString : utcString.replace(" ", "T");
+  const d = new Date(normalized);
+  if (Number.isNaN(d.getTime())) return utcString;
+
+  if (opts?.dateOnly) {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: EASTERN_TZ,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(d);
+  }
+
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: EASTERN_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    timeZoneName: "short",
+  }).format(d);
+}
+
 const SOURCE_LABELS: Record<string, string> = {
   daily_summary_report: "Daily Summary Agent",
   ship_tracking: "Shipment Agent",
   json_report: "JSON Agent",
   decision_agent: "Decision Agent",
 };
+
+const FIELD =
+  "border border-gray-300 dark:border-zinc-600 rounded text-sm text-gray-900 dark:text-zinc-100 bg-white dark:bg-zinc-800 placeholder:text-gray-600 dark:placeholder:text-zinc-400";
+const FIELD_FULL = `w-full px-2 py-1.5 ${FIELD}`;
+const FIELD_NARROW = `w-14 px-2 py-1.5 ${FIELD}`;
+const LABEL = "block text-xs text-gray-500 dark:text-zinc-400 mb-1";
 
 export default function DashboardPage() {
   const supabase = getSupabaseBrowser();
@@ -40,7 +79,7 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [agentMeta, setAgentMeta] = useState<Record<string, AgentMeta>>({});
 
-  const [dateFilter, setDateFilter] = useState(new Date().toISOString().slice(0, 10));
+  const [dateFilter, setDateFilter] = useState(() => easternDateYmd());
   const [sourceFilter, setSourceFilter] = useState("all");
   const [searchTerm, setSearchTerm] = useState("");
   const [scoreMin, setScoreMin] = useState(1);
@@ -76,11 +115,12 @@ export default function DashboardPage() {
 
   const loadRecords = useCallback(async () => {
     setLoading(true);
+    const { startIso, endIso } = easternYmdToUtcRange(dateFilter);
     let query = supabase
       .from("consolidated_flagged_supplier_list")
       .select("*")
-      .gte("created_at", `${dateFilter}T00:00:00Z`)
-      .lte("created_at", `${dateFilter}T23:59:59Z`)
+      .gte("created_at", startIso)
+      .lte("created_at", endIso)
       .gte("overall_risk_score", scoreMin)
       .lte("overall_risk_score", scoreMax)
       .order("overall_risk_score", { ascending: false });
@@ -137,15 +177,20 @@ export default function DashboardPage() {
 
   function exportCSV() {
     const headers = ["Report Date", "Supplier Key", "Supplier Name", "Risk Score", "Source", "Status", "Reasons"];
-    const rows = records.map((r) => [
-      r.created_at.slice(0, 10),
-      r.supplier_key,
-      r.supplier_name,
-      r.overall_risk_score,
-      SOURCE_LABELS[r.source] ?? r.source,
-      r.status,
-      Array.isArray(r.reasons) ? r.reasons.join("; ") : "",
-    ]);
+    const rows = records.map((r) => {
+      const normalized = r.created_at.includes("T") ? r.created_at : r.created_at.replace(" ", "T");
+      const d = new Date(normalized);
+      const reportDate = Number.isNaN(d.getTime()) ? r.created_at.slice(0, 10) : easternDateYmd(d);
+      return [
+        reportDate,
+        r.supplier_key,
+        r.supplier_name,
+        r.overall_risk_score,
+        SOURCE_LABELS[r.source] ?? r.source,
+        r.status,
+        Array.isArray(r.reasons) ? r.reasons.join("; ") : "",
+      ];
+    });
     const csv = [headers, ...rows].map((r) => r.map((c) => `"${c}"`).join(",")).join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
@@ -163,27 +208,30 @@ export default function DashboardPage() {
   if (!user) return null;
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      <header className="bg-white border-b px-6 py-4 flex justify-between items-center">
-        <h1 className="text-xl font-bold text-gray-900">Payability Risk Dashboard</h1>
-        <div className="flex items-center gap-4">
-          <span className="text-sm text-gray-500">{user.email}</span>
-          <button onClick={handleLogout} className="text-sm text-red-600 hover:underline">Sign Out</button>
+    <div className="min-h-screen bg-gray-50 dark:bg-zinc-950">
+      <header className="bg-white dark:bg-zinc-900 border-b border-gray-200 dark:border-zinc-800 px-6 py-4 flex justify-between items-center gap-4">
+        <h1 className="text-xl font-bold text-gray-900 dark:text-zinc-100">Payability Risk Dashboard</h1>
+        <div className="flex items-center gap-4 flex-wrap justify-end">
+          <ThemeToggle />
+          <span className="text-sm text-gray-500 dark:text-zinc-400">{user.email}</span>
+          <button onClick={handleLogout} className="text-sm text-red-600 dark:text-red-400 hover:underline">
+            Sign Out
+          </button>
         </div>
       </header>
 
       <div className="p-6 max-w-7xl mx-auto">
         {/* Filters */}
-        <div className="bg-white rounded-lg shadow p-4 mb-6 grid grid-cols-2 md:grid-cols-6 gap-3">
+        <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 mb-6 grid grid-cols-2 md:grid-cols-6 gap-3">
           <div>
-            <label className="block text-xs text-gray-500 mb-1">Date</label>
+            <label className={LABEL}>Date</label>
             <input type="date" value={dateFilter} onChange={(e) => setDateFilter(e.target.value)}
-              className="w-full px-2 py-1.5 border rounded text-sm" />
+              className={FIELD_FULL} />
           </div>
           <div>
-            <label className="block text-xs text-gray-500 mb-1">Agent</label>
+            <label className={LABEL}>Agent</label>
             <select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)}
-              className="w-full px-2 py-1.5 border rounded text-sm">
+              className={FIELD_FULL}>
               <option value="all">All Agents</option>
               {Object.entries(SOURCE_LABELS).map(([key, label]) => (
                 <option key={key} value={key}>{label}</option>
@@ -191,27 +239,27 @@ export default function DashboardPage() {
             </select>
           </div>
           <div>
-            <label className="block text-xs text-gray-500 mb-1">Search</label>
+            <label className={LABEL}>Search</label>
             <input type="text" placeholder="Name or key..." value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
-              className="w-full px-2 py-1.5 border rounded text-sm" />
+              className={FIELD_FULL} />
           </div>
           <div>
-            <label className="block text-xs text-gray-500 mb-1">Score Range</label>
-            <div className="flex gap-1">
+            <label className={LABEL}>Score Range</label>
+            <div className="flex gap-1 items-center text-gray-900 dark:text-zinc-100">
               <input type="number" min={1} max={10} value={scoreMin}
                 onChange={(e) => setScoreMin(Number(e.target.value))}
-                className="w-14 px-2 py-1.5 border rounded text-sm" />
+                className={FIELD_NARROW} />
               <span className="py-1.5">-</span>
               <input type="number" min={1} max={10} value={scoreMax}
                 onChange={(e) => setScoreMax(Number(e.target.value))}
-                className="w-14 px-2 py-1.5 border rounded text-sm" />
+                className={FIELD_NARROW} />
             </div>
           </div>
           <div>
-            <label className="block text-xs text-gray-500 mb-1">Status</label>
+            <label className={LABEL}>Status</label>
             <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}
-              className="w-full px-2 py-1.5 border rounded text-sm">
+              className={FIELD_FULL}>
               <option value="all">All</option>
               <option value="pending_review">Pending Review</option>
               <option value="reviewed">Reviewed</option>
@@ -227,64 +275,64 @@ export default function DashboardPage() {
 
         {/* Summary cards */}
         <div className="grid grid-cols-4 gap-4 mb-6">
-          <div className="bg-white rounded-lg shadow p-4 text-center">
-            <div className="text-2xl font-bold text-gray-900">{records.length}</div>
-            <div className="text-xs text-gray-500">Flagged Total</div>
+          <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 text-center">
+            <div className="text-2xl font-bold text-gray-900 dark:text-zinc-100">{records.length}</div>
+            <div className="text-xs text-gray-500 dark:text-zinc-400">Flagged Total</div>
           </div>
-          <div className="bg-white rounded-lg shadow p-4 text-center">
-            <div className="text-2xl font-bold text-red-600">
+          <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 text-center">
+            <div className="text-2xl font-bold text-red-600 dark:text-red-400">
               {records.filter((r) => r.overall_risk_score >= 8).length}
             </div>
-            <div className="text-xs text-gray-500">Critical (8-10)</div>
+            <div className="text-xs text-gray-500 dark:text-zinc-400">Critical (8-10)</div>
           </div>
-          <div className="bg-white rounded-lg shadow p-4 text-center">
-            <div className="text-2xl font-bold text-yellow-600">
+          <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 text-center">
+            <div className="text-2xl font-bold text-yellow-600 dark:text-yellow-500">
               {records.filter((r) => r.status === "pending_review").length}
             </div>
-            <div className="text-xs text-gray-500">Pending Review</div>
+            <div className="text-xs text-gray-500 dark:text-zinc-400">Pending Review</div>
           </div>
-          <div className="bg-white rounded-lg shadow p-4 text-center">
-            <div className="text-2xl font-bold text-green-600">
+          <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 text-center">
+            <div className="text-2xl font-bold text-green-600 dark:text-green-400">
               {records.filter((r) => r.status === "reviewed").length}
             </div>
-            <div className="text-xs text-gray-500">Reviewed</div>
+            <div className="text-xs text-gray-500 dark:text-zinc-400">Reviewed</div>
           </div>
         </div>
 
         {/* Table */}
-        <div className="bg-white rounded-lg shadow overflow-hidden">
+        <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 overflow-hidden">
           <table className="w-full text-sm">
-            <thead className="bg-gray-50 border-b">
+            <thead className="bg-gray-50 dark:bg-zinc-800 border-b border-gray-200 dark:border-zinc-700">
               <tr>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500">Date</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500">Supplier</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500">Key</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500">Score</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500">Flagged By</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500">Reason</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500">Status</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Date</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Supplier</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Key</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Score</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Flagged By</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Reason</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Status</th>
               </tr>
             </thead>
-            <tbody className="divide-y">
+            <tbody className="divide-y divide-gray-200 dark:divide-zinc-700">
               {loading ? (
-                <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400">Loading...</td></tr>
+                <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">Loading...</td></tr>
               ) : records.length === 0 ? (
-                <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400">No records found</td></tr>
+                <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">No records found</td></tr>
               ) : (
                 records.map((r) => (
-                  <tr key={r.id} onClick={() => openDetail(r)} className="hover:bg-blue-50 cursor-pointer">
-                    <td className="px-4 py-3 text-gray-600">{r.created_at.slice(0, 10)}</td>
-                    <td className="px-4 py-3 font-medium text-gray-900">{r.supplier_name}</td>
-                    <td className="px-4 py-3 text-gray-500 font-mono text-xs">{r.supplier_key.slice(0, 8)}...</td>
+                  <tr key={r.id} onClick={() => openDetail(r)} className="hover:bg-blue-50 dark:hover:bg-zinc-800 cursor-pointer">
+                    <td className="px-4 py-3 text-gray-600 dark:text-zinc-300">{formatEastern(r.created_at)}</td>
+                    <td className="px-4 py-3 font-medium text-gray-900 dark:text-zinc-100">{r.supplier_name}</td>
+                    <td className="px-4 py-3 text-gray-500 dark:text-zinc-400 font-mono text-xs">{r.supplier_key.slice(0, 8)}...</td>
                     <td className="px-4 py-3">
                       <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-bold ${
-                        r.overall_risk_score >= 8 ? "bg-red-100 text-red-800" :
-                        r.overall_risk_score >= 5 ? "bg-yellow-100 text-yellow-800" :
-                        "bg-green-100 text-green-800"
+                        r.overall_risk_score >= 8 ? "bg-red-100 text-red-800 dark:bg-red-950/50 dark:text-red-300" :
+                        r.overall_risk_score >= 5 ? "bg-yellow-100 text-yellow-800 dark:bg-yellow-950/40 dark:text-yellow-300" :
+                        "bg-green-100 text-green-800 dark:bg-green-950/50 dark:text-green-300"
                       }`}>{r.overall_risk_score}</span>
                     </td>
                     <td className="px-4 py-3 relative">
-                      <span className="text-blue-600 underline cursor-help"
+                      <span className="text-blue-600 dark:text-blue-400 underline cursor-help"
                         onMouseEnter={() => setHoveredAgent(r.source)}
                         onMouseLeave={() => setHoveredAgent(null)}>
                         {SOURCE_LABELS[r.source] ?? r.source}
@@ -294,16 +342,18 @@ export default function DashboardPage() {
                           <div className="font-bold mb-1">{agentMeta[r.source].display_name}</div>
                           <div className="mb-1">{agentMeta[r.source].description}</div>
                           <div className="text-gray-300">Rules: {agentMeta[r.source].active_rules}</div>
-                          <div className="text-gray-400 mt-1">Updated: {agentMeta[r.source].last_updated}</div>
+                          <div className="text-gray-400 mt-1">Updated: {formatEastern(agentMeta[r.source].last_updated)}</div>
                         </div>
                       )}
                     </td>
-                    <td className="px-4 py-3 text-gray-600 text-xs max-w-xs truncate">
+                    <td className="px-4 py-3 text-gray-600 dark:text-zinc-300 text-xs max-w-xs truncate">
                       {Array.isArray(r.reasons) ? r.reasons[0] : ""}
                     </td>
                     <td className="px-4 py-3">
                       <span className={`inline-flex px-2 py-0.5 rounded text-xs ${
-                        r.status === "reviewed" ? "bg-green-100 text-green-700" : "bg-orange-100 text-orange-700"
+                        r.status === "reviewed"
+                          ? "bg-green-100 text-green-700 dark:bg-green-950/50 dark:text-green-300"
+                          : "bg-orange-100 text-orange-700 dark:bg-orange-950/40 dark:text-orange-300"
                       }`}>{r.status === "reviewed" ? "Reviewed" : "Pending"}</span>
                     </td>
                   </tr>
@@ -317,47 +367,47 @@ export default function DashboardPage() {
       {/* Detail Modal */}
       {selectedRecord && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-lg shadow-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto">
+          <div className="bg-white dark:bg-zinc-900 rounded-lg shadow-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto border border-gray-200 dark:border-zinc-800">
             <div className="p-6">
               <div className="flex justify-between items-start mb-4">
                 <div>
-                  <h2 className="text-lg font-bold text-gray-900">{selectedRecord.supplier_name}</h2>
-                  <p className="text-sm text-gray-500 font-mono">{selectedRecord.supplier_key}</p>
+                  <h2 className="text-lg font-bold text-gray-900 dark:text-zinc-100">{selectedRecord.supplier_name}</h2>
+                  <p className="text-sm text-gray-500 dark:text-zinc-400 font-mono">{selectedRecord.supplier_key}</p>
                 </div>
-                <button onClick={() => setSelectedRecord(null)} className="text-gray-400 hover:text-gray-600 text-2xl">&times;</button>
+                <button type="button" onClick={() => setSelectedRecord(null)} className="text-gray-400 dark:text-zinc-500 hover:text-gray-600 dark:hover:text-zinc-300 text-2xl leading-none">&times;</button>
               </div>
 
               {/* Risk Score Trend */}
               <div className="mb-6">
-                <h3 className="text-sm font-semibold text-gray-700 mb-2">Risk Score Trend</h3>
-                <div className="flex items-end gap-1 h-24 bg-gray-50 rounded p-2">
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Risk Score Trend</h3>
+                <div className="flex items-end gap-1 h-24 bg-gray-50 dark:bg-zinc-800 rounded p-2">
                   {riskHistory.map((h: any, i: number) => (
                     <div key={i} className="flex flex-col items-center flex-1">
                       <div className={`w-full rounded-t ${
                         h.overall_risk_score >= 8 ? "bg-red-500" :
                         h.overall_risk_score >= 5 ? "bg-yellow-500" : "bg-green-500"
                       }`} style={{ height: `${(h.overall_risk_score / 10) * 80}px` }}
-                        title={`${h.source}: ${h.overall_risk_score} (${h.created_at.slice(0, 10)})`} />
-                      <span className="text-[9px] text-gray-400 mt-1">{h.created_at.slice(5, 10)}</span>
+                      title={`${h.source}: ${h.overall_risk_score} (${formatEastern(h.created_at, { dateOnly: true })})`} />
+                      <span className="text-[9px] text-gray-400 dark:text-zinc-500 mt-1">{formatEastern(h.created_at, { dateOnly: true })}</span>
                     </div>
                   ))}
-                  {riskHistory.length === 0 && <span className="text-gray-400 text-xs m-auto">No history</span>}
+                  {riskHistory.length === 0 && <span className="text-gray-400 dark:text-zinc-500 text-xs m-auto">No history</span>}
                 </div>
               </div>
 
               {/* Agent Scores Breakdown */}
               <div className="mb-6">
-                <h3 className="text-sm font-semibold text-gray-700 mb-2">Agent Scores</h3>
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Agent Scores</h3>
                 <div className="grid grid-cols-4 gap-2">
                   {Object.entries(SOURCE_LABELS).map(([src, label]) => {
                     const latest = riskHistory.filter((h: any) => h.source === src).slice(-1)[0];
                     return (
-                      <div key={src} className="bg-gray-50 rounded p-2 text-center">
-                        <div className="text-xs text-gray-500">{label}</div>
+                      <div key={src} className="bg-gray-50 dark:bg-zinc-800 rounded p-2 text-center">
+                        <div className="text-xs text-gray-500 dark:text-zinc-400">{label}</div>
                         <div className={`text-lg font-bold ${
-                          latest?.overall_risk_score >= 8 ? "text-red-600" :
-                          latest?.overall_risk_score >= 5 ? "text-yellow-600" :
-                          latest ? "text-green-600" : "text-gray-300"
+                          latest?.overall_risk_score >= 8 ? "text-red-600 dark:text-red-400" :
+                          latest?.overall_risk_score >= 5 ? "text-yellow-600 dark:text-yellow-500" :
+                          latest ? "text-green-600 dark:text-green-400" : "text-gray-300 dark:text-zinc-600"
                         }`}>{latest?.overall_risk_score ?? "—"}</div>
                       </div>
                     );
@@ -367,12 +417,18 @@ export default function DashboardPage() {
 
               {/* Triggered Metrics */}
               <div className="mb-6">
-                <h3 className="text-sm font-semibold text-gray-700 mb-2">Triggered Metrics</h3>
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Triggered Metrics</h3>
                 <div className="space-y-2">
                   {(Array.isArray(selectedRecord.metrics) ? selectedRecord.metrics : []).map((m: any, i: number) => (
-                    <div key={i} className="bg-gray-50 rounded p-2 flex justify-between text-sm">
-                      <span className="font-mono text-gray-700">{m.metric_id}</span>
-                      <span className="text-gray-900 font-medium">{m.value != null ? `${m.value} ${m.unit}` : "N/A"}</span>
+                    <div key={i} className="bg-gray-50 dark:bg-zinc-800 rounded p-2 flex justify-between text-sm">
+                      <span className="font-mono text-gray-700 dark:text-zinc-300">{m.metric_id}</span>
+                      <span className="text-gray-900 dark:text-zinc-100 font-medium">
+                        {m.value != null
+                          ? m.unit != null && String(m.unit).trim() !== ""
+                            ? `${m.value} ${m.unit}`
+                            : `${m.value}`
+                          : "N/A"}
+                      </span>
                     </div>
                   ))}
                 </div>
@@ -380,11 +436,11 @@ export default function DashboardPage() {
 
               {/* Full Reasons */}
               <div className="mb-6">
-                <h3 className="text-sm font-semibold text-gray-700 mb-2">Flag Reasons</h3>
-                <ul className="text-sm text-gray-600 space-y-1">
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Flag Reasons</h3>
+                <ul className="text-sm text-gray-600 dark:text-zinc-300 space-y-1">
                   {(Array.isArray(selectedRecord.reasons) ? selectedRecord.reasons : []).map((r: string, i: number) => (
                     <li key={i} className="flex gap-2">
-                      <span className="text-red-500 flex-shrink-0">•</span>
+                      <span className="text-red-500 dark:text-red-400 flex-shrink-0">•</span>
                       <span>{r}</span>
                     </li>
                   ))}
@@ -393,16 +449,16 @@ export default function DashboardPage() {
 
               {/* Review Section */}
               {selectedRecord.status === "pending_review" && (
-                <div className="border-t pt-4">
-                  <h3 className="text-sm font-semibold text-gray-700 mb-2">Submit Review</h3>
-                  <div className="flex gap-4 mb-3">
-                    <label className="flex items-center gap-2 text-sm">
+                <div className="border-t border-gray-200 dark:border-zinc-700 pt-4">
+                  <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Submit Review</h3>
+                  <div className="flex gap-4 mb-3 flex-wrap">
+                    <label className="flex items-center gap-2 text-sm text-gray-900 dark:text-zinc-100 cursor-pointer">
                       <input type="radio" name="verdict" value="correct_flag"
                         checked={reviewVerdict === "correct_flag"}
                         onChange={() => setReviewVerdict("correct_flag")} />
                       Correct Flag
                     </label>
-                    <label className="flex items-center gap-2 text-sm">
+                    <label className="flex items-center gap-2 text-sm text-gray-900 dark:text-zinc-100 cursor-pointer">
                       <input type="radio" name="verdict" value="incorrect_flag"
                         checked={reviewVerdict === "incorrect_flag"}
                         onChange={() => setReviewVerdict("incorrect_flag")} />
@@ -410,16 +466,18 @@ export default function DashboardPage() {
                     </label>
                   </div>
                   <textarea value={reviewComment} onChange={(e) => setReviewComment(e.target.value)}
-                    placeholder="Leave a comment..." className="w-full px-3 py-2 border rounded text-sm mb-3" rows={3} />
-                  <button onClick={submitReview}
+                    placeholder="Leave a comment..."
+                    className={`w-full px-3 py-2 mb-3 ${FIELD}`}
+                    rows={3} />
+                  <button type="button" onClick={submitReview}
                     className="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
                     Submit Review
                   </button>
                 </div>
               )}
               {selectedRecord.status === "reviewed" && (
-                <div className="border-t pt-4 text-sm text-green-600">
-                  ✓ Reviewed on {selectedRecord.reviewed_at?.slice(0, 10)}
+                <div className="border-t border-gray-200 dark:border-zinc-700 pt-4 text-sm text-green-600 dark:text-green-400">
+                  ✓ Reviewed on {formatEastern(selectedRecord.reviewed_at)}
                 </div>
               )}
             </div>
