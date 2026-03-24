@@ -28,7 +28,8 @@ type SupplierReview = {
   supplier_key: string;
   reviewer_id: string;
   reviewer_email: string;
-  verdict: "correct_flag" | "incorrect_flag";
+  /** Stored as "True Positive" / "False Positive"; legacy values normalized when editing/displaying. */
+  verdict: string;
   comment: string | null;
   source: string;
   suspended: boolean;
@@ -36,8 +37,18 @@ type SupplierReview = {
   monitored: boolean;
 };
 
-function verdictLabel(v: "correct_flag" | "incorrect_flag") {
-  return v === "correct_flag" ? "True Positive" : "False Positive";
+const VERDICT_TRUE = "True Positive";
+const VERDICT_FALSE = "False Positive";
+
+type ReviewVerdict = typeof VERDICT_TRUE | typeof VERDICT_FALSE;
+
+/** Map DB / legacy verdict strings to canonical form for UI and writes. */
+function normalizeVerdictFromDb(v: string | null | undefined): ReviewVerdict {
+  const s = (v ?? "").trim();
+  if (s === VERDICT_TRUE || s === "correct_flag" || s === "True_Positive") return VERDICT_TRUE;
+  if (s === VERDICT_FALSE || s === "incorrect_flag" || s === "False_Positive" || s === "False_positive")
+    return VERDICT_FALSE;
+  return VERDICT_TRUE;
 }
 
 function followUpSummary(r: SupplierReview) {
@@ -119,7 +130,7 @@ export default function DashboardPage() {
   const [selectedRecord, setSelectedRecord] = useState<FlaggedRecord | null>(null);
   const [riskHistory, setRiskHistory] = useState<any[]>([]);
   const [reviewComment, setReviewComment] = useState("");
-  const [reviewVerdict, setReviewVerdict] = useState<"correct_flag" | "incorrect_flag">("correct_flag");
+  const [reviewVerdict, setReviewVerdict] = useState<ReviewVerdict>(VERDICT_TRUE);
   const [reviewSuspended, setReviewSuspended] = useState(false);
   const [reviewEmailed, setReviewEmailed] = useState(false);
   const [reviewMonitored, setReviewMonitored] = useState(false);
@@ -173,7 +184,7 @@ export default function DashboardPage() {
 
   function resetReviewForm() {
     setReviewComment("");
-    setReviewVerdict("correct_flag");
+    setReviewVerdict(VERDICT_TRUE);
     setReviewSuspended(false);
     setReviewEmailed(false);
     setReviewMonitored(false);
@@ -262,11 +273,11 @@ export default function DashboardPage() {
 
   function validateReviewFields() {
     const anyFollowUp = reviewSuspended || reviewEmailed || reviewMonitored;
-    if (reviewVerdict === "correct_flag" && !anyFollowUp) {
+    if (reviewVerdict === VERDICT_TRUE && !anyFollowUp) {
       setReviewError("For True Positive, select at least one: Suspended, Emailed, or Monitored.");
       return false;
     }
-    if (reviewVerdict === "incorrect_flag" && anyFollowUp) {
+    if (reviewVerdict === VERDICT_FALSE && anyFollowUp) {
       setReviewError("False Positive cannot include follow-up actions.");
       return false;
     }
@@ -275,7 +286,7 @@ export default function DashboardPage() {
 
   function startEditReview(r: SupplierReview) {
     setEditingReviewId(r.id);
-    setReviewVerdict(r.verdict);
+    setReviewVerdict(normalizeVerdictFromDb(r.verdict));
     setReviewComment(r.comment ?? "");
     setReviewSuspended(r.suspended);
     setReviewEmailed(r.emailed);
@@ -679,7 +690,7 @@ export default function DashboardPage() {
                             </span>
                           </div>
                           <div className="mt-1 text-gray-900 dark:text-zinc-100">
-                            <span className="font-medium">Verdict:</span> {verdictLabel(r.verdict)}
+                            <span className="font-medium">Verdict:</span> {normalizeVerdictFromDb(r.verdict)}
                           </div>
                           <div className="text-gray-700 dark:text-zinc-300">
                             <span className="font-medium">Follow-up:</span> {followUpSummary(r)}
@@ -729,10 +740,10 @@ export default function DashboardPage() {
                       <input
                         type="radio"
                         name={`verdict-${editingReviewId ?? "new"}`}
-                        value="correct_flag"
-                        checked={reviewVerdict === "correct_flag"}
+                        value={VERDICT_TRUE}
+                        checked={reviewVerdict === VERDICT_TRUE}
                         onChange={() => {
-                          setReviewVerdict("correct_flag");
+                          setReviewVerdict(VERDICT_TRUE);
                           setReviewError("");
                         }}
                       />
@@ -742,10 +753,10 @@ export default function DashboardPage() {
                       <input
                         type="radio"
                         name={`verdict-${editingReviewId ?? "new"}`}
-                        value="incorrect_flag"
-                        checked={reviewVerdict === "incorrect_flag"}
+                        value={VERDICT_FALSE}
+                        checked={reviewVerdict === VERDICT_FALSE}
                         onChange={() => {
-                          setReviewVerdict("incorrect_flag");
+                          setReviewVerdict(VERDICT_FALSE);
                           setReviewSuspended(false);
                           setReviewEmailed(false);
                           setReviewMonitored(false);
@@ -757,7 +768,7 @@ export default function DashboardPage() {
                   </div>
                   <div className="mb-3">
                     <p className="text-xs font-medium text-gray-600 dark:text-zinc-400 mb-2">
-                      Follow-up {reviewVerdict === "correct_flag" ? "(select at least one)" : "(not applicable)"}
+                      Follow-up {reviewVerdict === VERDICT_TRUE ? "(select at least one)" : "(not applicable)"}
                     </p>
                     <div className="flex flex-wrap gap-4">
                       {([
@@ -768,13 +779,13 @@ export default function DashboardPage() {
                         <label
                           key={label}
                           className={`flex items-center gap-2 text-sm text-gray-900 dark:text-zinc-100 ${
-                            reviewVerdict === "incorrect_flag" ? "opacity-50 cursor-not-allowed" : "cursor-pointer"
+                            reviewVerdict === VERDICT_FALSE ? "opacity-50 cursor-not-allowed" : "cursor-pointer"
                           }`}
                         >
                           <input
                             type="checkbox"
                             checked={checked}
-                            disabled={reviewVerdict === "incorrect_flag"}
+                            disabled={reviewVerdict === VERDICT_FALSE}
                             onChange={(e) => {
                               setChecked(e.target.checked);
                               setReviewError("");
