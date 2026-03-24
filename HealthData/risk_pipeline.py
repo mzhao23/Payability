@@ -19,10 +19,14 @@ BQ_DATASET = "amazon"
 BQ_TABLE = "customer_health_metrics"
 BQ_FULL_TABLE = f"`{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}`"
 
-SUPABASE_TABLE = "supplier_daily_risk"
+BQ_PAYABILITY_TABLE = "`bigqueryexport-183608.PayabilitySheets.v_supplier_summary`"
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+SUPABASE_OUTPUT_TABLE = "health_daily_risk"
+SUPABASE_MAPPING_TABLE = "suppliers"
+CONSOLIDATED_TABLE = "consolidated_flagged_supplier_list"
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY.")
@@ -30,136 +34,113 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 bq = bigquery.Client(project=BQ_PROJECT)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+print("SUPABASE_URL =", SUPABASE_URL)
+print("SUPABASE_MAPPING_TABLE =", SUPABASE_MAPPING_TABLE)
+print("CONSOLIDATED_TABLE =", CONSOLIDATED_TABLE)
 
 # ============================================================
 # METRIC CONFIG
 # ============================================================
 METRIC_CONFIG: List[Dict[str, Any]] = [
-    # --------------------------
-    # Outcome metrics
-    # --------------------------
+    # Outcome
     {
         "metric_id": "ORDER_DEFECT_RATE_60",
         "source_column": "orderWithDefects_60_rate",
         "direction": "higher_is_worse",
         "group": "outcome",
-        "description": "Core supplier health outcome metric.",
     },
     {
         "metric_id": "CHARGEBACK_RATE_90",
         "source_column": "chargebacks_90_rate",
         "direction": "higher_is_worse",
         "group": "outcome",
-        "description": "Financial dispute sub-signal.",
     },
     {
         "metric_id": "A_TO_Z_CLAIM_RATE_90",
         "source_column": "a_z_claims_90_rate",
         "direction": "higher_is_worse",
         "group": "outcome",
-        "description": "A-to-z claim sub-signal.",
     },
     {
         "metric_id": "NEGATIVE_FEEDBACK_RATE_90",
         "source_column": "negativeFeedbacks_90_rate",
         "direction": "higher_is_worse",
         "group": "outcome",
-        "description": "Negative feedback sub-signal.",
     },
 
-    # --------------------------
-    # Operational metrics
-    # --------------------------
+    # Operational
     {
         "metric_id": "LATE_SHIPMENT_RATE_30",
         "source_column": "lateShipment_30_rate",
         "direction": "higher_is_worse",
         "group": "operational",
-        "description": "Operational delay signal.",
     },
     {
         "metric_id": "PRE_FULFILL_CANCEL_RATE_30",
         "source_column": "preFulfillmentCancellation_30_rate",
         "direction": "higher_is_worse",
         "group": "operational",
-        "description": "Inventory / pre-ship cancellation risk.",
     },
     {
         "metric_id": "AVG_RESPONSE_HOURS_30",
         "source_column": "averageResponseTimeInHours_30",
         "direction": "higher_is_worse",
         "group": "operational",
-        "description": "Customer support response speed.",
     },
     {
         "metric_id": "NO_RESPONSE_OVER_24H_30",
         "source_column": "noResponseForContactsOlderThan24Hours_30",
         "direction": "higher_is_worse",
         "group": "operational",
-        "description": "Severe support failure signal.",
     },
     {
         "metric_id": "VALID_TRACKING_RATE_30",
         "source_column": "validTracking_rate_30",
         "direction": "lower_is_worse",
         "group": "operational",
-        "description": "Tracking compliance metric.",
     },
     {
         "metric_id": "ON_TIME_DELIVERY_RATE_30",
         "source_column": "onTimeDelivery_rate_30",
         "direction": "lower_is_worse",
         "group": "operational",
-        "description": "Final fulfillment success metric.",
     },
 
-    # --------------------------
-    # Compliance metrics
-    # --------------------------
+    # Compliance
     {
         "metric_id": "PRODUCT_SAFETY_STATUS",
         "source_column": "productSafetyStatus_status",
         "direction": "status",
         "group": "compliance",
-        "description": "Product safety compliance risk.",
     },
     {
         "metric_id": "PRODUCT_AUTHENTICITY_STATUS",
         "source_column": "productAuthenticityStatus_status",
         "direction": "status",
         "group": "compliance",
-        "description": "Product authenticity compliance risk.",
     },
     {
         "metric_id": "POLICY_VIOLATION_STATUS",
         "source_column": "policyViolation_status",
         "direction": "status",
         "group": "compliance",
-        "description": "Policy violation compliance risk.",
     },
     {
         "metric_id": "LISTING_POLICY_STATUS",
         "source_column": "listingPolicyStatus_status",
         "direction": "status",
         "group": "compliance",
-        "description": "Listing policy compliance risk.",
     },
     {
         "metric_id": "INTELLECTUAL_PROPERTY_STATUS",
         "source_column": "intellectualProperty_status",
         "direction": "status",
         "group": "compliance",
-        "description": "Intellectual property compliance risk.",
     },
 ]
 
-
 METRIC_ID_TO_GROUP = {m["metric_id"]: m["group"] for m in METRIC_CONFIG}
 
-
-# ============================================================
-# OPTIONAL STATUS SNAPSHOT
-# ============================================================
 BQ_STATUS_COLS = [
     "policyViolation_status",
     "listingPolicyStatus_status",
@@ -197,6 +178,19 @@ def safe_float(v: Any) -> Optional[float]:
         return None
 
 
+def pct_to_ratio(v: Any) -> Optional[float]:
+    """
+    BigQuery values appear to be percentage-style values.
+    Examples:
+      0.418  -> 0.00418
+      99.74  -> 0.9974
+    """
+    x = safe_float(v)
+    if x is None:
+        return None
+    return x / 100.0
+
+
 def clamp(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
@@ -208,17 +202,13 @@ def utc_now_iso() -> str:
 def backoff_sleep(attempt: int, base: float = 0.5, cap: float = 5.0) -> None:
     time.sleep(min(cap, base * (2 ** attempt)))
 
-def pct_to_ratio(v: Any) -> Optional[float]:
-    """
-    Convert BigQuery percentage-style values to 0~1 ratio.
-    Example:
-      0.418  -> 0.00418   (0.418%)
-      99.74  -> 0.9974    (99.74%)
-    """
-    x = safe_float(v)
-    if x is None:
+
+def normalize_key(v: Any) -> Optional[str]:
+    if v is None:
         return None
-    return x / 100.0
+    s = str(v).strip().lower()
+    return s if s else None
+
 
 # ============================================================
 # BIGQUERY
@@ -234,10 +224,9 @@ def get_latest_report_date() -> date:
     return rows[0]["report_date"]
 
 
-def fetch_latest_snapshot_per_supplier(report_date: date, limit: int = 5000) -> List[Dict[str, Any]]:
+def fetch_latest_health_snapshot(report_date: date, limit: int = 5000) -> List[Dict[str, Any]]:
     metric_cols = [m["source_column"] for m in METRIC_CONFIG]
-    # add order volume columns for activity adjustment
-    metric_cols += ["orders_count_60", "orders_count_30", "orders_count_90"]
+    metric_cols += ["orders_count_60", "orders_count_30", "orders_count_90", "path_golden"]
 
     selected_cols = ["mp_sup_key", "snapshot_date"] + metric_cols + BQ_STATUS_COLS
     selected_cols = list(dict.fromkeys(selected_cols))
@@ -272,8 +261,109 @@ def fetch_latest_snapshot_per_supplier(report_date: date, limit: int = 5000) -> 
     return [dict(r) for r in rows]
 
 
+def fetch_payability_status_map() -> Dict[str, Dict[str, Any]]:
+    q = f"""
+    SELECT
+      supplier_key,
+      supplier_name,
+      payability_status
+    FROM {BQ_PAYABILITY_TABLE}
+    """
+    rows = bq.query(q).result()
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        supplier_key = normalize_key(r["supplier_key"])
+        if supplier_key is None:
+            continue
+        out[supplier_key] = {
+            "supplier_name": r.get("supplier_name"),
+            "payability_status": r.get("payability_status"),
+        }
+    return out
+
+
 # ============================================================
-# SCORE FUNCTIONS
+# SUPABASE MAPPING
+# ============================================================
+def fetch_supplier_mapping() -> Dict[str, Dict[str, Any]]:
+    """
+    Fetch mp_sup_key -> supplier_key mapping from Supabase `suppliers`.
+    """
+    offset = 0
+    page_size = 1000
+    rows: List[Dict[str, Any]] = []
+
+    while True:
+        resp = (
+            supabase.table(SUPABASE_MAPPING_TABLE)
+            .select("mp_sup_key,supplier_key,supplier_name")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+
+        batch = getattr(resp, "data", None) or []
+        rows.extend(batch)
+
+        if len(batch) < page_size:
+            break
+
+        offset += page_size
+
+    mapping: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        mp_sup_key = normalize_key(r.get("mp_sup_key"))
+        if mp_sup_key is None:
+            continue
+
+        mapping[mp_sup_key] = {
+            "supplier_key": r.get("supplier_key"),
+            "supplier_name": r.get("supplier_name"),
+        }
+
+    return mapping
+
+
+# ============================================================
+# ENRICH + FILTER
+# ============================================================
+def enrich_health_rows_with_supplier_context(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    mapping = fetch_supplier_mapping()
+    payability_map = fetch_payability_status_map()
+
+    enriched: List[Dict[str, Any]] = []
+    for row in rows:
+        mp_sup_key_norm = normalize_key(row.get("mp_sup_key"))
+        map_row = mapping.get(mp_sup_key_norm, {})
+
+        supplier_key = map_row.get("supplier_key")
+        supplier_key_norm = normalize_key(supplier_key)
+        pay_row = payability_map.get(supplier_key_norm, {})
+
+        row["supplier_key"] = supplier_key
+        row["supplier_name"] = map_row.get("supplier_name") or pay_row.get("supplier_name")
+        row["payability_status"] = pay_row.get("payability_status")
+
+        enriched.append(row)
+
+    return enriched
+
+
+def filter_active_population(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Exclude Suspended and Pending accounts based on risk team feedback.
+    """
+    kept = []
+    for row in rows:
+        status = str(row.get("payability_status") or "").strip().lower()
+        if status in {"suspended", "pending"}:
+            continue
+        kept.append(row)
+    return kept
+
+
+# ============================================================
+# SCORING FUNCTIONS
 # ============================================================
 def score_odr(odr: Optional[float]) -> float:
     if odr is None:
@@ -454,9 +544,6 @@ def risk_level_from_score(score: float) -> str:
 # CORE SCORING
 # ============================================================
 def score_supplier_row(row: Dict[str, Any]) -> Dict[str, Any]:
-    # --------------------------
-    # raw values
-    # --------------------------
     metric_values: Dict[str, Any] = {
         "ORDER_DEFECT_RATE_60": pct_to_ratio(row.get("orderWithDefects_60_rate")),
         "CHARGEBACK_RATE_90": pct_to_ratio(row.get("chargebacks_90_rate")),
@@ -476,12 +563,7 @@ def score_supplier_row(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     orders_count_60 = safe_float(row.get("orders_count_60"))
-    orders_count_30 = safe_float(row.get("orders_count_30"))
-    orders_count_90 = safe_float(row.get("orders_count_90"))
 
-    # --------------------------
-    # sub scores
-    # --------------------------
     outcome_subscores = {
         "ORDER_DEFECT_RATE_60": score_odr(metric_values["ORDER_DEFECT_RATE_60"]),
         "CHARGEBACK_RATE_90": score_chargeback(metric_values["CHARGEBACK_RATE_90"]),
@@ -506,9 +588,6 @@ def score_supplier_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "INTELLECTUAL_PROPERTY_STATUS": score_status(metric_values["INTELLECTUAL_PROPERTY_STATUS"]),
     }
 
-    # --------------------------
-    # grouped scores
-    # --------------------------
     outcome_score = round(
         0.70 * outcome_subscores["ORDER_DEFECT_RATE_60"]
         + 0.15 * outcome_subscores["CHARGEBACK_RATE_90"]
@@ -532,9 +611,6 @@ def score_supplier_row(row: Dict[str, Any]) -> Dict[str, Any]:
     comp_avg = sum(comp_values) / len(comp_values) if comp_values else 0.0
     compliance_score = round(0.7 * comp_max + 0.3 * comp_avg, 2)
 
-    # --------------------------
-    # activity / inactivity
-    # --------------------------
     act_gate = activity_gate(orders_count_60)
     inact_penalty = inactivity_penalty(orders_count_60)
 
@@ -553,26 +629,17 @@ def score_supplier_row(row: Dict[str, Any]) -> Dict[str, Any]:
     risk_score = clamp(risk_score, 0.0, 10.0)
     risk_level = risk_level_from_score(risk_score)
 
-    # --------------------------
-    # drivers
-    # use contribution after top-level weights
-    # --------------------------
     driver_contributions: Dict[str, float] = {
-        # outcome
         "ORDER_DEFECT_RATE_60": 0.45 * 0.70 * outcome_subscores["ORDER_DEFECT_RATE_60"],
         "CHARGEBACK_RATE_90": 0.45 * 0.15 * outcome_subscores["CHARGEBACK_RATE_90"],
         "A_TO_Z_CLAIM_RATE_90": 0.45 * 0.10 * outcome_subscores["A_TO_Z_CLAIM_RATE_90"],
         "NEGATIVE_FEEDBACK_RATE_90": 0.45 * 0.05 * outcome_subscores["NEGATIVE_FEEDBACK_RATE_90"],
-
-        # operational
         "LATE_SHIPMENT_RATE_30": 0.30 * 0.25 * operational_subscores["LATE_SHIPMENT_RATE_30"],
         "PRE_FULFILL_CANCEL_RATE_30": 0.30 * 0.15 * operational_subscores["PRE_FULFILL_CANCEL_RATE_30"],
         "AVG_RESPONSE_HOURS_30": 0.30 * 0.15 * operational_subscores["AVG_RESPONSE_HOURS_30"],
         "NO_RESPONSE_OVER_24H_30": 0.30 * 0.15 * operational_subscores["NO_RESPONSE_OVER_24H_30"],
         "VALID_TRACKING_RATE_30": 0.30 * 0.15 * operational_subscores["VALID_TRACKING_RATE_30"],
         "ON_TIME_DELIVERY_RATE_30": 0.30 * 0.15 * operational_subscores["ON_TIME_DELIVERY_RATE_30"],
-
-        # compliance
         "PRODUCT_SAFETY_STATUS": 0.20 * compliance_subscores["PRODUCT_SAFETY_STATUS"],
         "PRODUCT_AUTHENTICITY_STATUS": 0.20 * compliance_subscores["PRODUCT_AUTHENTICITY_STATUS"],
         "POLICY_VIOLATION_STATUS": 0.20 * compliance_subscores["POLICY_VIOLATION_STATUS"],
@@ -605,9 +672,6 @@ def score_supplier_row(row: Dict[str, Any]) -> Dict[str, Any]:
     else:
         risk_reason = "No significant risk signals detected."
 
-    # --------------------------
-    # band mapping for storage / explainability
-    # --------------------------
     def score_to_band(score: float) -> str:
         if score == 0:
             return "green"
@@ -615,77 +679,18 @@ def score_supplier_row(row: Dict[str, Any]) -> Dict[str, Any]:
             return "yellow"
         return "red"
 
-    metric_bands = {}
-    metric_scores = {}
-    weighted_metric_scores = {}
-
-    # store sub-score bands/scores
-    for metric_id, score in outcome_subscores.items():
-        metric_bands[metric_id] = score_to_band(score)
-        metric_scores[metric_id] = round(score, 2)
-        weighted_metric_scores[metric_id] = round(driver_contributions[metric_id], 4)
-
-    for metric_id, score in operational_subscores.items():
-        metric_bands[metric_id] = score_to_band(score)
-        metric_scores[metric_id] = round(score, 2)
-        weighted_metric_scores[metric_id] = round(driver_contributions[metric_id], 4)
-
-    for metric_id, score in compliance_subscores.items():
-        metric_bands[metric_id] = score_to_band(score)
-        metric_scores[metric_id] = round(score, 2)
-        weighted_metric_scores[metric_id] = round(driver_contributions[metric_id], 4)
-
-    metric_weights = {
-        "ORDER_DEFECT_RATE_60": 0.45 * 0.70,
-        "CHARGEBACK_RATE_90": 0.45 * 0.15,
-        "A_TO_Z_CLAIM_RATE_90": 0.45 * 0.10,
-        "NEGATIVE_FEEDBACK_RATE_90": 0.45 * 0.05,
-        "LATE_SHIPMENT_RATE_30": 0.30 * 0.25,
-        "PRE_FULFILL_CANCEL_RATE_30": 0.30 * 0.15,
-        "AVG_RESPONSE_HOURS_30": 0.30 * 0.15,
-        "NO_RESPONSE_OVER_24H_30": 0.30 * 0.15,
-        "VALID_TRACKING_RATE_30": 0.30 * 0.15,
-        "ON_TIME_DELIVERY_RATE_30": 0.30 * 0.15,
-        "PRODUCT_SAFETY_STATUS": 0.20,
-        "PRODUCT_AUTHENTICITY_STATUS": 0.20,
-        "POLICY_VIOLATION_STATUS": 0.20,
-        "LISTING_POLICY_STATUS": 0.20,
-        "INTELLECTUAL_PROPERTY_STATUS": 0.20,
-    }
-
-    red_metric_count = sum(1 for v in metric_bands.values() if v == "red")
-    yellow_metric_count = sum(1 for v in metric_bands.values() if v == "yellow")
-    missing_metrics = [k for k, v in metric_values.items() if v is None]
-
-    status_snapshot = {c: row.get(c) for c in BQ_STATUS_COLS}
-
-    threshold_snapshot = {
-        "version": "risk_formula_v2",
-        "formula": {
-            "final_score": "activity_gate * (0.45*outcome + 0.30*operational + 0.20*compliance + 0.05*inactivity_penalty) + (1-activity_gate)*inactivity_penalty"
-        },
-        "group_scores": {
-            "outcome_score": outcome_score,
-            "operational_score": operational_score,
-            "compliance_score": compliance_score,
-        },
-        "activity": {
-            "orders_count_60": orders_count_60,
-            "orders_count_30": orders_count_30,
-            "orders_count_90": orders_count_90,
-            "activity_gate": act_gate,
-            "inactivity_penalty": inact_penalty,
-        },
-    }
-
-    raw_score_total = round(base_risk, 3)
-    max_possible_score = 10.0
+    all_scores = {**outcome_subscores, **operational_subscores, **compliance_subscores}
+    red_metric_count = sum(1 for v in all_scores.values() if score_to_band(v) == "red")
+    yellow_metric_count = sum(1 for v in all_scores.values() if score_to_band(v) == "yellow")
 
     return {
         "report_date": iso(row.get("report_date")),
         "mp_sup_key": str(row["mp_sup_key"]),
+        "supplier_key": row.get("supplier_key"),
+        "supplier_name": row.get("supplier_name"),
+        "payability_status": row.get("payability_status"),
         "snapshot_timestamp": iso(row.get("snapshot_date")),
-        "pipeline_version": "risk_formula_v2",
+        "pipeline_version": "risk_formula_v2_production",
         "risk_score": round(risk_score, 2),
         "risk_level": risk_level,
         "risk_reason": risk_reason,
@@ -695,22 +700,7 @@ def score_supplier_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "driver_3": driver_3,
         "red_metric_count": red_metric_count,
         "yellow_metric_count": yellow_metric_count,
-        "metric_values": metric_values,
-        "metric_bands": metric_bands,
-        "metric_scores": metric_scores,
-        "weighted_metric_scores": weighted_metric_scores,
-        "metric_weights": metric_weights,
-        "threshold_snapshot": threshold_snapshot,
-        "raw_score_total": raw_score_total,
-        "max_possible_score": max_possible_score,
-        "eligible_metric_count": len(metric_values) - len(missing_metrics),
-        "missing_metrics": missing_metrics,
-        "volume_flags": {
-            "orders_count_60": orders_count_60,
-            "activity_gate": act_gate,
-            "inactivity_penalty": inact_penalty,
-        },
-        "status_snapshot": status_snapshot,
+        "created_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
     }
 
@@ -726,7 +716,81 @@ def build_payload(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # ============================================================
-# SUPABASE
+# CONSOLIDATED FLAGGED TABLE
+# ============================================================
+def is_high_risk(row: Dict[str, Any]) -> bool:
+    score = row.get("risk_score")
+    if score is None:
+        return False
+    return score > 5
+
+
+def build_consolidated_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "supplier_key": row.get("supplier_key"),
+        "source": "health_report",
+        "supplier_name": row.get("supplier_name"),
+        "created_at": utc_now_iso(),
+        "run_id": None,
+        "metrics": {
+            "top_risk_drivers": row.get("top_risk_drivers"),
+            "driver_1": row.get("driver_1"),
+            "driver_2": row.get("driver_2"),
+            "driver_3": row.get("driver_3"),
+            "red_metric_count": row.get("red_metric_count"),
+            "yellow_metric_count": row.get("yellow_metric_count"),
+            "pipeline_version": row.get("pipeline_version"),
+        },
+        "reasons": row.get("top_risk_drivers") or [],
+        "overall_risk_score": row.get("risk_score"),
+        "status": "pending_review",
+    }
+
+
+def write_flagged_to_consolidated(
+    payload: List[Dict[str, Any]],
+    chunk_size: int = 500,
+    max_retries: int = 4,
+) -> int:
+    flagged_rows = [
+        build_consolidated_row(row)
+        for row in payload
+        if is_high_risk(row) and row.get("supplier_key")
+    ]
+
+    if not flagged_rows:
+        print("[INFO] No high-risk suppliers to write into consolidated table.")
+        return 0
+
+    total_written = 0
+    chunks = math.ceil(len(flagged_rows) / chunk_size)
+
+    for i in range(chunks):
+        part = flagged_rows[i * chunk_size: (i + 1) * chunk_size]
+
+        for attempt in range(max_retries + 1):
+            try:
+                (
+                    supabase.table(CONSOLIDATED_TABLE)
+                    .upsert(part, on_conflict="supplier_key,source")
+                    .execute()
+                )
+                total_written += len(part)
+                print(f"[OK] Upserted chunk {i + 1}/{chunks}: {len(part)} rows into {CONSOLIDATED_TABLE}")
+                break
+            except Exception as e:
+                if attempt >= max_retries:
+                    raise
+                print(f"[WARN] Consolidated insert failed chunk {i + 1}/{chunks}, attempt {attempt + 1}: {e}")
+                backoff_sleep(attempt)
+
+    print(f"[INFO] High risk suppliers count: {len(flagged_rows)}")
+    print(f"[OK] Inserted total {total_written} flagged suppliers into {CONSOLIDATED_TABLE}.")
+    return total_written
+
+
+# ============================================================
+# SUPABASE OUTPUT
 # ============================================================
 def upsert_supabase(payload: List[Dict[str, Any]], chunk_size: int = 500, max_retries: int = 4) -> int:
     if not payload:
@@ -741,11 +805,11 @@ def upsert_supabase(payload: List[Dict[str, Any]], chunk_size: int = 500, max_re
 
         for attempt in range(max_retries + 1):
             try:
-                supabase.table(SUPABASE_TABLE).upsert(
-                    part,
-                    on_conflict="report_date,mp_sup_key",
-                ).execute()
-
+                (
+                    supabase.table(SUPABASE_OUTPUT_TABLE)
+                    .upsert(part, on_conflict="report_date,mp_sup_key")
+                    .execute()
+                )
                 total_written += len(part)
                 print(f"[OK] Upsert chunk {i + 1}/{chunks}: {len(part)} rows")
                 break
@@ -755,7 +819,7 @@ def upsert_supabase(payload: List[Dict[str, Any]], chunk_size: int = 500, max_re
                 print(f"[WARN] Upsert failed chunk {i + 1}/{chunks}, attempt {attempt + 1}: {e}")
                 backoff_sleep(attempt)
 
-    print(f"[OK] Upserted total {total_written} rows into {SUPABASE_TABLE}.")
+    print(f"[OK] Upserted total {total_written} rows into {SUPABASE_OUTPUT_TABLE}.")
     return total_written
 
 
@@ -763,30 +827,17 @@ def upsert_supabase(payload: List[Dict[str, Any]], chunk_size: int = 500, max_re
 # JSON EXPORT
 # ============================================================
 def build_unified_json(payload_row: Dict[str, Any]) -> Dict[str, Any]:
-    metrics = []
-
-    for metric in METRIC_CONFIG:
-        metric_id = metric["metric_id"]
-        unit = "status" if metric["direction"] == "status" else "raw_metric"
-
-        metrics.append(
-            {
-                "metric_id": metric_id,
-                "value": payload_row["metric_values"].get(metric_id),
-                "unit": unit,
-                "explanation": (
-                    f"{metric_id} is in {payload_row['metric_bands'].get(metric_id, 'missing')} band "
-                    f"with score {payload_row['metric_scores'].get(metric_id, 0)}."
-                ),
-            }
-        )
-
     return {
         "table_name": BQ_TABLE,
-        "supplier_key": payload_row["mp_sup_key"],
+        "supplier_key": payload_row.get("supplier_key"),
+        "mp_sup_key": payload_row.get("mp_sup_key"),
+        "supplier_name": payload_row.get("supplier_name"),
+        "payability_status": payload_row.get("payability_status"),
         "report_date": payload_row["report_date"],
-        "metrics": metrics,
         "overall_risk_score": payload_row["risk_score"],
+        "risk_level": payload_row["risk_level"],
+        "risk_reason": payload_row["risk_reason"],
+        "top_risk_drivers": payload_row["top_risk_drivers"],
     }
 
 
@@ -811,14 +862,36 @@ def run_for_date(
     print("=" * 80)
     print(f"Report date: {report_date.isoformat()}")
 
-    rows = fetch_latest_snapshot_per_supplier(report_date=report_date, limit=limit)
-    print(f"[INFO] Latest snapshot rows fetched: {len(rows)}")
+    health_rows = fetch_latest_health_snapshot(report_date=report_date, limit=limit)
+    print(f"[INFO] Health rows fetched from BigQuery: {len(health_rows)}")
 
-    if not rows:
+    if not health_rows:
         print("[INFO] No rows found. Skip.")
         return
 
-    payload = build_payload(rows)
+    enriched_rows = enrich_health_rows_with_supplier_context(health_rows)
+
+    print(f"[INFO] Rows after supplier mapping enrichment: {len(enriched_rows)}")
+
+    supplier_key_count = sum(1 for r in enriched_rows if r.get("supplier_key"))
+    payability_count = sum(1 for r in enriched_rows if r.get("payability_status"))
+
+    print(f"[DEBUG] Rows with supplier_key: {supplier_key_count}")
+    print(f"[DEBUG] Rows with payability_status: {payability_count}")
+
+    for r in enriched_rows[:5]:
+        print(
+            "[DEBUG SAMPLE]",
+            r.get("mp_sup_key"),
+            r.get("supplier_key"),
+            r.get("payability_status"),
+        )
+
+    filtered_rows = filter_active_population(enriched_rows)
+
+    print(f"[INFO] Rows after payability filter (exclude suspended/pending): {len(filtered_rows)}")
+
+    payload = build_payload(filtered_rows)
     print(f"[INFO] Payload rows prepared: {len(payload)}")
 
     if payload:
@@ -829,6 +902,7 @@ def run_for_date(
         print("[DRY-RUN] Skip Supabase write.")
     else:
         upsert_supabase(payload, chunk_size=chunk_size)
+        write_flagged_to_consolidated(payload, chunk_size=chunk_size)
 
     if export_json:
         export_unified_json(payload, output_file="risk_output.json")
@@ -837,7 +911,7 @@ def run_for_date(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Supplier Daily Risk Pipeline (risk formula v2)")
+    parser = argparse.ArgumentParser(description="HealthData production risk pipeline")
     parser.add_argument("--report-date", type=str, default="", help="YYYY-MM-DD")
     parser.add_argument("--days-back", type=int, default=0, help="Run latest date and previous N days")
     parser.add_argument("--limit", type=int, default=5000)
