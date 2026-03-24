@@ -67,7 +67,7 @@ function csvEscapeCell(value: unknown): string {
 }
 
 const iconSvg = {
-  className: "h-3 w-3 shrink-0",
+  className: "h-4 w-4 shrink-0",
   fill: "none" as const,
   viewBox: "0 0 24 24",
   strokeWidth: 1.5,
@@ -81,7 +81,7 @@ function VerdictIconBadge({ verdict }: { verdict: ReviewVerdict }) {
       role="img"
       aria-label={verdict}
       title={verdict}
-      className={`inline-flex items-center justify-center rounded-md border p-1 shadow-sm ${
+      className={`inline-flex items-center justify-center rounded-lg border p-2 shadow-sm ${
         isTrue
           ? "border-emerald-300/80 bg-emerald-100 text-emerald-800 dark:border-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-200"
           : "border-red-300/80 bg-red-100 text-red-800 dark:border-red-700 dark:bg-red-950/55 dark:text-red-200"
@@ -167,7 +167,7 @@ function FollowUpIconBadges({ r }: { r: SupplierReview }) {
   if (items.length === 0) {
     return (
       <span
-        className="inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-zinc-100 px-1.5 py-0.5 text-xs font-medium text-zinc-500 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
+        className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 bg-zinc-100 px-2.5 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
         title="No follow-up actions"
       >
         <svg {...iconSvg} aria-hidden>
@@ -178,12 +178,12 @@ function FollowUpIconBadges({ r }: { r: SupplierReview }) {
   }
 
   return (
-    <div className="flex flex-wrap items-center gap-1">
+    <div className="flex flex-wrap items-center gap-1.5">
       {items.map((it) => (
         <span
           key={it.key}
           title={it.title}
-          className={`inline-flex items-center justify-center rounded-md border p-1 shadow-sm ${it.className}`}
+          className={`inline-flex items-center justify-center rounded-lg border p-1.5 shadow-sm ${it.className}`}
         >
           {it.node}
         </span>
@@ -280,6 +280,56 @@ function mapSupabasePermissionError(err: { message?: string; code?: string } | n
   return err.message ?? NO_PERMISSION;
 }
 
+type TableSortColumn = "date" | "supplier" | "key" | "score" | "flagged_by";
+
+const TABLE_ORDER_COLUMN: Record<TableSortColumn, string> = {
+  date: "created_at",
+  supplier: "supplier_name",
+  key: "supplier_key",
+  score: "overall_risk_score",
+  flagged_by: "source",
+};
+
+function TableSortHeader({
+  label,
+  column,
+  activeColumn,
+  ascending,
+  onRequestSort,
+}: {
+  label: string;
+  column: TableSortColumn;
+  activeColumn: TableSortColumn;
+  ascending: boolean;
+  onRequestSort: (column: TableSortColumn) => void;
+}) {
+  const active = activeColumn === column;
+  return (
+    <th scope="col" className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onRequestSort(column);
+        }}
+        className="inline-flex items-center gap-0.5 rounded -mx-1 px-1 py-0.5 text-left hover:bg-gray-200/80 dark:hover:bg-zinc-700/80"
+        aria-label={`Sort by ${label}, ${active ? (ascending ? "ascending" : "descending") : "not sorted"}`}
+        aria-sort={active ? (ascending ? "ascending" : "descending") : "none"}
+      >
+        <span>{label}</span>
+        <span
+          className={`text-[10px] tabular-nums ${
+            active ? "text-gray-800 dark:text-zinc-200" : "text-gray-400 dark:text-zinc-500"
+          }`}
+          aria-hidden
+        >
+          {active ? (ascending ? "↑" : "↓") : "↕"}
+        </span>
+      </button>
+    </th>
+  );
+}
+
 export default function DashboardPage() {
   const supabase = getSupabaseBrowser();
   const router = useRouter();
@@ -295,6 +345,8 @@ export default function DashboardPage() {
   const [scoreMin, setScoreMin] = useState(1);
   const [scoreMax, setScoreMax] = useState(10);
   const [statusFilter, setStatusFilter] = useState("all");
+  const [sortColumn, setSortColumn] = useState<TableSortColumn>("score");
+  const [sortAscending, setSortAscending] = useState(false);
 
   const [selectedRecord, setSelectedRecord] = useState<FlaggedRecord | null>(null);
   const [riskHistory, setRiskHistory] = useState<any[]>([]);
@@ -346,7 +398,7 @@ export default function DashboardPage() {
 
   useEffect(() => {
     if (user) loadRecords();
-  }, [user, dateFilter, sourceFilter, searchTerm, scoreMin, scoreMax, statusFilter]);
+  }, [user, dateFilter, sourceFilter, searchTerm, scoreMin, scoreMax, statusFilter, sortColumn, sortAscending]);
 
   async function loadAgentMeta() {
     const { data } = await supabase
@@ -367,7 +419,7 @@ export default function DashboardPage() {
       .lte("created_at", endIso)
       .gte("overall_risk_score", scoreMin)
       .lte("overall_risk_score", scoreMax)
-      .order("overall_risk_score", { ascending: false });
+      .order(TABLE_ORDER_COLUMN[sortColumn], { ascending: sortAscending });
 
     if (sourceFilter !== "all") query = query.eq("source", sourceFilter);
     if (statusFilter !== "all") query = query.eq("status", statusFilter);
@@ -377,7 +429,17 @@ export default function DashboardPage() {
     if (error) console.error("Load error:", error);
     setRecords((data as FlaggedRecord[]) ?? []);
     setLoading(false);
-  }, [dateFilter, sourceFilter, searchTerm, scoreMin, scoreMax, statusFilter]);
+  }, [dateFilter, sourceFilter, searchTerm, scoreMin, scoreMax, statusFilter, sortColumn, sortAscending]);
+
+  function requestTableSort(column: TableSortColumn) {
+    if (column === sortColumn) {
+      setSortAscending((a) => !a);
+    } else {
+      setSortColumn(column);
+      const defaultAsc = column === "supplier" || column === "key" || column === "flagged_by";
+      setSortAscending(defaultAsc);
+    }
+  }
 
   function resetReviewForm() {
     setReviewComment("");
@@ -800,11 +862,41 @@ export default function DashboardPage() {
           <table className="w-full text-sm">
             <thead className="bg-gray-50 dark:bg-zinc-800 border-b border-gray-200 dark:border-zinc-700">
               <tr>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Date</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Supplier</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Key</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Score</th>
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Flagged By</th>
+                <TableSortHeader
+                  label="Date"
+                  column="date"
+                  activeColumn={sortColumn}
+                  ascending={sortAscending}
+                  onRequestSort={requestTableSort}
+                />
+                <TableSortHeader
+                  label="Supplier"
+                  column="supplier"
+                  activeColumn={sortColumn}
+                  ascending={sortAscending}
+                  onRequestSort={requestTableSort}
+                />
+                <TableSortHeader
+                  label="Key"
+                  column="key"
+                  activeColumn={sortColumn}
+                  ascending={sortAscending}
+                  onRequestSort={requestTableSort}
+                />
+                <TableSortHeader
+                  label="Score"
+                  column="score"
+                  activeColumn={sortColumn}
+                  ascending={sortAscending}
+                  onRequestSort={requestTableSort}
+                />
+                <TableSortHeader
+                  label="Flagged By"
+                  column="flagged_by"
+                  activeColumn={sortColumn}
+                  ascending={sortAscending}
+                  onRequestSort={requestTableSort}
+                />
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Reason</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Status</th>
               </tr>
