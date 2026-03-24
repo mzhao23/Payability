@@ -62,6 +62,7 @@ const SOURCE_LABELS: Record<string, string> = {
   ship_tracking: "Shipment Agent",
   json_report: "JSON Agent",
   decision_agent: "Decision Agent",
+  health_agent: "Health Agent",
 };
 
 const FIELD =
