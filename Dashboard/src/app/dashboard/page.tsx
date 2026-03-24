@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useCallback, type ReactNode } from "react";
+import { useState, useEffect, useCallback, useMemo, type ReactNode } from "react";
 import { getSupabaseBrowser } from "@/lib/supabase-browser";
 import { EASTERN_TZ, easternDateYmd, easternYmdToUtcRange } from "@/lib/eastern-date";
 import { useRouter } from "next/navigation";
@@ -244,6 +244,16 @@ const FIELD_FULL = `w-full px-2 py-1.5 ${FIELD}`;
 const FIELD_NARROW = `w-14 px-2 py-1.5 ${FIELD}`;
 const LABEL = "block text-xs text-gray-500 dark:text-zinc-400 mb-1";
 
+type DateFilterMode = "all" | "single" | "range";
+
+/** Inclusive Eastern calendar bounds for a start..end YYYY-MM-DD range (order-independent). */
+function easternYmdRangeToUtcBounds(startYmd: string, endYmd: string): { startIso: string; endIso: string } {
+  const lo = easternYmdToUtcRange(startYmd);
+  const hi = easternYmdToUtcRange(endYmd);
+  if (lo.startIso <= hi.startIso) return { startIso: lo.startIso, endIso: hi.endIso };
+  return { startIso: hi.startIso, endIso: lo.endIso };
+}
+
 type AppRole = "viewer" | "reviewer" | "admin";
 
 /** Normalize DB role strings (trim, case, common aliases) so admin UI is not lost to "Admin" vs "admin". */
@@ -282,6 +292,12 @@ function mapSupabasePermissionError(err: { message?: string; code?: string } | n
 
 type TableSortColumn = "date" | "supplier" | "key" | "score" | "flagged_by";
 
+type TableSortState =
+  | { mode: "default" }
+  | { mode: "column"; column: TableSortColumn; ascending: boolean; step: 1 | 2 };
+
+type SummaryQuickFilter = "all" | "critical" | "pending_review" | "reviewed";
+
 const TABLE_ORDER_COLUMN: Record<TableSortColumn, string> = {
   date: "created_at",
   supplier: "supplier_name",
@@ -289,6 +305,16 @@ const TABLE_ORDER_COLUMN: Record<TableSortColumn, string> = {
   score: "overall_risk_score",
   flagged_by: "source",
 };
+
+function primaryAscending(column: TableSortColumn): boolean {
+  return column === "supplier" || column === "key" || column === "flagged_by";
+}
+
+/** Active column + direction for UI and query (default = score desc). */
+function sortStateToQuery(s: TableSortState): { column: TableSortColumn; ascending: boolean } {
+  if (s.mode === "default") return { column: "score", ascending: false };
+  return { column: s.column, ascending: s.ascending };
+}
 
 function TableSortHeader({
   label,
@@ -339,14 +365,17 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [agentMeta, setAgentMeta] = useState<Record<string, AgentMeta>>({});
 
-  const [dateFilter, setDateFilter] = useState(() => easternDateYmd());
+  const [dateMode, setDateMode] = useState<DateFilterMode>("all");
+  const [dateSingleYmd, setDateSingleYmd] = useState(() => easternDateYmd());
+  const [dateRangeStartYmd, setDateRangeStartYmd] = useState(() => easternDateYmd());
+  const [dateRangeEndYmd, setDateRangeEndYmd] = useState(() => easternDateYmd());
   const [sourceFilter, setSourceFilter] = useState("all");
   const [searchTerm, setSearchTerm] = useState("");
   const [scoreMin, setScoreMin] = useState(1);
   const [scoreMax, setScoreMax] = useState(10);
   const [statusFilter, setStatusFilter] = useState("all");
-  const [sortColumn, setSortColumn] = useState<TableSortColumn>("score");
-  const [sortAscending, setSortAscending] = useState(false);
+  const [tableSortState, setTableSortState] = useState<TableSortState>({ mode: "default" });
+  const [summaryQuickFilter, setSummaryQuickFilter] = useState<SummaryQuickFilter>("all");
 
   const [selectedRecord, setSelectedRecord] = useState<FlaggedRecord | null>(null);
   const [riskHistory, setRiskHistory] = useState<any[]>([]);
@@ -398,7 +427,7 @@ export default function DashboardPage() {
 
   useEffect(() => {
     if (user) loadRecords();
-  }, [user, dateFilter, sourceFilter, searchTerm, scoreMin, scoreMax, statusFilter, sortColumn, sortAscending]);
+  }, [user, dateMode, dateSingleYmd, dateRangeStartYmd, dateRangeEndYmd, sourceFilter, searchTerm, scoreMin, scoreMax, statusFilter, tableSortState]);
 
   async function loadAgentMeta() {
     const { data } = await supabase
@@ -411,15 +440,20 @@ export default function DashboardPage() {
 
   const loadRecords = useCallback(async () => {
     setLoading(true);
-    const { startIso, endIso } = easternYmdToUtcRange(dateFilter);
     let query = supabase
       .from("consolidated_flagged_supplier_list")
       .select("*")
-      .gte("created_at", startIso)
-      .lte("created_at", endIso)
       .gte("overall_risk_score", scoreMin)
-      .lte("overall_risk_score", scoreMax)
-      .order(TABLE_ORDER_COLUMN[sortColumn], { ascending: sortAscending });
+      .lte("overall_risk_score", scoreMax);
+    if (dateMode === "single") {
+      const { startIso, endIso } = easternYmdToUtcRange(dateSingleYmd);
+      query = query.gte("created_at", startIso).lte("created_at", endIso);
+    } else if (dateMode === "range") {
+      const { startIso, endIso } = easternYmdRangeToUtcBounds(dateRangeStartYmd, dateRangeEndYmd);
+      query = query.gte("created_at", startIso).lte("created_at", endIso);
+    }
+    const { column: orderCol, ascending: orderAsc } = sortStateToQuery(tableSortState);
+    query = query.order(TABLE_ORDER_COLUMN[orderCol], { ascending: orderAsc });
 
     if (sourceFilter !== "all") query = query.eq("source", sourceFilter);
     if (statusFilter !== "all") query = query.eq("status", statusFilter);
@@ -429,16 +463,45 @@ export default function DashboardPage() {
     if (error) console.error("Load error:", error);
     setRecords((data as FlaggedRecord[]) ?? []);
     setLoading(false);
-  }, [dateFilter, sourceFilter, searchTerm, scoreMin, scoreMax, statusFilter, sortColumn, sortAscending]);
+  }, [dateMode, dateSingleYmd, dateRangeStartYmd, dateRangeEndYmd, sourceFilter, searchTerm, scoreMin, scoreMax, statusFilter, tableSortState]);
 
   function requestTableSort(column: TableSortColumn) {
-    if (column === sortColumn) {
-      setSortAscending((a) => !a);
-    } else {
-      setSortColumn(column);
-      const defaultAsc = column === "supplier" || column === "key" || column === "flagged_by";
-      setSortAscending(defaultAsc);
+    setTableSortState((prev) => {
+      if (prev.mode === "default") {
+        if (column === "score") {
+          return { mode: "column", column: "score", ascending: true, step: 1 };
+        }
+        return { mode: "column", column, ascending: primaryAscending(column), step: 1 };
+      }
+      if (prev.column !== column) {
+        return { mode: "column", column, ascending: primaryAscending(column), step: 1 };
+      }
+      if (prev.step === 1) {
+        return { mode: "column", column: prev.column, ascending: !prev.ascending, step: 2 };
+      }
+      return { mode: "default" };
+    });
+  }
+
+  const displayRecords = useMemo(() => {
+    switch (summaryQuickFilter) {
+      case "critical":
+        return records.filter((r) => r.overall_risk_score >= 8);
+      case "pending_review":
+        return records.filter((r) => r.status === "pending_review");
+      case "reviewed":
+        return records.filter((r) => r.status === "reviewed");
+      default:
+        return records;
     }
+  }, [records, summaryQuickFilter]);
+
+  function onSummaryCardClick(filter: SummaryQuickFilter) {
+    if (filter === "all") {
+      setSummaryQuickFilter("all");
+      return;
+    }
+    setSummaryQuickFilter((prev) => (prev === filter ? "all" : filter));
   }
 
   function resetReviewForm() {
@@ -679,7 +742,7 @@ export default function DashboardPage() {
       "monitored",
     ];
 
-    const ids = records.map((r) => r.id);
+    const ids = displayRecords.map((r) => r.id);
     let allReviews: SupplierReview[] = [];
     if (ids.length > 0) {
       const { data, error } = await supabase.from("supplier_reviews").select("*").in("flagged_record_id", ids);
@@ -703,7 +766,7 @@ export default function DashboardPage() {
     }
 
     const rows: unknown[][] = [];
-    for (const r of records) {
+    for (const r of displayRecords) {
       const normalized = r.created_at.includes("T") ? r.created_at : r.created_at.replace(" ", "T");
       const d = new Date(normalized);
       const reportDate = Number.isNaN(d.getTime()) ? r.created_at.slice(0, 10) : easternDateYmd(d);
@@ -740,7 +803,13 @@ export default function DashboardPage() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `flagged_suppliers_${dateFilter}.csv`;
+    const dateSuffix =
+      dateMode === "all"
+        ? "all_dates"
+        : dateMode === "single"
+          ? dateSingleYmd
+          : `${dateRangeStartYmd}_to_${dateRangeEndYmd}`;
+    a.download = `flagged_suppliers_${dateSuffix}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -752,6 +821,7 @@ export default function DashboardPage() {
 
   if (!user || appRole === null) return null;
 
+  const sortQuery = sortStateToQuery(tableSortState);
   const hasMyReview = supplierReviews.some((r) => sameReviewerId(r.reviewer_id, user.id));
 
   return (
@@ -780,8 +850,65 @@ export default function DashboardPage() {
         <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 mb-6 grid grid-cols-2 md:grid-cols-6 gap-3">
           <div>
             <label className={LABEL}>Date</label>
-            <input type="date" value={dateFilter} onChange={(e) => setDateFilter(e.target.value)}
-              className={FIELD_FULL} />
+            <select
+              value={dateMode}
+              onChange={(e) => {
+                const v = e.target.value as DateFilterMode;
+                const prev = dateMode;
+                setDateMode(v);
+                if (v === "single" && prev === "all") setDateSingleYmd(easternDateYmd());
+                if (v === "single" && prev === "range") {
+                  setDateSingleYmd(
+                    dateRangeStartYmd <= dateRangeEndYmd ? dateRangeStartYmd : dateRangeEndYmd
+                  );
+                }
+                if (v === "range") {
+                  if (prev === "all") {
+                    const t = easternDateYmd();
+                    setDateRangeStartYmd(t);
+                    setDateRangeEndYmd(t);
+                  } else if (prev === "single") {
+                    setDateRangeStartYmd(dateSingleYmd);
+                    setDateRangeEndYmd(dateSingleYmd);
+                  }
+                }
+              }}
+              className={FIELD_FULL}
+            >
+              <option value="all">All dates</option>
+              <option value="single">Single day</option>
+              <option value="range">Date range</option>
+            </select>
+            {dateMode === "single" && (
+              <input
+                type="date"
+                value={dateSingleYmd}
+                onChange={(e) => setDateSingleYmd(e.target.value)}
+                className={`${FIELD_FULL} mt-1.5`}
+              />
+            )}
+            {dateMode === "range" && (
+              <div className="mt-1.5 space-y-1.5">
+                <div>
+                  <span className="block text-[10px] text-gray-500 dark:text-zinc-500 mb-0.5">From</span>
+                  <input
+                    type="date"
+                    value={dateRangeStartYmd}
+                    onChange={(e) => setDateRangeStartYmd(e.target.value)}
+                    className={FIELD_FULL}
+                  />
+                </div>
+                <div>
+                  <span className="block text-[10px] text-gray-500 dark:text-zinc-500 mb-0.5">To</span>
+                  <input
+                    type="date"
+                    value={dateRangeEndYmd}
+                    onChange={(e) => setDateRangeEndYmd(e.target.value)}
+                    className={FIELD_FULL}
+                  />
+                </div>
+              </div>
+            )}
           </div>
           <div>
             <label className={LABEL}>Agent</label>
@@ -831,30 +958,66 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* Summary cards */}
-        <div className="grid grid-cols-4 gap-4 mb-6">
-          <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 text-center">
+        {/* Summary cards — click to filter table; click again to clear (except Total resets to all) */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
+          <button
+            type="button"
+            onClick={() => onSummaryCardClick("all")}
+            aria-pressed={summaryQuickFilter === "all"}
+            className={`rounded-lg shadow border p-4 text-center cursor-pointer transition w-full bg-white dark:bg-zinc-900 border-gray-200 dark:border-zinc-800 hover:bg-gray-50 dark:hover:bg-zinc-800/80 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+              summaryQuickFilter === "all"
+                ? "ring-2 ring-blue-600 ring-offset-2 ring-offset-gray-50 dark:ring-blue-400 dark:ring-offset-zinc-950"
+                : ""
+            }`}
+          >
             <div className="text-2xl font-bold text-gray-900 dark:text-zinc-100">{records.length}</div>
             <div className="text-xs text-gray-500 dark:text-zinc-400">Flagged Total</div>
-          </div>
-          <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 text-center">
+          </button>
+          <button
+            type="button"
+            onClick={() => onSummaryCardClick("critical")}
+            aria-pressed={summaryQuickFilter === "critical"}
+            className={`rounded-lg shadow border p-4 text-center cursor-pointer transition w-full bg-white dark:bg-zinc-900 border-gray-200 dark:border-zinc-800 hover:bg-gray-50 dark:hover:bg-zinc-800/80 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+              summaryQuickFilter === "critical"
+                ? "ring-2 ring-blue-600 ring-offset-2 ring-offset-gray-50 dark:ring-blue-400 dark:ring-offset-zinc-950"
+                : ""
+            }`}
+          >
             <div className="text-2xl font-bold text-red-600 dark:text-red-400">
               {records.filter((r) => r.overall_risk_score >= 8).length}
             </div>
             <div className="text-xs text-gray-500 dark:text-zinc-400">Critical (8-10)</div>
-          </div>
-          <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 text-center">
+          </button>
+          <button
+            type="button"
+            onClick={() => onSummaryCardClick("pending_review")}
+            aria-pressed={summaryQuickFilter === "pending_review"}
+            className={`rounded-lg shadow border p-4 text-center cursor-pointer transition w-full bg-white dark:bg-zinc-900 border-gray-200 dark:border-zinc-800 hover:bg-gray-50 dark:hover:bg-zinc-800/80 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+              summaryQuickFilter === "pending_review"
+                ? "ring-2 ring-blue-600 ring-offset-2 ring-offset-gray-50 dark:ring-blue-400 dark:ring-offset-zinc-950"
+                : ""
+            }`}
+          >
             <div className="text-2xl font-bold text-yellow-600 dark:text-yellow-500">
               {records.filter((r) => r.status === "pending_review").length}
             </div>
             <div className="text-xs text-gray-500 dark:text-zinc-400">Pending Review</div>
-          </div>
-          <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 text-center">
+          </button>
+          <button
+            type="button"
+            onClick={() => onSummaryCardClick("reviewed")}
+            aria-pressed={summaryQuickFilter === "reviewed"}
+            className={`rounded-lg shadow border p-4 text-center cursor-pointer transition w-full bg-white dark:bg-zinc-900 border-gray-200 dark:border-zinc-800 hover:bg-gray-50 dark:hover:bg-zinc-800/80 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
+              summaryQuickFilter === "reviewed"
+                ? "ring-2 ring-blue-600 ring-offset-2 ring-offset-gray-50 dark:ring-blue-400 dark:ring-offset-zinc-950"
+                : ""
+            }`}
+          >
             <div className="text-2xl font-bold text-green-600 dark:text-green-400">
               {records.filter((r) => r.status === "reviewed").length}
             </div>
             <div className="text-xs text-gray-500 dark:text-zinc-400">Reviewed</div>
-          </div>
+          </button>
         </div>
 
         {/* Table */}
@@ -865,36 +1028,36 @@ export default function DashboardPage() {
                 <TableSortHeader
                   label="Date"
                   column="date"
-                  activeColumn={sortColumn}
-                  ascending={sortAscending}
+                  activeColumn={sortQuery.column}
+                  ascending={sortQuery.ascending}
                   onRequestSort={requestTableSort}
                 />
                 <TableSortHeader
                   label="Supplier"
                   column="supplier"
-                  activeColumn={sortColumn}
-                  ascending={sortAscending}
+                  activeColumn={sortQuery.column}
+                  ascending={sortQuery.ascending}
                   onRequestSort={requestTableSort}
                 />
                 <TableSortHeader
                   label="Key"
                   column="key"
-                  activeColumn={sortColumn}
-                  ascending={sortAscending}
+                  activeColumn={sortQuery.column}
+                  ascending={sortQuery.ascending}
                   onRequestSort={requestTableSort}
                 />
                 <TableSortHeader
                   label="Score"
                   column="score"
-                  activeColumn={sortColumn}
-                  ascending={sortAscending}
+                  activeColumn={sortQuery.column}
+                  ascending={sortQuery.ascending}
                   onRequestSort={requestTableSort}
                 />
                 <TableSortHeader
                   label="Flagged By"
                   column="flagged_by"
-                  activeColumn={sortColumn}
-                  ascending={sortAscending}
+                  activeColumn={sortQuery.column}
+                  ascending={sortQuery.ascending}
                   onRequestSort={requestTableSort}
                 />
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Reason</th>
@@ -906,8 +1069,14 @@ export default function DashboardPage() {
                 <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">Loading...</td></tr>
               ) : records.length === 0 ? (
                 <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">No records found</td></tr>
+              ) : displayRecords.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">
+                    No rows match this summary filter. Click the same card again or choose &quot;Flagged Total&quot; to show all.
+                  </td>
+                </tr>
               ) : (
-                records.map((r) => (
+                displayRecords.map((r) => (
                   <tr key={r.id} onClick={() => openDetail(r)} className="hover:bg-blue-50 dark:hover:bg-zinc-800 cursor-pointer">
                     <td className="px-4 py-3 text-gray-600 dark:text-zinc-300">{formatEastern(r.created_at)}</td>
                     <td className="px-4 py-3 font-medium text-gray-900 dark:text-zinc-100">{r.supplier_name}</td>
@@ -986,12 +1155,14 @@ export default function DashboardPage() {
               {/* Agent Scores Breakdown */}
               <div className="mb-6">
                 <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Agent Scores</h3>
-                <div className="grid grid-cols-4 gap-2">
+                <div className="grid grid-cols-5 gap-1.5 sm:gap-2 min-w-0">
                   {Object.entries(SOURCE_LABELS).map(([src, label]) => {
                     const latest = riskHistory.filter((h: any) => h.source === src).slice(-1)[0];
                     return (
-                      <div key={src} className="bg-gray-50 dark:bg-zinc-800 rounded p-2 text-center">
-                        <div className="text-xs text-gray-500 dark:text-zinc-400">{label}</div>
+                      <div key={src} className="bg-gray-50 dark:bg-zinc-800 rounded p-1.5 sm:p-2 text-center min-w-0">
+                        <div className="text-[10px] sm:text-xs text-gray-500 dark:text-zinc-400 leading-tight line-clamp-2" title={label}>
+                          {label}
+                        </div>
                         <div className={`text-lg font-bold ${
                           latest?.overall_risk_score >= 8 ? "text-red-600 dark:text-red-400" :
                           latest?.overall_risk_score >= 5 ? "text-yellow-600 dark:text-yellow-500" :
