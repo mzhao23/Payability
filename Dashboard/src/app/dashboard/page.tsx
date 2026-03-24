@@ -91,6 +91,10 @@ export default function DashboardPage() {
   const [riskHistory, setRiskHistory] = useState<any[]>([]);
   const [reviewComment, setReviewComment] = useState("");
   const [reviewVerdict, setReviewVerdict] = useState<"correct_flag" | "incorrect_flag">("correct_flag");
+  const [reviewSuspended, setReviewSuspended] = useState(false);
+  const [reviewEmailed, setReviewEmailed] = useState(false);
+  const [reviewMonitored, setReviewMonitored] = useState(false);
+  const [reviewError, setReviewError] = useState("");
   const [hoveredAgent, setHoveredAgent] = useState<string | null>(null);
 
   useEffect(() => {
@@ -140,6 +144,10 @@ export default function DashboardPage() {
     setSelectedRecord(record);
     setReviewComment("");
     setReviewVerdict("correct_flag");
+    setReviewSuspended(false);
+    setReviewEmailed(false);
+    setReviewMonitored(false);
+    setReviewError("");
 
     const { data } = await supabase
       .from("consolidated_flagged_supplier_list")
@@ -153,6 +161,17 @@ export default function DashboardPage() {
   async function submitReview() {
     if (!selectedRecord || !user) return;
 
+    setReviewError("");
+    const anyFollowUp = reviewSuspended || reviewEmailed || reviewMonitored;
+    if (reviewVerdict === "correct_flag" && !anyFollowUp) {
+      setReviewError("For True Positive, select at least one: Suspended, Emailed, or Monitored.");
+      return;
+    }
+    if (reviewVerdict === "incorrect_flag" && anyFollowUp) {
+      setReviewError("False Positive cannot include follow-up actions.");
+      return;
+    }
+
     await supabase.from("supplier_reviews").insert({
       flagged_record_id: selectedRecord.id,
       supplier_key: selectedRecord.supplier_key,
@@ -161,6 +180,9 @@ export default function DashboardPage() {
       verdict: reviewVerdict,
       comment: reviewComment,
       source: selectedRecord.source,
+      suspended: reviewSuspended,
+      emailed: reviewEmailed,
+      monitored: reviewMonitored,
     });
 
     await supabase
@@ -456,16 +478,58 @@ export default function DashboardPage() {
                     <label className="flex items-center gap-2 text-sm text-gray-900 dark:text-zinc-100 cursor-pointer">
                       <input type="radio" name="verdict" value="correct_flag"
                         checked={reviewVerdict === "correct_flag"}
-                        onChange={() => setReviewVerdict("correct_flag")} />
-                      Correct Flag
+                        onChange={() => {
+                          setReviewVerdict("correct_flag");
+                          setReviewError("");
+                        }} />
+                      True Positive
                     </label>
                     <label className="flex items-center gap-2 text-sm text-gray-900 dark:text-zinc-100 cursor-pointer">
                       <input type="radio" name="verdict" value="incorrect_flag"
                         checked={reviewVerdict === "incorrect_flag"}
-                        onChange={() => setReviewVerdict("incorrect_flag")} />
-                      Incorrect Flag
+                        onChange={() => {
+                          setReviewVerdict("incorrect_flag");
+                          setReviewSuspended(false);
+                          setReviewEmailed(false);
+                          setReviewMonitored(false);
+                          setReviewError("");
+                        }} />
+                      False Positive
                     </label>
                   </div>
+                  <div className="mb-3">
+                    <p className="text-xs font-medium text-gray-600 dark:text-zinc-400 mb-2">
+                      Follow-up {reviewVerdict === "correct_flag" ? "(select at least one)" : "(not applicable)"}
+                    </p>
+                    <div className="flex flex-wrap gap-4">
+                      {([
+                        ["Suspended", reviewSuspended, setReviewSuspended] as const,
+                        ["Emailed", reviewEmailed, setReviewEmailed] as const,
+                        ["Monitored", reviewMonitored, setReviewMonitored] as const,
+                      ]).map(([label, checked, setChecked]) => (
+                        <label
+                          key={label}
+                          className={`flex items-center gap-2 text-sm text-gray-900 dark:text-zinc-100 ${
+                            reviewVerdict === "incorrect_flag" ? "opacity-50 cursor-not-allowed" : "cursor-pointer"
+                          }`}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            disabled={reviewVerdict === "incorrect_flag"}
+                            onChange={(e) => {
+                              setChecked(e.target.checked);
+                              setReviewError("");
+                            }}
+                          />
+                          {label}
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  {reviewError && (
+                    <p className="text-sm text-red-600 dark:text-red-400 mb-2">{reviewError}</p>
+                  )}
                   <textarea value={reviewComment} onChange={(e) => setReviewComment(e.target.value)}
                     placeholder="Leave a comment..."
                     className={`w-full px-3 py-2 mb-3 ${FIELD}`}
