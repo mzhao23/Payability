@@ -2,16 +2,18 @@ from __future__ import annotations
 
 from datetime import date
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 from health_risk.config import Settings
 from health_risk.enrichment import SupplierContextEnricher
 from health_risk.filters import filter_active_population
 from health_risk.export import export_unified_json
 from health_risk.flagged import build_consolidated_flagged_rows
+from health_risk.llm.high_risk_narrative import enrich_high_risk_narratives, strip_llm_narrative_for_supabase
 from health_risk.repositories.bigquery import BigQueryRepository
 from health_risk.repositories.supabase import SupabaseRepository
 from health_risk.scoring.engine import RiskScoreEngine
+from health_risk.utils import iso
 
 
 class HealthRiskPipeline:
@@ -46,6 +48,7 @@ class HealthRiskPipeline:
         chunk_size: int,
         export_json: bool,
         dry_run: bool,
+        enable_llm_narrative: bool = True,
     ) -> None:
         print("=" * 80)
         print(f"Report date: {report_date.isoformat()}")
@@ -86,10 +89,36 @@ class HealthRiskPipeline:
             scores = [float(p["risk_score"]) for p in payload]
             print(f"[INFO] Risk score range: min={min(scores):.2f}, max={max(scores):.2f}")
 
+        raw_index: Dict[Tuple[Any, str], Dict[str, Any]] = {}
+        for r in filtered_rows:
+            mp = r.get("mp_sup_key")
+            if mp is None:
+                continue
+            raw_index[(iso(r.get("report_date")), str(mp))] = r
+
+        n_llm = enrich_high_risk_narratives(
+            payload,
+            self._settings,
+            raw_index,
+            force_disable=not enable_llm_narrative,
+        )
+        if n_llm:
+            print(f"[INFO] High-risk LLM narratives generated: {n_llm} rows")
+        elif (
+            enable_llm_narrative
+            and self._settings.llm_high_risk_narrative_enabled
+            and self._settings.openai_api_key
+        ):
+            print("[INFO] No rows above narrative threshold or LLM skipped.")
+
+        sb_payload = payload
+        if not self._settings.store_llm_narrative_in_supabase:
+            sb_payload = [strip_llm_narrative_for_supabase(p) for p in payload]
+
         if dry_run:
             print("[DRY-RUN] Skip Supabase write.")
         else:
-            self._sb.upsert_health_daily_risk(payload, chunk_size=chunk_size)
+            self._sb.upsert_health_daily_risk(sb_payload, chunk_size=chunk_size)
             flagged = build_consolidated_flagged_rows(payload)
             self._sb.upsert_consolidated_flagged(flagged, chunk_size=chunk_size)
 

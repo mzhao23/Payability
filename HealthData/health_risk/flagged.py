@@ -27,6 +27,7 @@ def build_consolidated_row(row: Dict[str, Any]) -> Dict[str, Any]:
             "red_metric_count": row.get("red_metric_count"),
             "yellow_metric_count": row.get("yellow_metric_count"),
             "pipeline_version": row.get("pipeline_version"),
+            "high_risk_narrative_llm": row.get("high_risk_narrative_llm"),
         },
         "reasons": row.get("top_risk_drivers") or [],
         "overall_risk_score": row.get("risk_score"),

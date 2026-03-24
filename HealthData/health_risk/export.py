@@ -7,7 +7,7 @@ from health_risk.config import Settings
 
 
 def build_unified_json_row(payload_row: Dict[str, Any], settings: Settings) -> Dict[str, Any]:
-    return {
+    row = {
         "table_name": settings.bq_table,
         "supplier_key": payload_row.get("supplier_key"),
         "mp_sup_key": payload_row.get("mp_sup_key"),
@@ -19,6 +19,9 @@ def build_unified_json_row(payload_row: Dict[str, Any], settings: Settings) -> D
         "risk_reason": payload_row["risk_reason"],
         "top_risk_drivers": payload_row["top_risk_drivers"],
     }
+    if payload_row.get("high_risk_narrative_llm"):
+        row["high_risk_narrative_llm"] = payload_row["high_risk_narrative_llm"]
+    return row
 
 
 def export_unified_json(

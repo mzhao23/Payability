@@ -14,9 +14,15 @@ def main() -> None:
     parser.add_argument("--chunk-size", type=int, default=500)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-export-json", action="store_true")
+    parser.add_argument(
+        "--no-llm-narrative",
+        action="store_true",
+        help="Skip Claude narrative for high-risk rows (rule scores still run)",
+    )
 
     args = parser.parse_args()
     export_json = not args.no_export_json
+    enable_llm = not args.no_llm_narrative
 
     pipeline = build_default_pipeline()
 
@@ -28,6 +34,7 @@ def main() -> None:
             chunk_size=args.chunk_size,
             export_json=export_json,
             dry_run=args.dry_run,
+            enable_llm_narrative=enable_llm,
         )
         return
 
@@ -40,6 +47,7 @@ def main() -> None:
             chunk_size=args.chunk_size,
             export_json=export_json,
             dry_run=args.dry_run,
+            enable_llm_narrative=enable_llm,
         )
 
 
