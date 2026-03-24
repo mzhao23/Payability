@@ -59,8 +59,15 @@ function followUpSummary(r: SupplierReview) {
   return parts.length ? parts.join(", ") : "—";
 }
 
+/** RFC 4180-style CSV field (always quoted; doubles internal quotes). */
+function csvEscapeCell(value: unknown): string {
+  if (value === null || value === undefined) return '""';
+  const s = String(value);
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
 const iconSvg = {
-  className: "h-4 w-4 shrink-0",
+  className: "h-3 w-3 shrink-0",
   fill: "none" as const,
   viewBox: "0 0 24 24",
   strokeWidth: 1.5,
@@ -74,7 +81,7 @@ function VerdictIconBadge({ verdict }: { verdict: ReviewVerdict }) {
       role="img"
       aria-label={verdict}
       title={verdict}
-      className={`inline-flex items-center justify-center rounded-lg border p-2 shadow-sm ${
+      className={`inline-flex items-center justify-center rounded-md border p-1 shadow-sm ${
         isTrue
           ? "border-emerald-300/80 bg-emerald-100 text-emerald-800 dark:border-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-200"
           : "border-red-300/80 bg-red-100 text-red-800 dark:border-red-700 dark:bg-red-950/55 dark:text-red-200"
@@ -160,7 +167,7 @@ function FollowUpIconBadges({ r }: { r: SupplierReview }) {
   if (items.length === 0) {
     return (
       <span
-        className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 bg-zinc-100 px-2.5 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
+        className="inline-flex items-center gap-1 rounded-md border border-zinc-200 bg-zinc-100 px-1.5 py-0.5 text-xs font-medium text-zinc-500 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
         title="No follow-up actions"
       >
         <svg {...iconSvg} aria-hidden>
@@ -171,12 +178,12 @@ function FollowUpIconBadges({ r }: { r: SupplierReview }) {
   }
 
   return (
-    <div className="flex flex-wrap items-center gap-1.5">
+    <div className="flex flex-wrap items-center gap-1">
       {items.map((it) => (
         <span
           key={it.key}
           title={it.title}
-          className={`inline-flex items-center justify-center rounded-lg border p-1.5 shadow-sm ${it.className}`}
+          className={`inline-flex items-center justify-center rounded-md border p-1 shadow-sm ${it.className}`}
         >
           {it.node}
         </span>
@@ -592,13 +599,53 @@ export default function DashboardPage() {
     loadRecords();
   }
 
-  function exportCSV() {
-    const headers = ["Report Date", "Supplier Key", "Supplier Name", "Risk Score", "Source", "Status", "Reasons"];
-    const rows = records.map((r) => {
+  async function exportCSV() {
+    const headers = [
+      "Report Date",
+      "Supplier Key",
+      "Supplier Name",
+      "Risk Score",
+      "Source",
+      "Status",
+      "Reasons",
+      "reviewed_by",
+      "reviewed_date",
+      "verdict",
+      "comment",
+      "suspended",
+      "emailed",
+      "monitored",
+    ];
+
+    const ids = records.map((r) => r.id);
+    let allReviews: SupplierReview[] = [];
+    if (ids.length > 0) {
+      const { data, error } = await supabase.from("supplier_reviews").select("*").in("flagged_record_id", ids);
+      if (error) {
+        console.error("Export reviews error:", error);
+        window.alert("Could not load reviews for export. Please try again.");
+        return;
+      }
+      allReviews = (data as SupplierReview[]) ?? [];
+    }
+
+    const byFlag = new Map<number, SupplierReview[]>();
+    for (const rev of allReviews) {
+      const fid = rev.flagged_record_id;
+      const list = byFlag.get(fid);
+      if (list) list.push(rev);
+      else byFlag.set(fid, [rev]);
+    }
+    for (const list of byFlag.values()) {
+      list.sort((a, b) => a.created_at.localeCompare(b.created_at));
+    }
+
+    const rows: unknown[][] = [];
+    for (const r of records) {
       const normalized = r.created_at.includes("T") ? r.created_at : r.created_at.replace(" ", "T");
       const d = new Date(normalized);
       const reportDate = Number.isNaN(d.getTime()) ? r.created_at.slice(0, 10) : easternDateYmd(d);
-      return [
+      const base = [
         reportDate,
         r.supplier_key,
         r.supplier_name,
@@ -607,14 +654,33 @@ export default function DashboardPage() {
         r.status,
         Array.isArray(r.reasons) ? r.reasons.join("; ") : "",
       ];
-    });
-    const csv = [headers, ...rows].map((r) => r.map((c) => `"${c}"`).join(",")).join("\n");
+      const reviews = byFlag.get(r.id) ?? [];
+      if (reviews.length === 0) {
+        rows.push([...base, "", "", "", "", "false", "false", "false"]);
+      } else {
+        for (const rev of reviews) {
+          rows.push([
+            ...base,
+            rev.reviewer_email,
+            formatEastern(rev.created_at),
+            normalizeVerdictFromDb(rev.verdict),
+            rev.comment?.trim() ? rev.comment : "",
+            rev.suspended ? "true" : "false",
+            rev.emailed ? "true" : "false",
+            rev.monitored ? "true" : "false",
+          ]);
+        }
+      }
+    }
+
+    const csv = [headers, ...rows].map((row) => row.map(csvEscapeCell).join(",")).join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
     a.download = `flagged_suppliers_${dateFilter}.csv`;
     a.click();
+    URL.revokeObjectURL(url);
   }
 
   async function handleLogout() {
@@ -695,7 +761,7 @@ export default function DashboardPage() {
           <div className="flex items-end">
             <button
               type="button"
-              onClick={exportCSV}
+              onClick={() => void exportCSV()}
               className="w-full px-3 py-1.5 bg-green-600 text-white rounded text-sm hover:bg-green-700"
             >
               Export CSV
