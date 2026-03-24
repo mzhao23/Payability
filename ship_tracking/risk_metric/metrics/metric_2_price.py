@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from core.bigquery_client import BigQueryClient
 from config.settings import PARAMS, BQ_TABLE
@@ -23,6 +23,7 @@ def run(bq: BigQueryClient) -> tuple[list, dict]:
         "table": BQ_TABLE,
         "baseline_days": PARAMS["baseline_days"],
         "zscore_threshold": PARAMS["zscore_threshold"],
+        "ship_sla_days": PARAMS["ship_sla_days"],
     })
 
     run_date = datetime.now(ZoneInfo("America/New_York")).date()
@@ -43,12 +44,13 @@ def run(bq: BigQueryClient) -> tuple[list, dict]:
             "last_purchase_date": row.get("order_date"),
         })
 
-    # Return latest row per supplier for risk scoring
-    latest = {}
-    for row in rows:
-        key = row["supplier_key"]
-        if key not in latest or row["order_date"] > latest[key]["order_date"]:
-            latest[key] = row
+    # Return rows for the target date only (aligned with metric_1)
+    target_date = run_date - timedelta(days=PARAMS["ship_sla_days"])
+    latest = {
+        row["supplier_key"]: row
+        for row in rows
+        if row.get("order_date") == target_date
+    }
 
     logger.info(f"  → {len(latest)} suppliers processed")
     return unified_rows, latest

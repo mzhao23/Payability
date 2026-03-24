@@ -1,8 +1,9 @@
 -- Metric 2: Daily Price Escalation Detection
--- Parameters: baseline_days, zscore_threshold, table
+-- Parameters: baseline_days, zscore_threshold, ship_sla_days, table
 
 DECLARE baseline_days INT64 DEFAULT {baseline_days};
 DECLARE zscore_threshold FLOAT64 DEFAULT {zscore_threshold};
+DECLARE ship_sla_days INT64 DEFAULT {ship_sla_days};
 
 WITH deduplicated_labels AS (
     SELECT * EXCEPT(row_num)
@@ -66,5 +67,5 @@ SELECT
         THEN 'YES' ELSE 'NO'
     END AS high_price_risk
 FROM rolling_baseline
-WHERE order_date >= DATE_SUB(CURRENT_DATE(), INTERVAL baseline_days DAY)
-ORDER BY order_date DESC, zscore DESC
+WHERE order_date = DATE_SUB(CURRENT_DATE(), INTERVAL ship_sla_days DAY)
+ORDER BY zscore DESC

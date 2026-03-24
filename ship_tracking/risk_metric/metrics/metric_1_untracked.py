@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from core.bigquery_client import BigQueryClient
 from config.settings import PARAMS, BQ_TABLE
@@ -10,12 +10,13 @@ logger = logging.getLogger(__name__)
 SQL_PATH = os.path.join(os.path.dirname(__file__), "../queries/metric_1_untracked.sql")
 
 
-def run(bq: BigQueryClient) -> tuple[list, dict]:
+def run(bq: BigQueryClient) -> tuple[list, dict, dict]:
     """
     Run Metric 1: Untracked Order Rate.
-    Returns (unified_rows, risk_dict) where:
+    Returns (unified_rows, risk_dict, carrier_baseline) where:
       - unified_rows: list of dicts with m1_* columns for supplier_daily_metrics
-      - risk_dict: { supplier_key -> latest row } for risk scoring
+      - risk_dict: { supplier_key -> row } for risk scoring (target date only)
+      - carrier_baseline: { carrier_normalized -> row } carrier-level rates for target date
     """
     logger.info("[Metric 1] Running Untracked Order Rate...")
 
@@ -45,13 +46,21 @@ def run(bq: BigQueryClient) -> tuple[list, dict]:
             "last_purchase_date": row.get("order_date"),
         })
 
-    # Return only by_supplier rows, latest per supplier, for risk scoring
-    supplier_rows = [r for r in rows if r.get("result_type") == "by_supplier"]
-    latest = {}
-    for row in supplier_rows:
-        key = row["supplier_key"]
-        if key not in latest or row["order_date"] > latest[key]["order_date"]:
-            latest[key] = row
+    # Return only by_supplier rows for the target date (CURRENT_DATE - ship_sla_days) for risk scoring
+    # Suppliers with no orders on the target date are excluded
+    target_date = run_date - timedelta(days=PARAMS["ship_sla_days"])
+    latest = {
+        row["supplier_key"]: row
+        for row in rows
+        if row.get("result_type") == "by_supplier" and row.get("order_date") == target_date
+    }
 
-    logger.info(f"  → {len(latest)} suppliers processed")
-    return unified_rows, latest
+    # Carrier-level baseline for the same target date (for systemic anomaly detection)
+    carrier_baseline = {
+        row["carrier_normalized"]: row
+        for row in rows
+        if row.get("result_type") == "by_carrier" and row.get("order_date") == target_date
+    }
+
+    logger.info(f"  → {len(latest)} suppliers processed, {len(carrier_baseline)} carriers in baseline")
+    return unified_rows, latest, carrier_baseline

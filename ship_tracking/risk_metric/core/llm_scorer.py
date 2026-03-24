@@ -66,7 +66,7 @@ def _load_system_prompt() -> str:
 
 
 
-def _build_supplier_context(supplier_key: str, rows: list[dict]) -> dict:
+def _build_supplier_context(supplier_key: str, rows: list[dict], carrier_baseline: dict) -> dict:
     """Build the metrics context dict for a supplier from their latest Supabase row."""
     evaluation_date = _today_et().isoformat()
     metrics = {}
@@ -125,6 +125,19 @@ def _build_supplier_context(supplier_key: str, rows: list[dict]) -> dict:
 
     if untracked:
         metrics["untracked_rate"] = untracked
+
+        # Add carrier-level baseline for same target date
+        carrier_baseline_context = {}
+        for carrier in TRACKED_CARRIERS:
+            b = carrier_baseline.get(carrier)
+            if b and b.get("untracked_rate") is not None:
+                carrier_baseline_context[carrier] = {
+                    "carrier_untracked_rate": b["untracked_rate"],
+                    "carrier_rolling_avg_30d": b.get("rolling_avg_30d"),
+                }
+        if carrier_baseline_context:
+            metrics["carrier_baseline"] = carrier_baseline_context
+
         untracked_score = _compute_untracked_score(rows)
         metrics["untracked_score"] = untracked_score
 
@@ -208,7 +221,7 @@ def _build_output_row(supplier_key: str, rows: list[dict], llm_result: dict) -> 
         "last_purchase_date": str(last_purchase_date) if last_purchase_date else None,
         "metrics": metrics,
         "trigger_reason": llm_result.get("trigger_reason"),
-        "overall_risk_score": llm_result.get("overall_risk_score"),
+        "overall_risk_score": int(llm_result.get("overall_risk_score", 0)),
     }
 
 
@@ -284,6 +297,7 @@ def _score_supplier(
     rows: list[dict],
     client: OpenAI,
     system_prompt: str,
+    carrier_baseline: dict,
 ) -> dict | None:
     if not _has_sufficient_volume(rows):
         logger.debug(f"  Skipping {supplier_key}: insufficient order volume")
@@ -296,14 +310,14 @@ def _score_supplier(
             },
         )
 
-    context = _build_supplier_context(supplier_key, rows)
+    context = _build_supplier_context(supplier_key, rows, carrier_baseline)
     llm_result = _call_llm(client, system_prompt, context)
     if llm_result is None:
         return None
     return _build_output_row(supplier_key, rows, llm_result)
 
 
-def run(grouped: dict[str, list[dict]]) -> list[dict]:
+def run(grouped: dict[str, list[dict]], carrier_baseline: dict) -> list[dict]:
     """
     Score each supplier with the LLM in parallel using today's BQ rows.
     Returns list of rows ready for supplier_risk_scores upsert.
@@ -319,7 +333,7 @@ def run(grouped: dict[str, list[dict]]) -> list[dict]:
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(_score_supplier, supplier_key, rows, client, system_prompt): supplier_key
+            executor.submit(_score_supplier, supplier_key, rows, client, system_prompt, carrier_baseline): supplier_key
             for supplier_key, rows in grouped.items()
         }
 
