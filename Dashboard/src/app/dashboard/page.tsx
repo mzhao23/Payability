@@ -15,9 +15,49 @@ type FlaggedRecord = {
   metrics: any[];
   status: string;
   created_at: string;
-  reviewed_by: string | null;
+  /** After DB migration to uuid[]: array of reviewer user ids; legacy rows may be a single string. */
+  reviewed_by: string | string[] | null;
   reviewed_at: string | null;
 };
+
+type SupplierReview = {
+  id: string;
+  created_at: string;
+  updated_at: string;
+  flagged_record_id: number;
+  supplier_key: string;
+  reviewer_id: string;
+  reviewer_email: string;
+  verdict: "correct_flag" | "incorrect_flag";
+  comment: string | null;
+  source: string;
+  suspended: boolean;
+  emailed: boolean;
+  monitored: boolean;
+};
+
+function verdictLabel(v: "correct_flag" | "incorrect_flag") {
+  return v === "correct_flag" ? "True Positive" : "False Positive";
+}
+
+function followUpSummary(r: SupplierReview) {
+  const parts: string[] = [];
+  if (r.suspended) parts.push("Suspended");
+  if (r.emailed) parts.push("Emailed");
+  if (r.monitored) parts.push("Monitored");
+  return parts.length ? parts.join(", ") : "—";
+}
+
+/** Append current user to consolidated.reviewed_by without dropping prior reviewers (requires uuid[] column). */
+function mergeReviewerIds(existing: string | string[] | null | undefined, newId: string): string[] {
+  const prev: string[] =
+    existing == null || existing === ""
+      ? []
+      : Array.isArray(existing)
+        ? existing.map(String)
+        : [String(existing)];
+  return Array.from(new Set([...prev.filter(Boolean), newId]));
+}
 
 type AgentMeta = {
   display_name: string;
@@ -95,6 +135,8 @@ export default function DashboardPage() {
   const [reviewEmailed, setReviewEmailed] = useState(false);
   const [reviewMonitored, setReviewMonitored] = useState(false);
   const [reviewError, setReviewError] = useState("");
+  const [supplierReviews, setSupplierReviews] = useState<SupplierReview[]>([]);
+  const [editingReviewId, setEditingReviewId] = useState<string | null>(null);
   const [hoveredAgent, setHoveredAgent] = useState<string | null>(null);
 
   useEffect(() => {
@@ -140,14 +182,42 @@ export default function DashboardPage() {
     setLoading(false);
   }, [dateFilter, sourceFilter, searchTerm, scoreMin, scoreMax, statusFilter]);
 
-  async function openDetail(record: FlaggedRecord) {
-    setSelectedRecord(record);
+  function resetReviewForm() {
     setReviewComment("");
     setReviewVerdict("correct_flag");
     setReviewSuspended(false);
     setReviewEmailed(false);
     setReviewMonitored(false);
     setReviewError("");
+    setEditingReviewId(null);
+  }
+
+  function closeDetail() {
+    setSelectedRecord(null);
+    setSupplierReviews([]);
+    resetReviewForm();
+  }
+
+  async function loadReviewsForFlag(flaggedRecordId: number) {
+    const { data, error } = await supabase
+      .from("supplier_reviews")
+      .select("*")
+      .eq("flagged_record_id", flaggedRecordId)
+      .order("created_at", { ascending: true });
+    if (error) {
+      console.error("Load reviews error:", error);
+      setSupplierReviews([]);
+      return;
+    }
+    setSupplierReviews((data as SupplierReview[]) ?? []);
+  }
+
+  async function openDetail(record: FlaggedRecord) {
+    setSelectedRecord(record);
+    setSupplierReviews([]);
+    resetReviewForm();
+
+    await loadReviewsForFlag(record.id);
 
     const { data } = await supabase
       .from("consolidated_flagged_supplier_list")
@@ -158,21 +228,63 @@ export default function DashboardPage() {
     setRiskHistory(data ?? []);
   }
 
-  async function submitReview() {
-    if (!selectedRecord || !user) return;
-
-    setReviewError("");
+  function validateReviewFields() {
     const anyFollowUp = reviewSuspended || reviewEmailed || reviewMonitored;
     if (reviewVerdict === "correct_flag" && !anyFollowUp) {
       setReviewError("For True Positive, select at least one: Suspended, Emailed, or Monitored.");
-      return;
+      return false;
     }
     if (reviewVerdict === "incorrect_flag" && anyFollowUp) {
       setReviewError("False Positive cannot include follow-up actions.");
+      return false;
+    }
+    return true;
+  }
+
+  function startEditReview(r: SupplierReview) {
+    setEditingReviewId(r.id);
+    setReviewVerdict(r.verdict);
+    setReviewComment(r.comment ?? "");
+    setReviewSuspended(r.suspended);
+    setReviewEmailed(r.emailed);
+    setReviewMonitored(r.monitored);
+    setReviewError("");
+  }
+
+  async function saveReviewEdit() {
+    if (!selectedRecord || !user || !editingReviewId) return;
+    setReviewError("");
+    if (!validateReviewFields()) return;
+
+    const { error } = await supabase
+      .from("supplier_reviews")
+      .update({
+        verdict: reviewVerdict,
+        comment: reviewComment,
+        suspended: reviewSuspended,
+        emailed: reviewEmailed,
+        monitored: reviewMonitored,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", editingReviewId)
+      .eq("reviewer_id", user.id);
+
+    if (error) {
+      setReviewError(error.message);
       return;
     }
 
-    await supabase.from("supplier_reviews").insert({
+    await loadReviewsForFlag(selectedRecord.id);
+    resetReviewForm();
+  }
+
+  async function submitReview() {
+    if (!selectedRecord || !user || editingReviewId) return;
+
+    setReviewError("");
+    if (!validateReviewFields()) return;
+
+    const { error: insertError } = await supabase.from("supplier_reviews").insert({
       flagged_record_id: selectedRecord.id,
       supplier_key: selectedRecord.supplier_key,
       reviewer_id: user.id,
@@ -185,16 +297,39 @@ export default function DashboardPage() {
       monitored: reviewMonitored,
     });
 
-    await supabase
+    if (insertError) {
+      setReviewError(insertError.message);
+      return;
+    }
+
+    const reviewedByIds = mergeReviewerIds(selectedRecord.reviewed_by, user.id);
+
+    const { error: updateError } = await supabase
       .from("consolidated_flagged_supplier_list")
       .update({
         status: "reviewed",
-        reviewed_by: user.id,
+        reviewed_by: reviewedByIds,
         reviewed_at: new Date().toISOString(),
       })
       .eq("id", selectedRecord.id);
 
-    setSelectedRecord(null);
+    if (updateError) {
+      setReviewError(updateError.message);
+      return;
+    }
+
+    const { data: updatedRow, error: refetchError } = await supabase
+      .from("consolidated_flagged_supplier_list")
+      .select("*")
+      .eq("id", selectedRecord.id)
+      .single();
+
+    if (!refetchError && updatedRow) {
+      setSelectedRecord(updatedRow as FlaggedRecord);
+    }
+
+    await loadReviewsForFlag(selectedRecord.id);
+    resetReviewForm();
     loadRecords();
   }
 
@@ -397,7 +532,7 @@ export default function DashboardPage() {
                   <h2 className="text-lg font-bold text-gray-900 dark:text-zinc-100">{selectedRecord.supplier_name}</h2>
                   <p className="text-sm text-gray-500 dark:text-zinc-400 font-mono">{selectedRecord.supplier_key}</p>
                 </div>
-                <button type="button" onClick={() => setSelectedRecord(null)} className="text-gray-400 dark:text-zinc-500 hover:text-gray-600 dark:hover:text-zinc-300 text-2xl leading-none">&times;</button>
+                <button type="button" onClick={closeDetail} className="text-gray-400 dark:text-zinc-500 hover:text-gray-600 dark:hover:text-zinc-300 text-2xl leading-none">&times;</button>
               </div>
 
               {/* Risk Score Trend */}
@@ -470,22 +605,83 @@ export default function DashboardPage() {
                 </ul>
               </div>
 
-              {/* Review Section */}
-              {selectedRecord.status === "pending_review" && (
-                <div className="border-t border-gray-200 dark:border-zinc-700 pt-4">
-                  <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Submit Review</h3>
+              {/* Review Section — all users can add reviews; list shows history */}
+              <div className="border-t border-gray-200 dark:border-zinc-700 pt-4 space-y-4">
+                {selectedRecord.status === "reviewed" ? (
+                  <p className="text-sm text-green-600 dark:text-green-400">
+                    Flag marked reviewed (last update {formatEastern(selectedRecord.reviewed_at)})
+                  </p>
+                ) : (
+                  <p className="text-sm text-orange-600 dark:text-orange-400">
+                    Pending review — additional reviews can be added below after this flag is marked reviewed.
+                  </p>
+                )}
+
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Review history</h3>
+                  {supplierReviews.length === 0 ? (
+                    <p className="text-sm text-gray-500 dark:text-zinc-400">No reviews yet.</p>
+                  ) : (
+                    <ul className="space-y-2">
+                      {supplierReviews.map((r) => (
+                        <li
+                          key={r.id}
+                          className="rounded-lg border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800/80 p-3 text-sm"
+                        >
+                          <div className="flex flex-wrap justify-between gap-2 text-xs text-gray-500 dark:text-zinc-400">
+                            <span className="font-medium text-gray-700 dark:text-zinc-300">{r.reviewer_email}</span>
+                            <span>{formatEastern(r.created_at)}</span>
+                          </div>
+                          <div className="mt-1 text-gray-900 dark:text-zinc-100">
+                            <span className="font-medium">Verdict:</span> {verdictLabel(r.verdict)}
+                          </div>
+                          <div className="text-gray-700 dark:text-zinc-300">
+                            <span className="font-medium">Follow-up:</span> {followUpSummary(r)}
+                          </div>
+                          <div className="text-gray-700 dark:text-zinc-300 mt-1">
+                            <span className="font-medium">Comment:</span> {r.comment?.trim() ? r.comment : "—"}
+                          </div>
+                          {user?.id === r.reviewer_id && !editingReviewId && (
+                            <button
+                              type="button"
+                              onClick={() => startEditReview(r)}
+                              className="mt-2 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                            >
+                              Edit my review
+                            </button>
+                          )}
+                          {editingReviewId === r.id && (
+                            <p className="mt-2 text-xs text-blue-600 dark:text-blue-400">Editing below…</p>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
+                <div>
+                  <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">
+                    {editingReviewId ? "Edit your review" : "Add a review"}
+                  </h3>
                   <div className="flex gap-4 mb-3 flex-wrap">
                     <label className="flex items-center gap-2 text-sm text-gray-900 dark:text-zinc-100 cursor-pointer">
-                      <input type="radio" name="verdict" value="correct_flag"
+                      <input
+                        type="radio"
+                        name={`verdict-${editingReviewId ?? "new"}`}
+                        value="correct_flag"
                         checked={reviewVerdict === "correct_flag"}
                         onChange={() => {
                           setReviewVerdict("correct_flag");
                           setReviewError("");
-                        }} />
+                        }}
+                      />
                       True Positive
                     </label>
                     <label className="flex items-center gap-2 text-sm text-gray-900 dark:text-zinc-100 cursor-pointer">
-                      <input type="radio" name="verdict" value="incorrect_flag"
+                      <input
+                        type="radio"
+                        name={`verdict-${editingReviewId ?? "new"}`}
+                        value="incorrect_flag"
                         checked={reviewVerdict === "incorrect_flag"}
                         onChange={() => {
                           setReviewVerdict("incorrect_flag");
@@ -493,7 +689,8 @@ export default function DashboardPage() {
                           setReviewEmailed(false);
                           setReviewMonitored(false);
                           setReviewError("");
-                        }} />
+                        }}
+                      />
                       False Positive
                     </label>
                   </div>
@@ -530,21 +727,43 @@ export default function DashboardPage() {
                   {reviewError && (
                     <p className="text-sm text-red-600 dark:text-red-400 mb-2">{reviewError}</p>
                   )}
-                  <textarea value={reviewComment} onChange={(e) => setReviewComment(e.target.value)}
+                  <textarea
+                    value={reviewComment}
+                    onChange={(e) => setReviewComment(e.target.value)}
                     placeholder="Leave a comment..."
                     className={`w-full px-3 py-2 mb-3 ${FIELD}`}
-                    rows={3} />
-                  <button type="button" onClick={submitReview}
-                    className="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700">
-                    Submit Review
-                  </button>
+                    rows={3}
+                  />
+                  <div className="flex flex-wrap gap-2">
+                    {editingReviewId ? (
+                      <>
+                        <button
+                          type="button"
+                          onClick={saveReviewEdit}
+                          className="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700"
+                        >
+                          Save changes
+                        </button>
+                        <button
+                          type="button"
+                          onClick={resetReviewForm}
+                          className="px-4 py-2 border border-gray-300 dark:border-zinc-600 rounded text-sm text-gray-800 dark:text-zinc-200 hover:bg-gray-50 dark:hover:bg-zinc-800"
+                        >
+                          Cancel
+                        </button>
+                      </>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={submitReview}
+                        className="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700"
+                      >
+                        Submit review
+                      </button>
+                    )}
+                  </div>
                 </div>
-              )}
-              {selectedRecord.status === "reviewed" && (
-                <div className="border-t border-gray-200 dark:border-zinc-700 pt-4 text-sm text-green-600 dark:text-green-400">
-                  ✓ Reviewed on {formatEastern(selectedRecord.reviewed_at)}
-                </div>
-              )}
+              </div>
             </div>
           </div>
         </div>
