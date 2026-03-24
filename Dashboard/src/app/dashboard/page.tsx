@@ -111,6 +111,42 @@ const FIELD_FULL = `w-full px-2 py-1.5 ${FIELD}`;
 const FIELD_NARROW = `w-14 px-2 py-1.5 ${FIELD}`;
 const LABEL = "block text-xs text-gray-500 dark:text-zinc-400 mb-1";
 
+type AppRole = "viewer" | "reviewer" | "admin";
+
+/** Normalize DB role strings (trim, case, common aliases) so admin UI is not lost to "Admin" vs "admin". */
+function normalizeAppRole(role: unknown): AppRole {
+  const r = String(role ?? "")
+    .trim()
+    .toLowerCase();
+  if (r === "admin" || r === "administrator" || r === "super_admin" || r === "superadmin") return "admin";
+  if (r === "reviewer") return "reviewer";
+  if (r === "viewer") return "viewer";
+  return "viewer";
+}
+
+function sameReviewerId(a: string | undefined | null, b: string | undefined | null): boolean {
+  if (a == null || b == null) return false;
+  return String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+}
+
+const NO_PERMISSION = "You do not have permission to perform this action.";
+
+function mapSupabasePermissionError(err: { message?: string; code?: string } | null | undefined): string {
+  if (!err?.message && !err?.code) return NO_PERMISSION;
+  const m = (err.message ?? "").toLowerCase();
+  if (
+    err.code === "42501" ||
+    m.includes("permission denied") ||
+    m.includes("row-level security") ||
+    m.includes("rls") ||
+    m.includes("violates row-level security") ||
+    m.includes("policy")
+  ) {
+    return NO_PERMISSION;
+  }
+  return err.message ?? NO_PERMISSION;
+}
+
 export default function DashboardPage() {
   const supabase = getSupabaseBrowser();
   const router = useRouter();
@@ -138,6 +174,10 @@ export default function DashboardPage() {
   const [supplierReviews, setSupplierReviews] = useState<SupplierReview[]>([]);
   const [editingReviewId, setEditingReviewId] = useState<string | null>(null);
   const [hoveredAgent, setHoveredAgent] = useState<string | null>(null);
+  const [appRole, setAppRole] = useState<AppRole | null>(null);
+
+  const canReview = appRole === "reviewer" || appRole === "admin";
+  const isAdmin = appRole === "admin";
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => {
@@ -146,6 +186,30 @@ export default function DashboardPage() {
     });
     loadAgentMeta();
   }, []);
+
+  useEffect(() => {
+    if (!user) {
+      setAppRole(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase.from("profiles").select("role").eq("id", user.id).maybeSingle();
+      if (cancelled) return;
+      if (error) {
+        setAppRole("viewer");
+        return;
+      }
+      if (!data?.role) {
+        setAppRole("viewer");
+        return;
+      }
+      setAppRole(normalizeAppRole(data.role));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user]);
 
   useEffect(() => {
     if (user) loadRecords();
@@ -285,21 +349,33 @@ export default function DashboardPage() {
   }
 
   function startEditReview(r: SupplierReview) {
+    setReviewError("");
+    if (!canReview) {
+      setReviewError(NO_PERMISSION);
+      return;
+    }
+    if (!isAdmin && !sameReviewerId(r.reviewer_id, user?.id)) {
+      setReviewError("You do not have permission to edit another user's review.");
+      return;
+    }
     setEditingReviewId(r.id);
     setReviewVerdict(normalizeVerdictFromDb(r.verdict));
     setReviewComment(r.comment ?? "");
     setReviewSuspended(r.suspended);
     setReviewEmailed(r.emailed);
     setReviewMonitored(r.monitored);
-    setReviewError("");
   }
 
   async function saveReviewEdit() {
     if (!selectedRecord || !user || !editingReviewId) return;
     setReviewError("");
+    if (!canReview) {
+      setReviewError(NO_PERMISSION);
+      return;
+    }
     if (!validateReviewFields()) return;
 
-    const { data: updatedRows, error } = await supabase
+    let q = supabase
       .from("supplier_reviews")
       .update({
         verdict: reviewVerdict,
@@ -309,16 +385,16 @@ export default function DashboardPage() {
         monitored: reviewMonitored,
         updated_at: new Date().toISOString(),
       })
-      .eq("id", editingReviewId)
-      .eq("reviewer_id", user.id)
-      .select("id");
+      .eq("id", editingReviewId);
+    if (!isAdmin) q = q.eq("reviewer_id", user.id);
+    const { data: updatedRows, error } = await q.select("id");
 
     if (error) {
-      setReviewError(error.message);
+      setReviewError(mapSupabasePermissionError(error));
       return;
     }
     if (!updatedRows?.length) {
-      setReviewError("Update failed (no row updated). Check permissions or try again.");
+      setReviewError(NO_PERMISSION);
       return;
     }
 
@@ -327,16 +403,22 @@ export default function DashboardPage() {
   }
 
   async function deleteReview(review: SupplierReview) {
-    if (!selectedRecord || !user || review.reviewer_id !== user.id) return;
-    if (!window.confirm("Delete this review? This cannot be undone.")) return;
+    if (!selectedRecord || !user) return;
     setReviewError("");
-    const { error } = await supabase
-      .from("supplier_reviews")
-      .delete()
-      .eq("id", review.id)
-      .eq("reviewer_id", user.id);
+    if (!canReview) {
+      setReviewError(NO_PERMISSION);
+      return;
+    }
+    if (!isAdmin && !sameReviewerId(review.reviewer_id, user.id)) {
+      setReviewError("You do not have permission to delete another user's review.");
+      return;
+    }
+    if (!window.confirm("Delete this review? This cannot be undone.")) return;
+    let dq = supabase.from("supplier_reviews").delete().eq("id", review.id);
+    if (!isAdmin) dq = dq.eq("reviewer_id", user.id);
+    const { error } = await dq;
     if (error) {
-      setReviewError(error.message);
+      setReviewError(mapSupabasePermissionError(error));
       return;
     }
     if (editingReviewId === review.id) resetReviewForm();
@@ -349,7 +431,11 @@ export default function DashboardPage() {
     if (!selectedRecord || !user || editingReviewId) return;
 
     setReviewError("");
-    if (supplierReviews.some((r) => r.reviewer_id === user.id)) {
+    if (!canReview) {
+      setReviewError(NO_PERMISSION);
+      return;
+    }
+    if (supplierReviews.some((r) => sameReviewerId(r.reviewer_id, user.id))) {
       setReviewError("You already have a review for this flag. Edit or delete it first.");
       return;
     }
@@ -369,7 +455,7 @@ export default function DashboardPage() {
     });
 
     if (insertError) {
-      setReviewError(insertError.message);
+      setReviewError(mapSupabasePermissionError(insertError));
       return;
     }
 
@@ -410,9 +496,9 @@ export default function DashboardPage() {
     router.push("/login");
   }
 
-  if (!user) return null;
+  if (!user || appRole === null) return null;
 
-  const hasMyReview = supplierReviews.some((r) => r.reviewer_id === user.id);
+  const hasMyReview = supplierReviews.some((r) => sameReviewerId(r.reviewer_id, user.id));
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-zinc-950">
@@ -420,6 +506,9 @@ export default function DashboardPage() {
         <h1 className="text-xl font-bold text-gray-900 dark:text-zinc-100">Payability Risk Dashboard</h1>
         <div className="flex items-center gap-4 flex-wrap justify-end">
           <ThemeToggle />
+          <span className="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-zinc-400 px-2 py-0.5 rounded border border-gray-200 dark:border-zinc-600">
+            {appRole}
+          </span>
           <span className="text-sm text-gray-500 dark:text-zinc-400">{user.email}</span>
           <button onClick={handleLogout} className="text-sm text-red-600 dark:text-red-400 hover:underline">
             Sign Out
@@ -428,6 +517,11 @@ export default function DashboardPage() {
       </header>
 
       <div className="p-6 max-w-7xl mx-auto">
+        {!canReview && (
+          <div className="mb-4 rounded-lg border border-amber-200 dark:border-amber-900/50 bg-amber-50 dark:bg-amber-950/30 px-4 py-3 text-sm text-amber-900 dark:text-amber-200">
+            View-only access: you can browse data and export CSV, but cannot submit, edit, or delete reviews.
+          </div>
+        )}
         {/* Filters */}
         <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 mb-6 grid grid-cols-2 md:grid-cols-6 gap-3">
           <div>
@@ -473,8 +567,11 @@ export default function DashboardPage() {
             </select>
           </div>
           <div className="flex items-end">
-            <button onClick={exportCSV}
-              className="w-full px-3 py-1.5 bg-green-600 text-white rounded text-sm hover:bg-green-700">
+            <button
+              type="button"
+              onClick={exportCSV}
+              className="w-full px-3 py-1.5 bg-green-600 text-white rounded text-sm hover:bg-green-700"
+            >
               Export CSV
             </button>
           </div>
@@ -654,7 +751,7 @@ export default function DashboardPage() {
                 </ul>
               </div>
 
-              {/* Review Section — all users can add reviews; list shows history */}
+              {/* Review Section — reviewers/admins can submit; viewers see history only */}
               <div className="border-t border-gray-200 dark:border-zinc-700 pt-4 space-y-4">
                 {selectedRecord.status === "reviewed" ? (
                   <p className="text-sm text-green-600 dark:text-green-400">
@@ -698,21 +795,27 @@ export default function DashboardPage() {
                           <div className="text-gray-700 dark:text-zinc-300 mt-1">
                             <span className="font-medium">Comment:</span> {r.comment?.trim() ? r.comment : "—"}
                           </div>
-                          {user?.id === r.reviewer_id && !editingReviewId && (
+                          {canReview &&
+                            !editingReviewId &&
+                            (isAdmin || sameReviewerId(r.reviewer_id, user.id)) && (
                             <div className="mt-2 flex flex-wrap gap-3">
                               <button
                                 type="button"
                                 onClick={() => startEditReview(r)}
                                 className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
                               >
-                                Edit my review
+                                {sameReviewerId(r.reviewer_id, user.id)
+                                  ? "Edit my review"
+                                  : "Edit review (admin)"}
                               </button>
                               <button
                                 type="button"
                                 onClick={() => deleteReview(r)}
                                 className="text-xs font-medium text-red-600 dark:text-red-400 hover:underline"
                               >
-                                Delete my review
+                                {sameReviewerId(r.reviewer_id, user.id)
+                                  ? "Delete my review"
+                                  : "Delete review (admin)"}
                               </button>
                             </div>
                           )}
@@ -727,8 +830,12 @@ export default function DashboardPage() {
 
                 <div>
                   <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">
-                    {editingReviewId ? "Edit your review" : "Add a review"}
+                    {editingReviewId ? "Edit review" : "Add a review"}
                   </h3>
+                  {!canReview ? (
+                    <p className="text-sm text-gray-600 dark:text-zinc-400 mb-3">{NO_PERMISSION}</p>
+                  ) : (
+                    <>
                   {hasMyReview && !editingReviewId && (
                     <p className="text-sm text-gray-600 dark:text-zinc-400 mb-3">
                       You already submitted a review for this flag. Use <strong>Edit</strong> or <strong>Delete</strong>{" "}
@@ -835,6 +942,8 @@ export default function DashboardPage() {
                       </button>
                     )}
                   </div>
+                    </>
+                  )}
                 </div>
               </div>
             </div>
