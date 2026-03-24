@@ -61,8 +61,8 @@ const SOURCE_LABELS: Record<string, string> = {
   daily_summary_report: "Daily Summary Agent",
   ship_tracking: "Shipment Agent",
   json_report: "JSON Agent",
+  health_report: "Health Agent",
   decision_agent: "Decision Agent",
-  health_agent: "Health Agent",
 };
 
 const FIELD =
