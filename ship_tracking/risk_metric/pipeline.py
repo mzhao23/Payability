@@ -35,7 +35,29 @@ def run_pipeline():
     sb = SupabaseClient()
 
     # ── Metric 1: Untracked Order Rate ──────────────────────
-    rows_1, _ = metric_1_untracked.run(bq)
+    rows_1, m1_latest, carrier_baseline = metric_1_untracked.run(bq)
+
+    if not m1_latest:
+        logger.warning("No orders found on target date — skipping scoring.")
+        return
+
+    # ── Write carrier daily untracked rates ──────────────────
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+    target_date = datetime.now(ZoneInfo("America/New_York")).date() - timedelta(days=3)
+    carrier_rows = [
+        {
+            "run_date": date.today().isoformat(),
+            "order_date": target_date.isoformat(),
+            "carrier": carrier,
+            "total_orders": row.get("total_orders"),
+            "untracked_orders": row.get("untracked_orders"),
+            "untracked_rate": row.get("untracked_rate"),
+            "rolling_avg_30d": row.get("rolling_avg_30d"),
+        }
+        for carrier, row in carrier_baseline.items()
+    ]
+    sb.upsert("carrier_daily_untracked", carrier_rows)
 
     # ── Metric 2: Price Escalation ───────────────────────────
     rows_2, _ = metric_2_price.run(bq)
@@ -44,15 +66,18 @@ def run_pipeline():
     rows_3, _ = metric_3_pickup_lag.run(bq)
 
     # ── Group BQ rows by supplier for LLM scorer ─────────────
+    # Only score suppliers that have orders on the target date (from m1_latest)
     run_id = str(uuid.uuid4())
+    active_suppliers = set(m1_latest.keys())
     supplier_rows = defaultdict(list)
     for row in rows_1 + rows_2 + rows_3:
-        if row.get("supplier_key"):
-            supplier_rows[row["supplier_key"]].append(row)
+        key = row.get("supplier_key")
+        if key and key in active_suppliers:
+            supplier_rows[key].append(row)
 
     # ── LLM Risk Scoring ─────────────────────────────────────
     logger.info("\n[LLM Scorer] Running LLM risk scoring...")
-    risk_scores = llm_scorer.run(dict(supplier_rows))
+    risk_scores = llm_scorer.run(dict(supplier_rows), carrier_baseline)
     for row in risk_scores:
         row["run_id"] = run_id
 
@@ -84,7 +109,7 @@ def run_pipeline():
             "reasons": [r["trigger_reason"]] if r.get("trigger_reason") else [],
             "overall_risk_score": r["overall_risk_score"],
         }
-        for r in risk_scores if float(r.get("overall_risk_score", 0)) >= 5
+        for r in risk_scores if float(r.get("overall_risk_score", 0)) >= 6
     ]
     if alerts:
         logger.info(f"\n[Alerts] Writing {len(alerts)} high-risk suppliers to consolidated_flagged_supplier_list...")

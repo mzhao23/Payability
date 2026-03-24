@@ -5,10 +5,7 @@ Your job is to evaluate seller risk based on their shipping behavior.
 
 ## Metrics Provided
 
-> **Note on time windows:** `untracked_rate` reflects orders placed 3+ days ago
-> (a buffer is applied to avoid flagging orders that haven't had time to ship yet).
-> `price_escalation` reflects the most recent available order data.
-> These two metrics cover slightly different time windows by design — this is expected.
+> **Note on time windows:** All metrics (`untracked_rate`, `price_escalation`, `fedex_pickup_lag`) reflect orders placed on the same target date: **today minus 3 days**. This 3-day buffer ensures orders have had sufficient time to generate tracking events before being evaluated. All signals are directly comparable as they cover the same cohort of orders.
 
 ### 1. untracked_rate (PRIMARY signal — highest weight)
 The proportion of orders with no shipping scan after a 3-day SLA window.
@@ -30,6 +27,22 @@ Fields provided per carrier (UPS, FEDEX, USPS):
   - High untracked rate + low or shrinking order volume = weak signal, seller may simply have fewer active orders
   - Do NOT treat low or declining order volume as a risk signal on its own
 - Compare `diff_vs_baseline` to context: if diff is high but `latest_rate` is still low in absolute terms, it may be noise
+
+**Carrier baseline comparison (`carrier_baseline` field):**
+
+The context may include `carrier_baseline` — the overall untracked rate across ALL suppliers for the same carrier on the same day. Use this to distinguish supplier-specific risk from systemic carrier issues.
+
+Use the following logic to interpret the comparison:
+
+Use the following logic to interpret the comparison:
+
+Use the following logic. The adjustment applies to `untracked_score` when computing `overall_risk_score`:
+
+- If `carrier_untracked_rate` is **≥ 50%** AND supplier's `latest_rate` is within **15 percentage points** of the carrier rate (e.g. carrier 99.6%, supplier 100%): systemic carrier issue. **Multiply `untracked_score` by 0.5** before adding to final score. In `trigger_reason`, state that the carrier-wide rate is X% making this signal unreliable, and reflect the reduced weight in the score.
+- If `carrier_untracked_rate` is **≥ 50%** AND supplier's `latest_rate` exceeds carrier by **more than 15 percentage points**: systemic issue exists but supplier is meaningfully worse. **Use full `untracked_score`**. In `trigger_reason`, note the carrier-wide issue but state that the supplier's rate exceeds the carrier baseline, indicating real supplier-specific risk.
+- If `carrier_untracked_rate` is **< 20%** and supplier's `latest_rate` is significantly higher: signal is supplier-specific. **Use full `untracked_score`**. Note in `trigger_reason` that the rate is well above the carrier-wide baseline.
+- If `carrier_untracked_rate` is **20–50%** and supplier's rate is notably higher: **Multiply `untracked_score` by 0.75**. Note the mixed signal in `trigger_reason`.
+- If `carrier_baseline` is absent: use full `untracked_score` without adjustment.
 
 ---
 

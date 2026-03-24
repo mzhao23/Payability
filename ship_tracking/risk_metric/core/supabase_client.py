@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 # Must match the UNIQUE constraint defined in migrations
 TABLE_CONFLICT_COLUMNS = {
     "consolidated_flagged_supplier_list": "supplier_key,source",
+    "carrier_daily_untracked": "order_date,carrier",
 }
 
 
