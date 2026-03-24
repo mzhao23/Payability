@@ -1,6 +1,7 @@
 "use client";
 import { useState, useEffect, useCallback } from "react";
 import { getSupabaseBrowser } from "@/lib/supabase-browser";
+import { EASTERN_TZ, easternDateYmd, easternYmdToUtcRange } from "@/lib/eastern-date";
 import { useRouter } from "next/navigation";
 
 type FlaggedRecord = {
@@ -23,8 +24,6 @@ type AgentMeta = {
   last_updated: string;
   active_rules: string;
 };
-
-const EASTERN_TZ = "America/New_York";
 
 function formatEastern(
   utcString: string | null | undefined,
@@ -73,7 +72,7 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [agentMeta, setAgentMeta] = useState<Record<string, AgentMeta>>({});
 
-  const [dateFilter, setDateFilter] = useState(new Date().toISOString().slice(0, 10));
+  const [dateFilter, setDateFilter] = useState(() => easternDateYmd());
   const [sourceFilter, setSourceFilter] = useState("all");
   const [searchTerm, setSearchTerm] = useState("");
   const [scoreMin, setScoreMin] = useState(1);
@@ -109,11 +108,12 @@ export default function DashboardPage() {
 
   const loadRecords = useCallback(async () => {
     setLoading(true);
+    const { startIso, endIso } = easternYmdToUtcRange(dateFilter);
     let query = supabase
       .from("consolidated_flagged_supplier_list")
       .select("*")
-      .gte("created_at", `${dateFilter}T00:00:00Z`)
-      .lte("created_at", `${dateFilter}T23:59:59Z`)
+      .gte("created_at", startIso)
+      .lte("created_at", endIso)
       .gte("overall_risk_score", scoreMin)
       .lte("overall_risk_score", scoreMax)
       .order("overall_risk_score", { ascending: false });
@@ -170,15 +170,20 @@ export default function DashboardPage() {
 
   function exportCSV() {
     const headers = ["Report Date", "Supplier Key", "Supplier Name", "Risk Score", "Source", "Status", "Reasons"];
-    const rows = records.map((r) => [
-      r.created_at.slice(0, 10),
-      r.supplier_key,
-      r.supplier_name,
-      r.overall_risk_score,
-      SOURCE_LABELS[r.source] ?? r.source,
-      r.status,
-      Array.isArray(r.reasons) ? r.reasons.join("; ") : "",
-    ]);
+    const rows = records.map((r) => {
+      const normalized = r.created_at.includes("T") ? r.created_at : r.created_at.replace(" ", "T");
+      const d = new Date(normalized);
+      const reportDate = Number.isNaN(d.getTime()) ? r.created_at.slice(0, 10) : easternDateYmd(d);
+      return [
+        reportDate,
+        r.supplier_key,
+        r.supplier_name,
+        r.overall_risk_score,
+        SOURCE_LABELS[r.source] ?? r.source,
+        r.status,
+        Array.isArray(r.reasons) ? r.reasons.join("; ") : "",
+      ];
+    });
     const csv = [headers, ...rows].map((r) => r.map((c) => `"${c}"`).join(",")).join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
     const url = URL.createObjectURL(blob);

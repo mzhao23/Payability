@@ -3,6 +3,7 @@ export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase-admin";
+import { easternDateYmd, easternYmdToUtcRange } from "@/lib/eastern-date";
 
 const SOURCE_LABELS: Record<string, string> = {
   daily_summary_report: "Daily Summary Agent",
@@ -14,7 +15,8 @@ const SOURCE_LABELS: Record<string, string> = {
 export async function GET() {
   try {
     const sb = supabaseAdmin();
-    const today = new Date().toISOString().slice(0, 10);
+    const today = easternDateYmd();
+    const { startIso, endIso } = easternYmdToUtcRange(today);
 
     const { data: config } = await sb
       .from("app_settings")
@@ -31,8 +33,8 @@ export async function GET() {
     const { data: flagged } = await sb
       .from("consolidated_flagged_supplier_list")
       .select("supplier_key, supplier_name, overall_risk_score, source, reasons")
-      .gte("created_at", `${today}T00:00:00Z`)
-      .lte("created_at", `${today}T23:59:59Z`)
+      .gte("created_at", startIso)
+      .lte("created_at", endIso)
       .order("overall_risk_score", { ascending: false })
       .limit(30);
 
