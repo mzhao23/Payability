@@ -24,6 +24,39 @@ type AgentMeta = {
   active_rules: string;
 };
 
+const EASTERN_TZ = "America/New_York";
+
+function formatEastern(
+  utcString: string | null | undefined,
+  opts?: { dateOnly?: boolean }
+): string {
+  if (!utcString) return "—";
+  const normalized = utcString.includes("T") ? utcString : utcString.replace(" ", "T");
+  const d = new Date(normalized);
+  if (Number.isNaN(d.getTime())) return utcString;
+
+  if (opts?.dateOnly) {
+    return new Intl.DateTimeFormat("en-US", {
+      timeZone: EASTERN_TZ,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(d);
+  }
+
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: EASTERN_TZ,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    timeZoneName: "short",
+  }).format(d);
+}
+
 const SOURCE_LABELS: Record<string, string> = {
   daily_summary_report: "Daily Summary Agent",
   ship_tracking: "Shipment Agent",
@@ -273,7 +306,7 @@ export default function DashboardPage() {
               ) : (
                 records.map((r) => (
                   <tr key={r.id} onClick={() => openDetail(r)} className="hover:bg-blue-50 cursor-pointer">
-                    <td className="px-4 py-3 text-gray-600">{r.created_at.slice(0, 10)}</td>
+                    <td className="px-4 py-3 text-gray-600">{formatEastern(r.created_at)}</td>
                     <td className="px-4 py-3 font-medium text-gray-900">{r.supplier_name}</td>
                     <td className="px-4 py-3 text-gray-500 font-mono text-xs">{r.supplier_key.slice(0, 8)}...</td>
                     <td className="px-4 py-3">
@@ -294,7 +327,7 @@ export default function DashboardPage() {
                           <div className="font-bold mb-1">{agentMeta[r.source].display_name}</div>
                           <div className="mb-1">{agentMeta[r.source].description}</div>
                           <div className="text-gray-300">Rules: {agentMeta[r.source].active_rules}</div>
-                          <div className="text-gray-400 mt-1">Updated: {agentMeta[r.source].last_updated}</div>
+                          <div className="text-gray-400 mt-1">Updated: {formatEastern(agentMeta[r.source].last_updated)}</div>
                         </div>
                       )}
                     </td>
@@ -337,8 +370,8 @@ export default function DashboardPage() {
                         h.overall_risk_score >= 8 ? "bg-red-500" :
                         h.overall_risk_score >= 5 ? "bg-yellow-500" : "bg-green-500"
                       }`} style={{ height: `${(h.overall_risk_score / 10) * 80}px` }}
-                        title={`${h.source}: ${h.overall_risk_score} (${h.created_at.slice(0, 10)})`} />
-                      <span className="text-[9px] text-gray-400 mt-1">{h.created_at.slice(5, 10)}</span>
+                      title={`${h.source}: ${h.overall_risk_score} (${formatEastern(h.created_at, { dateOnly: true })})`} />
+                      <span className="text-[9px] text-gray-400 mt-1">{formatEastern(h.created_at, { dateOnly: true })}</span>
                     </div>
                   ))}
                   {riskHistory.length === 0 && <span className="text-gray-400 text-xs m-auto">No history</span>}
@@ -419,7 +452,7 @@ export default function DashboardPage() {
               )}
               {selectedRecord.status === "reviewed" && (
                 <div className="border-t pt-4 text-sm text-green-600">
-                  ✓ Reviewed on {selectedRecord.reviewed_at?.slice(0, 10)}
+                  ✓ Reviewed on {formatEastern(selectedRecord.reviewed_at)}
                 </div>
               )}
             </div>
