@@ -48,17 +48,6 @@ function followUpSummary(r: SupplierReview) {
   return parts.length ? parts.join(", ") : "—";
 }
 
-/** Append current user to consolidated.reviewed_by without dropping prior reviewers (requires uuid[] column). */
-function mergeReviewerIds(existing: string | string[] | null | undefined, newId: string): string[] {
-  const prev: string[] =
-    existing == null || existing === ""
-      ? []
-      : Array.isArray(existing)
-        ? existing.map(String)
-        : [String(existing)];
-  return Array.from(new Set([...prev.filter(Boolean), newId]));
-}
-
 type AgentMeta = {
   display_name: string;
   description: string;
@@ -212,6 +201,49 @@ export default function DashboardPage() {
     setSupplierReviews((data as SupplierReview[]) ?? []);
   }
 
+  /** Set consolidated row from actual supplier_reviews (distinct reviewer_id). Requires reviewed_by uuid[]. */
+  async function syncConsolidatedReviewersFromReviews(flaggedRecordId: number) {
+    const { data: rows, error } = await supabase
+      .from("supplier_reviews")
+      .select("reviewer_id")
+      .eq("flagged_record_id", flaggedRecordId);
+    if (error) {
+      console.error("Sync reviewers error:", error);
+      return;
+    }
+    const ids = Array.from(new Set((rows ?? []).map((r) => String(r.reviewer_id)).filter(Boolean)));
+    if (ids.length === 0) {
+      const { error: uerr } = await supabase
+        .from("consolidated_flagged_supplier_list")
+        .update({
+          status: "pending_review",
+          reviewed_by: null,
+          reviewed_at: null,
+        })
+        .eq("id", flaggedRecordId);
+      if (uerr) console.error("Consolidated update error:", uerr);
+    } else {
+      const { error: uerr } = await supabase
+        .from("consolidated_flagged_supplier_list")
+        .update({
+          status: "reviewed",
+          reviewed_by: ids,
+          reviewed_at: new Date().toISOString(),
+        })
+        .eq("id", flaggedRecordId);
+      if (uerr) console.error("Consolidated update error:", uerr);
+    }
+
+    const { data: updatedRow, error: refetchError } = await supabase
+      .from("consolidated_flagged_supplier_list")
+      .select("*")
+      .eq("id", flaggedRecordId)
+      .single();
+    if (!refetchError && updatedRow) {
+      setSelectedRecord((prev) => (prev?.id === flaggedRecordId ? (updatedRow as FlaggedRecord) : prev));
+    }
+  }
+
   async function openDetail(record: FlaggedRecord) {
     setSelectedRecord(record);
     setSupplierReviews([]);
@@ -256,7 +288,7 @@ export default function DashboardPage() {
     setReviewError("");
     if (!validateReviewFields()) return;
 
-    const { error } = await supabase
+    const { data: updatedRows, error } = await supabase
       .from("supplier_reviews")
       .update({
         verdict: reviewVerdict,
@@ -267,10 +299,15 @@ export default function DashboardPage() {
         updated_at: new Date().toISOString(),
       })
       .eq("id", editingReviewId)
-      .eq("reviewer_id", user.id);
+      .eq("reviewer_id", user.id)
+      .select("id");
 
     if (error) {
       setReviewError(error.message);
+      return;
+    }
+    if (!updatedRows?.length) {
+      setReviewError("Update failed (no row updated). Check permissions or try again.");
       return;
     }
 
@@ -278,10 +315,33 @@ export default function DashboardPage() {
     resetReviewForm();
   }
 
+  async function deleteReview(review: SupplierReview) {
+    if (!selectedRecord || !user || review.reviewer_id !== user.id) return;
+    if (!window.confirm("Delete this review? This cannot be undone.")) return;
+    setReviewError("");
+    const { error } = await supabase
+      .from("supplier_reviews")
+      .delete()
+      .eq("id", review.id)
+      .eq("reviewer_id", user.id);
+    if (error) {
+      setReviewError(error.message);
+      return;
+    }
+    if (editingReviewId === review.id) resetReviewForm();
+    await loadReviewsForFlag(selectedRecord.id);
+    await syncConsolidatedReviewersFromReviews(selectedRecord.id);
+    loadRecords();
+  }
+
   async function submitReview() {
     if (!selectedRecord || !user || editingReviewId) return;
 
     setReviewError("");
+    if (supplierReviews.some((r) => r.reviewer_id === user.id)) {
+      setReviewError("You already have a review for this flag. Edit or delete it first.");
+      return;
+    }
     if (!validateReviewFields()) return;
 
     const { error: insertError } = await supabase.from("supplier_reviews").insert({
@@ -302,31 +362,7 @@ export default function DashboardPage() {
       return;
     }
 
-    const reviewedByIds = mergeReviewerIds(selectedRecord.reviewed_by, user.id);
-
-    const { error: updateError } = await supabase
-      .from("consolidated_flagged_supplier_list")
-      .update({
-        status: "reviewed",
-        reviewed_by: reviewedByIds,
-        reviewed_at: new Date().toISOString(),
-      })
-      .eq("id", selectedRecord.id);
-
-    if (updateError) {
-      setReviewError(updateError.message);
-      return;
-    }
-
-    const { data: updatedRow, error: refetchError } = await supabase
-      .from("consolidated_flagged_supplier_list")
-      .select("*")
-      .eq("id", selectedRecord.id)
-      .single();
-
-    if (!refetchError && updatedRow) {
-      setSelectedRecord(updatedRow as FlaggedRecord);
-    }
+    await syncConsolidatedReviewersFromReviews(selectedRecord.id);
 
     await loadReviewsForFlag(selectedRecord.id);
     resetReviewForm();
@@ -364,6 +400,8 @@ export default function DashboardPage() {
   }
 
   if (!user) return null;
+
+  const hasMyReview = supplierReviews.some((r) => r.reviewer_id === user.id);
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-zinc-950">
@@ -613,7 +651,7 @@ export default function DashboardPage() {
                   </p>
                 ) : (
                   <p className="text-sm text-orange-600 dark:text-orange-400">
-                    Pending review — additional reviews can be added below after this flag is marked reviewed.
+                    Pending review — other reviewers can add their review below (one review per person).
                   </p>
                 )}
 
@@ -630,7 +668,15 @@ export default function DashboardPage() {
                         >
                           <div className="flex flex-wrap justify-between gap-2 text-xs text-gray-500 dark:text-zinc-400">
                             <span className="font-medium text-gray-700 dark:text-zinc-300">{r.reviewer_email}</span>
-                            <span>{formatEastern(r.created_at)}</span>
+                            <span className="text-right">
+                              <span className="block">{formatEastern(r.created_at)}</span>
+                              {r.updated_at &&
+                                r.updated_at.slice(0, 19) !== r.created_at.slice(0, 19) && (
+                                  <span className="block text-[10px] text-gray-400 dark:text-zinc-500">
+                                    Updated {formatEastern(r.updated_at)}
+                                  </span>
+                                )}
+                            </span>
                           </div>
                           <div className="mt-1 text-gray-900 dark:text-zinc-100">
                             <span className="font-medium">Verdict:</span> {verdictLabel(r.verdict)}
@@ -642,13 +688,22 @@ export default function DashboardPage() {
                             <span className="font-medium">Comment:</span> {r.comment?.trim() ? r.comment : "—"}
                           </div>
                           {user?.id === r.reviewer_id && !editingReviewId && (
-                            <button
-                              type="button"
-                              onClick={() => startEditReview(r)}
-                              className="mt-2 text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
-                            >
-                              Edit my review
-                            </button>
+                            <div className="mt-2 flex flex-wrap gap-3">
+                              <button
+                                type="button"
+                                onClick={() => startEditReview(r)}
+                                className="text-xs font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                              >
+                                Edit my review
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => deleteReview(r)}
+                                className="text-xs font-medium text-red-600 dark:text-red-400 hover:underline"
+                              >
+                                Delete my review
+                              </button>
+                            </div>
                           )}
                           {editingReviewId === r.id && (
                             <p className="mt-2 text-xs text-blue-600 dark:text-blue-400">Editing below…</p>
@@ -663,6 +718,12 @@ export default function DashboardPage() {
                   <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">
                     {editingReviewId ? "Edit your review" : "Add a review"}
                   </h3>
+                  {hasMyReview && !editingReviewId && (
+                    <p className="text-sm text-gray-600 dark:text-zinc-400 mb-3">
+                      You already submitted a review for this flag. Use <strong>Edit</strong> or <strong>Delete</strong>{" "}
+                      in the list above to change it. Submit is disabled until you delete that review.
+                    </p>
+                  )}
                   <div className="flex gap-4 mb-3 flex-wrap">
                     <label className="flex items-center gap-2 text-sm text-gray-900 dark:text-zinc-100 cursor-pointer">
                       <input
@@ -756,7 +817,8 @@ export default function DashboardPage() {
                       <button
                         type="button"
                         onClick={submitReview}
-                        className="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700"
+                        disabled={hasMyReview}
+                        className="px-4 py-2 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-blue-600"
                       >
                         Submit review
                       </button>
