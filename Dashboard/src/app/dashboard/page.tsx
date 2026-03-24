@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, type ReactNode } from "react";
 import { getSupabaseBrowser } from "@/lib/supabase-browser";
 import { EASTERN_TZ, easternDateYmd, easternYmdToUtcRange } from "@/lib/eastern-date";
 import { useRouter } from "next/navigation";
@@ -57,6 +57,132 @@ function followUpSummary(r: SupplierReview) {
   if (r.emailed) parts.push("Emailed");
   if (r.monitored) parts.push("Monitored");
   return parts.length ? parts.join(", ") : "—";
+}
+
+const iconSvg = {
+  className: "h-4 w-4 shrink-0",
+  fill: "none" as const,
+  viewBox: "0 0 24 24",
+  strokeWidth: 1.5,
+  stroke: "currentColor" as const,
+};
+
+function VerdictIconBadge({ verdict }: { verdict: ReviewVerdict }) {
+  const isTrue = verdict === VERDICT_TRUE;
+  return (
+    <span
+      role="img"
+      aria-label={verdict}
+      title={verdict}
+      className={`inline-flex items-center justify-center rounded-lg border p-2 shadow-sm ${
+        isTrue
+          ? "border-emerald-300/80 bg-emerald-100 text-emerald-800 dark:border-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-200"
+          : "border-red-300/80 bg-red-100 text-red-800 dark:border-red-700 dark:bg-red-950/55 dark:text-red-200"
+      }`}
+    >
+      {isTrue ? (
+        <svg {...iconSvg} aria-hidden>
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="M9 12.75L11.25 15 15 9.75M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+          />
+        </svg>
+      ) : (
+        <svg {...iconSvg} aria-hidden>
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="m9.75 9.75 4.5 4.5m0-4.5-4.5 4.5M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+          />
+        </svg>
+      )}
+    </span>
+  );
+}
+
+function FollowUpIconBadges({ r }: { r: SupplierReview }) {
+  type Key = "suspended" | "emailed" | "monitored";
+  const items: { key: Key; title: string; className: string; node: ReactNode }[] = [];
+  if (r.suspended) {
+    items.push({
+      key: "suspended",
+      title: "Suspended",
+      className:
+        "border-amber-300/80 bg-amber-100 text-amber-950 dark:border-amber-700 dark:bg-amber-950/50 dark:text-amber-100",
+      node: (
+        <svg {...iconSvg} aria-hidden>
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636"
+          />
+        </svg>
+      ),
+    });
+  }
+  if (r.emailed) {
+    items.push({
+      key: "emailed",
+      title: "Emailed",
+      className:
+        "border-violet-300/80 bg-violet-100 text-violet-950 dark:border-violet-700 dark:bg-violet-950/50 dark:text-violet-100",
+      node: (
+        <svg {...iconSvg} aria-hidden>
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="M21.75 6.75v10.5a2.25 2.25 0 01-2.25 2.25h-15a2.25 2.25 0 01-2.25-2.25V6.75m19.5 0A2.25 2.25 0 0019.5 4.5h-15a2.25 2.25 0 00-2.25 2.25m19.5 0v.243a2.25 2.25 0 01-1.07 1.916l-7.5 4.615a2.25 2.25 0 01-2.36 0L3.32 8.91a2.25 2.25 0 01-1.07-1.916V6.75"
+          />
+        </svg>
+      ),
+    });
+  }
+  if (r.monitored) {
+    items.push({
+      key: "monitored",
+      title: "Monitored",
+      className:
+        "border-cyan-300/80 bg-cyan-100 text-cyan-950 dark:border-cyan-700 dark:bg-cyan-950/50 dark:text-cyan-100",
+      node: (
+        <svg {...iconSvg} aria-hidden>
+          <path
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178z"
+          />
+          <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+        </svg>
+      ),
+    });
+  }
+
+  if (items.length === 0) {
+    return (
+      <span
+        className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-200 bg-zinc-100 px-2.5 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-400"
+        title="No follow-up actions"
+      >
+        <svg {...iconSvg} aria-hidden>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M18 12H6" />
+        </svg>
+      </span>
+    );
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {items.map((it) => (
+        <span
+          key={it.key}
+          title={it.title}
+          className={`inline-flex items-center justify-center rounded-lg border p-1.5 shadow-sm ${it.className}`}
+        >
+          {it.node}
+        </span>
+      ))}
+    </div>
+  );
 }
 
 type AgentMeta = {
@@ -786,11 +912,13 @@ export default function DashboardPage() {
                                 )}
                             </span>
                           </div>
-                          <div className="mt-1 text-gray-900 dark:text-zinc-100">
-                            <span className="font-medium">Verdict:</span> {normalizeVerdictFromDb(r.verdict)}
-                          </div>
-                          <div className="text-gray-700 dark:text-zinc-300">
-                            <span className="font-medium">Follow-up:</span> {followUpSummary(r)}
+                          <div
+                            className="mt-2 flex flex-wrap items-center gap-2"
+                            role="group"
+                            aria-label={`Verdict ${normalizeVerdictFromDb(r.verdict)}, follow-up ${followUpSummary(r)}`}
+                          >
+                            <VerdictIconBadge verdict={normalizeVerdictFromDb(r.verdict)} />
+                            <FollowUpIconBadges r={r} />
                           </div>
                           <div className="text-gray-700 dark:text-zinc-300 mt-1">
                             <span className="font-medium">Comment:</span> {r.comment?.trim() ? r.comment : "—"}
