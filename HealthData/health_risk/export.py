@@ -21,7 +21,7 @@ def build_unified_json_row(payload_row: Dict[str, Any], settings: Settings) -> D
     }
     if payload_row.get("high_risk_narrative_llm"):
         row["high_risk_narrative_llm"] = payload_row["high_risk_narrative_llm"]
-    return row
+    return {k: v for k, v in row.items() if not k.startswith("_")}
 
 
 def export_unified_json(

@@ -111,8 +111,12 @@ class HealthRiskPipeline:
         ):
             print("[INFO] No rows above narrative threshold or LLM skipped.")
 
-        sb_payload = payload
-        if not self._settings.store_llm_narrative_in_supabase:
+        if self._settings.store_llm_narrative_in_supabase:
+            sb_payload = [
+                {k: v for k, v in p.items() if not k.startswith("_")}
+                for p in payload
+            ]
+        else:
             sb_payload = [strip_llm_narrative_for_supabase(p) for p in payload]
 
         if dry_run:

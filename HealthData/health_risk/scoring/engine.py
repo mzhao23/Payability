@@ -206,6 +206,8 @@ class RiskScoreEngine:
             "yellow_metric_count": yellow_metric_count,
             "created_at": utc_now_iso(),
             "updated_at": utc_now_iso(),
+            "_metric_values": metric_values,
+            "_subscores": all_scores,
         }
 
     def build_payload(self, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

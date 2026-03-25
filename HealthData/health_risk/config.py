@@ -74,6 +74,6 @@ def load_settings() -> Settings:
         openai_model=os.getenv("HEALTH_RISK_OPENAI_MODEL", "gpt-4o-mini"),
         llm_high_risk_narrative_enabled=llm_on,
         llm_narrative_max_workers=max(1, _env_int("HEALTH_RISK_LLM_MAX_WORKERS", 4)),
-        high_risk_narrative_threshold=float(os.getenv("HEALTH_RISK_NARRATIVE_THRESHOLD", "5")),
+        high_risk_narrative_threshold=float(os.getenv("HEALTH_RISK_NARRATIVE_THRESHOLD", "4")),
         store_llm_narrative_in_supabase=_env_truthy("HEALTH_RISK_STORE_LLM_IN_SUPABASE", False),
     )

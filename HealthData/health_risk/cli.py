@@ -17,7 +17,7 @@ def main() -> None:
     parser.add_argument(
         "--no-llm-narrative",
         action="store_true",
-        help="Skip Claude narrative for high-risk rows (rule scores still run)",
+        help="Skip LLM narrative for high-risk rows (rule scores still run)",
     )
 
     args = parser.parse_args()

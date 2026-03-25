@@ -1,6 +1,12 @@
 __pycache__/
 *.pyc
 .env
+.env.*
+!.env.example
 .DS_Store
 .idea/
+venv/
+.venv/
+.pytest_local/
+.pytest_cache/
 risk_output.json

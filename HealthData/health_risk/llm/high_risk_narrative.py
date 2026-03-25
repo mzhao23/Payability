@@ -7,43 +7,26 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Tuple
 from health_risk.config import Settings
 
 _SYSTEM = """\
-You are a marketplace health analyst. The seller has been flagged by our rule-based \
-scoring engine. The numeric risk score is final — do NOT change or question it.
+You output ONLY a short bullet list. No prose, no paragraphs, no explanations.
 
-Your job: compare every metric below against its Amazon health threshold, identify \
-which ones are UNHEALTHY, and explain why.
+Data values that are numbers are already percentages (1.5 means 1.5%). Append "%" when outputting them.
 
-━━━ METRIC THRESHOLDS (values are in ratio form, e.g. 0.01 = 1%) ━━━
+THRESHOLDS:
+Order Defect Rate(60d) <0.5%=OK|0.5-1%=Low|1-2%=Moderate|2-3%=High|>3%=Critical
+Chargeback Rate(90d) <0.1%=OK|0.1-0.2%=Low|0.2-0.5%=Moderate|>0.5%=Critical
+A-to-Z Claim Rate(90d) <0.1%=OK|0.1-0.3%=Low|0.3-0.8%=Moderate|>0.8%=Critical
+Negative Feedback Rate(90d) <0.5%=OK|0.5-1%=Low|1-3%=Moderate|>3%=Critical
+Late Shipment Rate(30d) <2%=OK|2-4%=Low|4-8%=Moderate|>8%=Critical
+Pre-Fulfillment Cancel Rate(30d) <1%=OK|1-3%=Low|3-5%=Moderate|>5%=Critical
+Avg Response Hours(30d) <12h=OK|12-24h=Low|24-48h=Moderate|>48h=Critical
+No Response >24h Count(30d) 0=OK|1-4=Low|5-19=Moderate|>=20=Critical
+Valid Tracking Rate(30d) >=97%=OK|94-97%=Low|90-94%=Moderate|<90%=Critical
+On-Time Delivery Rate(30d) >=95%=OK|90-95%=Low|85-90%=Moderate|<85%=Critical
+Compliance statuses: "Good"=OK|"Fair"/"Watch"=Moderate|other=Critical
 
-OUTCOME METRICS:
-  Order Defect Rate (60d)     — Healthy: <0.5%  | Low: 0.5–1%  | Moderate: 1–2%  | High: 2–3%  | Critical: >3%
-  Chargeback Rate (90d)       — Healthy: <0.1%  | Low: 0.1–0.2% | Moderate: 0.2–0.5% | Critical: >0.5%
-  A-to-Z Claim Rate (90d)    — Healthy: <0.1%  | Low: 0.1–0.3% | Moderate: 0.3–0.8% | Critical: >0.8%
-  Negative Feedback Rate (90d)— Healthy: <0.5%  | Low: 0.5–1%  | Moderate: 1–3%  | Critical: >3%
-
-OPERATIONAL METRICS:
-  Late Shipment Rate (30d)    — Healthy: <2%   | Low: 2–4%  | Moderate: 4–8%  | Critical: >8%
-  Pre-Fulfillment Cancel (30d)— Healthy: <1%   | Low: 1–3%  | Moderate: 3–5%  | Critical: >5%
-  Avg Response Hours (30d)    — Healthy: <12h  | Low: 12–24h | Moderate: 24–48h | Critical: >48h
-  No Response >24h Count (30d)— Healthy: 0     | Low: 1–4    | Moderate: 5–19  | Critical: ≥20
-  Valid Tracking Rate (30d)   — Healthy: ≥97%  | Low: 94–97% | Moderate: 90–94% | Critical: <90%
-  On-Time Delivery Rate (30d) — Healthy: ≥95%  | Low: 90–95% | Moderate: 85–90% | Critical: <85%
-
-COMPLIANCE STATUS FIELDS (text values):
-  Product Safety / Product Authenticity / Policy Violation / Listing Policy / Intellectual Property
-  — "Good" = Healthy | "Fair"/"Warning"/"Watch" = Moderate | anything else (e.g. "Bad","At Risk") = Critical
-
-━━━ OUTPUT FORMAT ━━━
-
-1. List ONLY the unhealthy metrics (skip any that are Healthy or null/missing).
-   For each one write ONE line:
-     • <Metric Name>: <actual value> — <band: Low/Moderate/High/Critical> — <1-sentence business impact>
-
-2. After the list, write a short overall summary (2–3 sentences) of the seller's \
-   health situation and the combined risk picture.
-
-Do NOT mention metrics that are Healthy. Do NOT invent values for null/missing fields — just skip them.
-Use plain business English, no markdown headings."""
+FORMAT (strict, no deviation):
+For each NOT-OK metric, one line: <Name>: <value> — <band>
+Skip OK and null metrics. No extra text. No summary sentence. Nothing else."""
 
 _RAW_NUMERIC_KEYS = (
     "orderWithDefects_60_rate",
@@ -116,7 +99,7 @@ def _call_openai(settings: Settings, user_message: str) -> str:
     client = OpenAI(api_key=settings.openai_api_key)
     resp = client.chat.completions.create(
         model=settings.openai_model,
-        max_tokens=1200,
+        max_tokens=2000,
         messages=[
             {"role": "system", "content": _SYSTEM},
             {"role": "user", "content": user_message},
@@ -195,6 +178,9 @@ def enrich_high_risk_narratives(
     return n_ok
 
 
+_INTERNAL_KEYS = ("high_risk_narrative_llm", "high_risk_narrative_error", "_metric_values", "_subscores")
+
+
 def strip_llm_narrative_for_supabase(row: Mapping[str, Any]) -> Dict[str, Any]:
-    """Drop LLM-only keys for health_daily_risk upsert when the table has no such columns."""
-    return {k: v for k, v in row.items() if k not in ("high_risk_narrative_llm", "high_risk_narrative_error")}
+    """Drop internal/LLM keys for health_daily_risk upsert when the table has no such columns."""
+    return {k: v for k, v in row.items() if k not in _INTERNAL_KEYS}
