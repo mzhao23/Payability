@@ -1,5 +1,3 @@
-// lib/bigquery.ts
-
 import { BigQuery } from "@google-cloud/bigquery";
 
 function getBigQueryClient() {
@@ -15,38 +13,26 @@ function getBigQueryClient() {
 
 const bigquery = getBigQueryClient();
 
-/**
- * 增量入口：
- * 找出最近 N 天有新记录的 supplier。
- * 真正上生产时，最好改成基于 state table 的 last_run_time / max(latest_record_date)。
- */
-export async function getChangedSupplierKeys(daysBack = 2): Promise<string[]> {
-  const query = `
-    SELECT DISTINCT supplier_key
-    FROM \`bigqueryexport-183608.PayabilitySheets.vm_transaction_summary\`
-    WHERE xact_post_date >= DATE_SUB(CURRENT_DATE(), INTERVAL @days_back DAY)
-      AND xact_post_date <= CURRENT_DATE()
-      AND supplier_key IS NOT NULL
-  `;
-
-  const [rows] = await bigquery.query({
-    query,
-    params: { days_back: daysBack },
-  });
-
-  return (rows as Array<{ supplier_key: string }>).map((r) => r.supplier_key);
-}
-
 type GetSupplierRiskInputOptions = {
   supplierKeys?: string[];
   limit?: number;
 };
 
+/**
+ * Risk-engine input:
+ * - Universe = suppliers currently marked Active in v_supplier_summary
+ * - No incremental pre-filter on "recent transaction activity"
+ * - Latest snapshot + trailing history features are all computed here
+ * - Payment delay is activation-aware:
+ *   - if there has been no marketplace payment since the latest activation date,
+ *     use days_since_last_activation
+ *   - otherwise use days_since_last_marketplace_payment
+ */
 export async function getSupplierRiskInputData(
   options: GetSupplierRiskInputOptions = {}
 ) {
   const supplierKeys = options.supplierKeys ?? [];
-  const limit = options.limit ?? 2000;
+  const limit = options.limit ?? 5000;
   const useSupplierFilter = supplierKeys.length > 0;
 
   const query = `
@@ -55,26 +41,47 @@ export async function getSupplierRiskInputData(
       FROM UNNEST(@supplier_keys) AS supplier_key
     ),
 
-    base AS (
-      SELECT
-        supplier_key,
-        supplier_name,
-        xact_post_date,
-
-        IFNULL(receivable, 0) AS receivable,
-        IFNULL(potential_liability, 0) AS liability,
-        IFNULL(net_earning, 0) AS net_earning,
-        IFNULL(chargeback, 0) AS chargeback,
-        IFNULL(available_balance, 0) AS available_balance,
-        IFNULL(outstanding_bal, 0) AS outstanding_bal,
-        IFNULL(marketplace_payment, 0) AS marketplace_payment,
-        IFNULL(due_from_supplier, 0) AS due_from_supplier
-      FROM \`bigqueryexport-183608.PayabilitySheets.vm_transaction_summary\`
-      WHERE xact_post_date <= CURRENT_DATE()
+    active_suppliers AS (
+      SELECT DISTINCT supplier_key
+      FROM \`bigqueryexport-183608.PayabilitySheets.v_supplier_summary\`
+      WHERE payability_status = 'Active'
+        AND supplier_key IS NOT NULL
         AND (
           @use_supplier_filter = FALSE
           OR supplier_key IN (SELECT supplier_key FROM target_suppliers)
         )
+    ),
+
+    activation_dates AS (
+      SELECT
+        ss.supplier_key,
+        MAX(COALESCE(r.reactivation_date, ss.first_purchase_date)) AS last_activation_date
+      FROM \`bigqueryexport-183608.PayabilitySheets.v_supplier_summary\` ss
+      LEFT JOIN \`bigqueryexport-183608.daniel_sandbox.reactivations\` r
+        USING (supplier_key)
+      INNER JOIN active_suppliers a
+        ON ss.supplier_key = a.supplier_key
+      GROUP BY ss.supplier_key
+    ),
+
+    base AS (
+      SELECT
+        t.supplier_key,
+        t.supplier_name,
+        t.xact_post_date,
+
+        IFNULL(t.receivable, 0) AS receivable,
+        IFNULL(t.potential_liability, 0) AS liability,
+        IFNULL(t.net_earning, 0) AS net_earning,
+        IFNULL(t.chargeback, 0) AS chargeback,
+        IFNULL(t.available_balance, 0) AS available_balance,
+        IFNULL(t.outstanding_bal, 0) AS outstanding_bal,
+        IFNULL(t.marketplace_payment, 0) AS marketplace_payment,
+        IFNULL(t.due_from_supplier, 0) AS due_from_supplier
+      FROM \`bigqueryexport-183608.PayabilitySheets.vm_transaction_summary\` t
+      INNER JOIN active_suppliers a
+        ON t.supplier_key = a.supplier_key
+      WHERE t.xact_post_date <= CURRENT_DATE()
     ),
 
     supplier_history AS (
@@ -90,16 +97,6 @@ export async function getSupplierRiskInputData(
           ORDER BY xact_post_date
         ) AS prev_receivable,
 
-        LAG(liability) OVER (
-          PARTITION BY supplier_key
-          ORDER BY xact_post_date
-        ) AS prev_liability,
-
-        LAG(marketplace_payment) OVER (
-          PARTITION BY supplier_key
-          ORDER BY xact_post_date
-        ) AS prev_marketplace_payment,
-
         LAG(due_from_supplier) OVER (
           PARTITION BY supplier_key
           ORDER BY xact_post_date
@@ -111,15 +108,13 @@ export async function getSupplierRiskInputData(
       SELECT *
       FROM supplier_history
       WHERE rn_desc = 1
+        AND liability >= 100
     ),
 
     trailing_6 AS (
       SELECT
         supplier_key,
-        xact_post_date,
         receivable,
-        liability,
-        marketplace_payment,
         chargeback,
         ROW_NUMBER() OVER (
           PARTITION BY supplier_key
@@ -132,8 +127,6 @@ export async function getSupplierRiskInputData(
       SELECT
         supplier_key,
         APPROX_QUANTILES(receivable, 100)[OFFSET(50)] AS trailing_median_receivable,
-        APPROX_QUANTILES(liability, 100)[OFFSET(50)] AS trailing_median_liability,
-        APPROX_QUANTILES(marketplace_payment, 100)[OFFSET(50)] AS trailing_median_marketplace_payment,
         APPROX_QUANTILES(chargeback, 100)[OFFSET(50)] AS trailing_median_chargeback
       FROM trailing_6
       WHERE hist_rn BETWEEN 2 AND 7
@@ -143,7 +136,6 @@ export async function getSupplierRiskInputData(
     negative_streak_source AS (
       SELECT
         supplier_key,
-        xact_post_date,
         net_earning,
         ROW_NUMBER() OVER (
           PARTITION BY supplier_key
@@ -152,10 +144,11 @@ export async function getSupplierRiskInputData(
       FROM base
     ),
 
-    negative_net_streak AS (
+    negative_net_stats AS (
       SELECT
         supplier_key,
-        COUNTIF(net_earning < 0) AS negative_net_earning_streak
+        COUNTIF(net_earning < 0) AS negative_net_earning_streak,
+        SUM(net_earning) AS recent_3_net_earning_sum
       FROM negative_streak_source
       WHERE rn <= 3
       GROUP BY supplier_key
@@ -201,6 +194,78 @@ export async function getSupplierRiskInputData(
         xact_post_date AS last_marketplace_payment_date
       FROM payment_events
       WHERE payment_rn_desc = 1
+    ),
+
+    payment_since_activation AS (
+      SELECT
+        ad.supplier_key,
+        COUNTIF(
+          b.marketplace_payment > 0
+          AND ad.last_activation_date IS NOT NULL
+          AND b.xact_post_date >= ad.last_activation_date
+        ) AS payment_count_since_activation,
+        MAX(
+          CASE
+            WHEN b.marketplace_payment > 0
+              AND ad.last_activation_date IS NOT NULL
+              AND b.xact_post_date >= ad.last_activation_date
+            THEN b.xact_post_date
+            ELSE NULL
+          END
+        ) AS last_payment_since_activation_date
+      FROM activation_dates ad
+      LEFT JOIN base b
+        ON ad.supplier_key = b.supplier_key
+      GROUP BY ad.supplier_key
+    ),
+
+    transaction_activity AS (
+      SELECT
+        supplier_key,
+        COUNTIF(
+          xact_post_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 21 DAY)
+        ) AS transaction_records_last_21d,
+        MAX(xact_post_date) AS last_transaction_date
+      FROM base
+      GROUP BY supplier_key
+    ),
+
+    receivable_recent AS (
+      SELECT
+        supplier_key,
+        rn_desc,
+        receivable
+      FROM supplier_history
+      WHERE rn_desc <= 3
+    ),
+
+    receivable_trend_raw AS (
+      SELECT
+        supplier_key,
+        MAX(CASE WHEN rn_desc = 1 THEN receivable END) AS receivable_r1,
+        MAX(CASE WHEN rn_desc = 2 THEN receivable END) AS receivable_r2,
+        MAX(CASE WHEN rn_desc = 3 THEN receivable END) AS receivable_r3
+      FROM receivable_recent
+      GROUP BY supplier_key
+    ),
+
+    receivable_trend AS (
+      SELECT
+        supplier_key,
+        CASE
+          WHEN receivable_r1 IS NOT NULL
+            AND receivable_r2 IS NOT NULL
+            AND receivable_r3 IS NOT NULL
+            AND receivable_r1 < receivable_r2
+            AND receivable_r2 < receivable_r3
+          THEN 3
+          WHEN receivable_r1 IS NOT NULL
+            AND receivable_r2 IS NOT NULL
+            AND receivable_r1 < receivable_r2
+          THEN 2
+          ELSE 0
+        END AS receivable_down_streak_3
+      FROM receivable_trend_raw
     )
 
     SELECT
@@ -211,15 +276,11 @@ export async function getSupplierRiskInputData(
       l.prev_receivable,
 
       l.liability AS today_liability,
-      l.prev_liability,
 
       l.net_earning AS today_net_earning,
       l.chargeback AS today_chargeback,
       l.available_balance AS today_available_balance,
       l.outstanding_bal AS today_outstanding_bal,
-
-      l.marketplace_payment AS today_marketplace_payment,
-      l.prev_marketplace_payment,
 
       l.due_from_supplier AS today_due_from_supplier,
       l.prev_due_from_supplier,
@@ -232,46 +293,47 @@ export async function getSupplierRiskInputData(
         )
       END AS receivable_change_pct,
 
-      CASE
-        WHEN l.prev_liability IS NULL OR l.prev_liability = 0 THEN NULL
-        ELSE ROUND(
-          SAFE_DIVIDE(l.liability - l.prev_liability, ABS(l.prev_liability)) * 100,
-          2
-        )
-      END AS liability_change_pct,
-
-      CASE
-        WHEN l.prev_marketplace_payment IS NULL OR l.prev_marketplace_payment = 0 THEN NULL
-        ELSE ROUND(
-          SAFE_DIVIDE(
-            l.marketplace_payment - l.prev_marketplace_payment,
-            ABS(l.prev_marketplace_payment)
-          ) * 100,
-          2
-        )
-      END AS marketplace_payment_change_pct,
-
       IF(l.prev_receivable IS NULL, FALSE, TRUE) AS has_prev_week_data,
 
       tm.trailing_median_receivable,
-      tm.trailing_median_liability,
-      tm.trailing_median_marketplace_payment,
       tm.trailing_median_chargeback,
 
-      ns.negative_net_earning_streak,
+      nns.negative_net_earning_streak,
+      nns.recent_3_net_earning_sum,
 
+      ad.last_activation_date,
+      DATE_DIFF(CURRENT_DATE(), ad.last_activation_date, DAY) AS days_since_last_activation,
+
+      IFNULL(psa.payment_count_since_activation, 0) > 0 AS has_payment_since_activation,
+      psa.last_payment_since_activation_date,
+
+      lp.last_marketplace_payment_date,
       DATE_DIFF(CURRENT_DATE(), lp.last_marketplace_payment_date, DAY) AS days_since_last_marketplace_payment,
-      pgs.historical_median_payment_gap_days
+      pgs.historical_median_payment_gap_days,
+
+      ta.transaction_records_last_21d,
+      ta.last_transaction_date,
+      DATE_DIFF(CURRENT_DATE(), ta.last_transaction_date, DAY) AS days_since_latest_transaction,
+
+      rt.receivable_down_streak_3
 
     FROM latest_row l
     LEFT JOIN trailing_medians tm
       ON l.supplier_key = tm.supplier_key
-    LEFT JOIN negative_net_streak ns
-      ON l.supplier_key = ns.supplier_key
+    LEFT JOIN negative_net_stats nns
+      ON l.supplier_key = nns.supplier_key
+    LEFT JOIN activation_dates ad
+      ON l.supplier_key = ad.supplier_key
+    LEFT JOIN payment_since_activation psa
+      ON l.supplier_key = psa.supplier_key
     LEFT JOIN last_payment lp
       ON l.supplier_key = lp.supplier_key
     LEFT JOIN payment_gap_stats pgs
       ON l.supplier_key = pgs.supplier_key
+    LEFT JOIN transaction_activity ta
+      ON l.supplier_key = ta.supplier_key
+    LEFT JOIN receivable_trend rt
+      ON l.supplier_key = rt.supplier_key
 
     ORDER BY l.outstanding_bal DESC
     LIMIT @limit
@@ -284,14 +346,17 @@ export async function getSupplierRiskInputData(
       use_supplier_filter: useSupplierFilter,
       limit,
     },
+    types: {
+      supplier_keys: ["STRING"],
+    },
   });
 
   return rows;
 }
 
 /**
- * 兼容旧调用。
- * 若不传 supplierKeys，则拉全量最新状态。
+ * Compatibility shim for legacy callers.
+ * If no supplierKeys provided, fetches all active suppliers' latest state.
  */
 export async function getDailyChangeData() {
   return getSupplierRiskInputData();

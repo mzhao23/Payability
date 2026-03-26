@@ -1,9 +1,7 @@
-// lib/risk-policy.ts
-
-export const RISK_POLICY_VERSION = "v3.1.0";
+export const RISK_POLICY_VERSION = "v4.2.0";
 
 export const RISK_THRESHOLDS = {
-  receivableAnomaly: {
+  receivableSurge: {
     wowLow: 50,
     wowHigh: 100,
     wowCritical: 200,
@@ -11,16 +9,36 @@ export const RISK_THRESHOLDS = {
     histLow: 2.0,
     histHigh: 4.0,
     histCritical: 8.0,
+
+    minTodayReceivableMedium: 3_000,
+    minTodayReceivableHighCrit: 5_000,
+    minDeltaReceivable: 2_000,
   },
 
-  liabilityAnomaly: {
-    wowLow: 50,
-    wowHigh: 100,
-    wowCritical: 200,
+  receivableDrop: {
+    wowMediumDropPct: 50,
+    wowHighDropPct: 70,
 
-    histLow: 1.5,
-    histHigh: 2.8,
-    histCritical: 4.2,
+    histMediumMaxRatio: 0.60,
+    histHighMaxRatio: 0.40,
+
+    minPrevReceivable: 5_000,
+    minTrailingMedianReceivable: 3_000,
+
+    sustainedDownStreakMedium: 2,
+    sustainedDownStreakHigh: 3,
+  },
+
+  marketplacePaymentDelayDays: {
+    medium: 21,
+    high: 28,
+    critical: 35,
+  },
+
+  paymentDelayEligibility: {
+    recentTransactionWindowDays: 21,
+    minRecentTransactionCount: 2,
+    maxDaysSinceLatestTransaction: 14,
   },
 
   chargebackAnomaly: {
@@ -31,21 +49,19 @@ export const RISK_THRESHOLDS = {
     histLow: 2.0,
     histHigh: 4.5,
     histCritical: 10.0,
-  },
 
-  marketplacePaymentDelayDays: {
-    low: 14,
-    high: 21,
-    critical: 28,
+    minChargebackAmountMedium: 200,
+    minChargebackAmountHigh: 500,
+    minChargebackDeltaVsMedian: 200,
   },
 
   negativeNetEarning: {
-    low: -5_000,
-    high: -50_000,
+    medium: -500,
+    high: -10_000,
+    critical3PeriodSum: -1_000,
   },
 
   negativeAvailableBalance: {
-    low: 0,
     medium: -500,
     high: -2_000,
     critical: -7_000,
@@ -56,17 +72,17 @@ export const RISK_THRESHOLDS = {
     high: 0.25,
   },
 
-  materiality: {
-    minBaseReceivable: 25_000,
-    minBaseLiability: 25_000,
-    minAbsDeltaReceivable: 10_000,
-    minAbsDeltaLiability: 10_000,
+  dueFromSupplierTurnedPositive: {
+    criticalMinAmount: 100,
+    criticalMinRatio: 0.05,
   },
+
+  minFlaggedRiskScore: 3,
 } as const;
 
 export const RISK_WEIGHTS = {
-  receivableAnomaly: 8,
-  liabilityAnomaly: 10,
+  receivableSurge: 8,
+  receivableDrop: 10,
   marketplacePaymentDelay: 12,
   chargebackAnomaly: 18,
   negativeNetEarning: 15,
