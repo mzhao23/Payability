@@ -18,6 +18,7 @@ from core.bigquery_client import BigQueryClient
 from core.supabase_client import SupabaseClient
 from core import llm_scorer
 from metrics import metric_1_untracked, metric_2_price, metric_3_pickup_lag
+from config.settings import PARAMS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,7 +45,7 @@ def run_pipeline():
     # ── Write carrier daily untracked rates ──────────────────
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
-    target_date = datetime.now(ZoneInfo("America/New_York")).date() - timedelta(days=3)
+    target_date = datetime.now(ZoneInfo("America/New_York")).date() - timedelta(days=PARAMS["ship_sla_days"])
     carrier_rows = [
         {
             "run_date": date.today().isoformat(),
