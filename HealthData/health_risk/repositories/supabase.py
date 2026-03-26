@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 from supabase import Client
 
@@ -49,6 +49,33 @@ class SupabaseRepository:
             }
 
         return mapping
+
+    def fetch_reviewed_supplier_keys(self) -> Set[str]:
+        """Return the set of supplier_keys that have already been reviewed."""
+        offset = 0
+        page_size = 1000
+        keys: Set[str] = set()
+
+        while True:
+            resp = (
+                self._sb.table(self._settings.reviewed_suppliers_table)
+                .select("supplier_key")
+                .range(offset, offset + page_size - 1)
+                .execute()
+            )
+
+            batch = getattr(resp, "data", None) or []
+            for r in batch:
+                k = normalize_key(r.get("supplier_key"))
+                if k is not None:
+                    keys.add(k)
+
+            if len(batch) < page_size:
+                break
+
+            offset += page_size
+
+        return keys
 
     def upsert_health_daily_risk(
         self,

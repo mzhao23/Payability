@@ -6,14 +6,14 @@ def score_odr(odr: Optional[float]) -> float:
         return 0.0
     if odr == 0:
         return 0.0
-    if odr < 0.005:
-        return 1.0
-    if odr < 0.01:
+    if odr < 0.0015:
         return 3.0
-    if odr < 0.02:
+    if odr < 0.004:
         return 6.0
-    if odr < 0.03:
+    if odr < 0.008:
         return 8.0
+    if odr < 0.015:
+        return 10.0
     return 10.0
 
 
@@ -22,13 +22,13 @@ def score_chargeback(rate: Optional[float]) -> float:
         return 0.0
     if rate == 0:
         return 0.0
-    if rate < 0.001:
-        return 1.0
-    if rate < 0.002:
+    if rate < 0.0002:
         return 3.0
-    if rate < 0.005:
+    if rate < 0.0007:
         return 6.0
-    return 9.0
+    if rate < 0.0015:
+        return 8.0
+    return 10.0
 
 
 def score_a_to_z(rate: Optional[float]) -> float:
@@ -36,13 +36,13 @@ def score_a_to_z(rate: Optional[float]) -> float:
         return 0.0
     if rate == 0:
         return 0.0
-    if rate < 0.001:
-        return 1.0
-    if rate < 0.003:
+    if rate < 0.0002:
         return 3.0
-    if rate < 0.008:
+    if rate < 0.001:
         return 6.0
-    return 9.0
+    if rate < 0.003:
+        return 8.0
+    return 10.0
 
 
 def score_negative_feedback(rate: Optional[float]) -> float:
@@ -50,49 +50,49 @@ def score_negative_feedback(rate: Optional[float]) -> float:
         return 0.0
     if rate == 0:
         return 0.0
-    if rate < 0.005:
-        return 1.0
-    if rate < 0.01:
+    if rate < 0.0015:
         return 3.0
-    if rate < 0.03:
+    if rate < 0.004:
         return 6.0
-    return 8.0
+    if rate < 0.012:
+        return 8.0
+    return 10.0
 
 
 def score_late_shipment(rate: Optional[float]) -> float:
     if rate is None:
         return 0.0
-    if rate < 0.02:
+    if rate < 0.008:
         return 0.0
-    if rate < 0.04:
-        return 3.0
-    if rate < 0.08:
+    if rate < 0.02:
         return 6.0
-    return 9.0
+    if rate < 0.04:
+        return 8.0
+    return 10.0
 
 
 def score_cancellation(rate: Optional[float]) -> float:
     if rate is None:
         return 0.0
-    if rate < 0.01:
+    if rate < 0.004:
         return 0.0
-    if rate < 0.03:
-        return 3.0
-    if rate < 0.05:
+    if rate < 0.015:
         return 6.0
-    return 9.0
+    if rate < 0.03:
+        return 8.0
+    return 10.0
 
 
 def score_response_hours(hours: Optional[float]) -> float:
     if hours is None:
         return 0.0
-    if hours < 12:
+    if hours < 5:
         return 0.0
-    if hours < 24:
-        return 3.0
-    if hours < 48:
+    if hours < 12:
         return 6.0
-    return 9.0
+    if hours < 24:
+        return 8.0
+    return 10.0
 
 
 def score_no_response(count: Optional[float]) -> float:
@@ -100,35 +100,35 @@ def score_no_response(count: Optional[float]) -> float:
         return 0.0
     if count == 0:
         return 0.0
-    if count < 5:
-        return 3.0
-    if count < 20:
+    if count < 2:
         return 6.0
-    return 9.0
+    if count < 6:
+        return 8.0
+    return 10.0
 
 
 def score_valid_tracking(rate: Optional[float]) -> float:
     if rate is None:
         return 0.0
-    if rate >= 0.97:
+    if rate >= 0.98:
         return 0.0
-    if rate >= 0.94:
-        return 3.0
-    if rate >= 0.90:
+    if rate >= 0.97:
         return 6.0
-    return 9.0
+    if rate >= 0.94:
+        return 8.0
+    return 10.0
 
 
 def score_on_time_delivery(rate: Optional[float]) -> float:
     if rate is None:
         return 0.0
-    if rate >= 0.95:
+    if rate >= 0.97:
         return 0.0
-    if rate >= 0.90:
-        return 3.0
-    if rate >= 0.85:
+    if rate >= 0.95:
         return 6.0
-    return 9.0
+    if rate >= 0.91:
+        return 8.0
+    return 10.0
 
 
 def score_status(value: Any) -> float:
@@ -138,31 +138,31 @@ def score_status(value: Any) -> float:
     if v in {"good", "ok", "healthy"}:
         return 0.0
     if v in {"fair", "warning", "watch"}:
-        return 5.0
+        return 7.0
     return 10.0
 
 
 def activity_gate(order_count_60: Optional[float]) -> float:
     if order_count_60 is None:
-        return 0.2
+        return 0.40
     if order_count_60 == 0:
-        return 0.2
+        return 0.40
     if order_count_60 < 25:
-        return 0.4
+        return 0.60
     if order_count_60 < 100:
-        return 0.6
+        return 0.80
     if order_count_60 < 500:
-        return 0.8
+        return 0.95
     return 1.0
 
 
 def inactivity_penalty(order_count_60: Optional[float]) -> float:
     if order_count_60 is None:
-        return 4.0
+        return 5.0
     if order_count_60 == 0:
-        return 4.0
+        return 5.0
     if order_count_60 < 25:
-        return 2.0
+        return 3.0
     return 0.0
 
 

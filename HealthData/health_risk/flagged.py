@@ -28,14 +28,21 @@ def is_high_risk(row: Dict[str, Any]) -> bool:
     score = row.get("risk_score")
     if score is None:
         return False
-    return score > 4
+    return score > 6
 
 
 def _format_reasons(row: Dict[str, Any]) -> List[str]:
     narrative = row.get("high_risk_narrative_llm")
     if narrative and isinstance(narrative, str):
-        lines = [line.strip() for line in narrative.replace("\n", " ").split("•") if line.strip()]
-        return lines if lines else [narrative]
+        parts: List[str] = []
+        for line in narrative.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("•"):
+                line = line[1:].strip()
+            parts.append(line)
+        return parts if parts else [narrative]
     drivers = row.get("top_risk_drivers")
     if isinstance(drivers, list):
         return drivers

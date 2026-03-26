@@ -13,7 +13,7 @@ class RiskScoreEngine:
     Swap or subclass to experiment with new formulas without touching I/O.
     """
 
-    PIPELINE_VERSION = "risk_formula_v2_production"
+    PIPELINE_VERSION = "risk_formula_v3_production"
 
     def score_supplier_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
         metric_values: Dict[str, Any] = {
@@ -79,20 +79,20 @@ class RiskScoreEngine:
         }
 
         outcome_score = round(
-            0.70 * outcome_subscores["ORDER_DEFECT_RATE_60"]
-            + 0.15 * outcome_subscores["CHARGEBACK_RATE_90"]
-            + 0.10 * outcome_subscores["A_TO_Z_CLAIM_RATE_90"]
-            + 0.05 * outcome_subscores["NEGATIVE_FEEDBACK_RATE_90"],
+            0.55 * outcome_subscores["ORDER_DEFECT_RATE_60"]
+            + 0.18 * outcome_subscores["CHARGEBACK_RATE_90"]
+            + 0.15 * outcome_subscores["A_TO_Z_CLAIM_RATE_90"]
+            + 0.12 * outcome_subscores["NEGATIVE_FEEDBACK_RATE_90"],
             2,
         )
 
         operational_score = round(
             0.25 * operational_subscores["LATE_SHIPMENT_RATE_30"]
-            + 0.15 * operational_subscores["PRE_FULFILL_CANCEL_RATE_30"]
-            + 0.15 * operational_subscores["AVG_RESPONSE_HOURS_30"]
-            + 0.15 * operational_subscores["NO_RESPONSE_OVER_24H_30"]
-            + 0.15 * operational_subscores["VALID_TRACKING_RATE_30"]
-            + 0.15 * operational_subscores["ON_TIME_DELIVERY_RATE_30"],
+            + 0.20 * operational_subscores["PRE_FULFILL_CANCEL_RATE_30"]
+            + 0.08 * operational_subscores["AVG_RESPONSE_HOURS_30"]
+            + 0.07 * operational_subscores["NO_RESPONSE_OVER_24H_30"]
+            + 0.20 * operational_subscores["VALID_TRACKING_RATE_30"]
+            + 0.20 * operational_subscores["ON_TIME_DELIVERY_RATE_30"],
             2,
         )
 
@@ -105,10 +105,9 @@ class RiskScoreEngine:
         inact_penalty = S.inactivity_penalty(orders_count_60)
 
         base_risk = round(
-            0.45 * outcome_score
-            + 0.30 * operational_score
-            + 0.20 * compliance_score
-            + 0.05 * inact_penalty,
+            0.55 * outcome_score
+            + 0.35 * operational_score
+            + 0.10 * compliance_score,
             2,
         )
 
@@ -120,28 +119,28 @@ class RiskScoreEngine:
         risk_level = S.risk_level_from_score(risk_score)
 
         driver_contributions: Dict[str, float] = {
-            "ORDER_DEFECT_RATE_60": 0.45 * 0.70 * outcome_subscores["ORDER_DEFECT_RATE_60"],
-            "CHARGEBACK_RATE_90": 0.45 * 0.15 * outcome_subscores["CHARGEBACK_RATE_90"],
-            "A_TO_Z_CLAIM_RATE_90": 0.45 * 0.10 * outcome_subscores["A_TO_Z_CLAIM_RATE_90"],
-            "NEGATIVE_FEEDBACK_RATE_90": 0.45 * 0.05 * outcome_subscores["NEGATIVE_FEEDBACK_RATE_90"],
-            "LATE_SHIPMENT_RATE_30": 0.30 * 0.25 * operational_subscores["LATE_SHIPMENT_RATE_30"],
-            "PRE_FULFILL_CANCEL_RATE_30": 0.30
-            * 0.15
+            "ORDER_DEFECT_RATE_60": 0.55 * 0.55 * outcome_subscores["ORDER_DEFECT_RATE_60"],
+            "CHARGEBACK_RATE_90": 0.55 * 0.18 * outcome_subscores["CHARGEBACK_RATE_90"],
+            "A_TO_Z_CLAIM_RATE_90": 0.55 * 0.15 * outcome_subscores["A_TO_Z_CLAIM_RATE_90"],
+            "NEGATIVE_FEEDBACK_RATE_90": 0.55 * 0.12 * outcome_subscores["NEGATIVE_FEEDBACK_RATE_90"],
+            "LATE_SHIPMENT_RATE_30": 0.35 * 0.25 * operational_subscores["LATE_SHIPMENT_RATE_30"],
+            "PRE_FULFILL_CANCEL_RATE_30": 0.35
+            * 0.20
             * operational_subscores["PRE_FULFILL_CANCEL_RATE_30"],
-            "AVG_RESPONSE_HOURS_30": 0.30 * 0.15 * operational_subscores["AVG_RESPONSE_HOURS_30"],
-            "NO_RESPONSE_OVER_24H_30": 0.30
-            * 0.15
+            "AVG_RESPONSE_HOURS_30": 0.35 * 0.08 * operational_subscores["AVG_RESPONSE_HOURS_30"],
+            "NO_RESPONSE_OVER_24H_30": 0.35
+            * 0.07
             * operational_subscores["NO_RESPONSE_OVER_24H_30"],
-            "VALID_TRACKING_RATE_30": 0.30 * 0.15 * operational_subscores["VALID_TRACKING_RATE_30"],
-            "ON_TIME_DELIVERY_RATE_30": 0.30
-            * 0.15
+            "VALID_TRACKING_RATE_30": 0.35 * 0.20 * operational_subscores["VALID_TRACKING_RATE_30"],
+            "ON_TIME_DELIVERY_RATE_30": 0.35
+            * 0.20
             * operational_subscores["ON_TIME_DELIVERY_RATE_30"],
-            "PRODUCT_SAFETY_STATUS": 0.20 * compliance_subscores["PRODUCT_SAFETY_STATUS"],
-            "PRODUCT_AUTHENTICITY_STATUS": 0.20
+            "PRODUCT_SAFETY_STATUS": 0.10 * compliance_subscores["PRODUCT_SAFETY_STATUS"],
+            "PRODUCT_AUTHENTICITY_STATUS": 0.10
             * compliance_subscores["PRODUCT_AUTHENTICITY_STATUS"],
-            "POLICY_VIOLATION_STATUS": 0.20 * compliance_subscores["POLICY_VIOLATION_STATUS"],
-            "LISTING_POLICY_STATUS": 0.20 * compliance_subscores["LISTING_POLICY_STATUS"],
-            "INTELLECTUAL_PROPERTY_STATUS": 0.20
+            "POLICY_VIOLATION_STATUS": 0.10 * compliance_subscores["POLICY_VIOLATION_STATUS"],
+            "LISTING_POLICY_STATUS": 0.10 * compliance_subscores["LISTING_POLICY_STATUS"],
+            "INTELLECTUAL_PROPERTY_STATUS": 0.10
             * compliance_subscores["INTELLECTUAL_PROPERTY_STATUS"],
         }
 

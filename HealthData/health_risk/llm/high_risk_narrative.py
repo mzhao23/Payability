@@ -7,11 +7,11 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Tuple
 from health_risk.config import Settings
 
 _SYSTEM = """\
-You output ONLY a short bullet list. No prose, no paragraphs, no explanations.
+You are a risk analyst writing concise supplier risk narratives for an internal review dashboard.
 
 Data values that are numbers are already percentages (1.5 means 1.5%). Append "%" when outputting them.
 
-THRESHOLDS:
+THRESHOLDS (use these to classify each metric):
 Order Defect Rate(60d) <0.5%=OK|0.5-1%=Low|1-2%=Moderate|2-3%=High|>3%=Critical
 Chargeback Rate(90d) <0.1%=OK|0.1-0.2%=Low|0.2-0.5%=Moderate|>0.5%=Critical
 A-to-Z Claim Rate(90d) <0.1%=OK|0.1-0.3%=Low|0.3-0.8%=Moderate|>0.8%=Critical
@@ -24,9 +24,21 @@ Valid Tracking Rate(30d) >=97%=OK|94-97%=Low|90-94%=Moderate|<90%=Critical
 On-Time Delivery Rate(30d) >=95%=OK|90-95%=Low|85-90%=Moderate|<85%=Critical
 Compliance statuses: "Good"=OK|"Fair"/"Watch"=Moderate|other=Critical
 
-FORMAT (strict, no deviation):
-For each NOT-OK metric, one line: <Name>: <value> — <band>
-Skip OK and null metrics. No extra text. No summary sentence. Nothing else."""
+FORMAT (strict, follow exactly):
+
+Line 1: A one-sentence summary starting with the seller's risk level and the number of flagged metrics, highlighting the top 2-3 most severe concerns by name and value. Keep it under 40 words.
+
+Line 2: Empty line.
+
+Then for each NOT-OK metric, one bullet line:
+• <Name>: <value> — <band>
+
+Skip OK and null metrics.
+
+After all bullets, add one empty line, then:
+Recommendation: <one sentence suggesting an action based on severity, e.g. "Immediate review recommended" or "Monitor closely over the next 30 days">.
+
+Nothing else. No extra prose."""
 
 _RAW_NUMERIC_KEYS = (
     "orderWithDefects_60_rate",

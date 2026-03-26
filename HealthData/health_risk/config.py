@@ -34,6 +34,7 @@ class Settings:
     supabase_output_table: str
     supabase_mapping_table: str
     consolidated_table: str
+    reviewed_suppliers_table: str
     # High-risk narrative (OpenAI): rule-based score unchanged; LLM adds text only.
     openai_api_key: str | None
     openai_model: str
@@ -70,10 +71,11 @@ def load_settings() -> Settings:
         supabase_output_table="health_daily_risk",
         supabase_mapping_table="suppliers",
         consolidated_table="consolidated_flagged_supplier_list",
+        reviewed_suppliers_table="reviewed_suppliers",
         openai_api_key=api_key,
         openai_model=os.getenv("HEALTH_RISK_OPENAI_MODEL", "gpt-4o-mini"),
         llm_high_risk_narrative_enabled=llm_on,
         llm_narrative_max_workers=max(1, _env_int("HEALTH_RISK_LLM_MAX_WORKERS", 4)),
-        high_risk_narrative_threshold=float(os.getenv("HEALTH_RISK_NARRATIVE_THRESHOLD", "4")),
+        high_risk_narrative_threshold=float(os.getenv("HEALTH_RISK_NARRATIVE_THRESHOLD", "6")),
         store_llm_narrative_in_supabase=_env_truthy("HEALTH_RISK_STORE_LLM_IN_SUPABASE", False),
     )

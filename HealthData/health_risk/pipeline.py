@@ -9,6 +9,7 @@ from health_risk.enrichment import SupplierContextEnricher
 from health_risk.filters import filter_active_population
 from health_risk.export import export_unified_json
 from health_risk.flagged import build_consolidated_flagged_rows
+from health_risk.utils import normalize_key
 from health_risk.llm.high_risk_narrative import enrich_high_risk_narratives, strip_llm_narrative_for_supabase
 from health_risk.repositories.bigquery import BigQueryRepository
 from health_risk.repositories.supabase import SupabaseRepository
@@ -123,7 +124,18 @@ class HealthRiskPipeline:
             print("[DRY-RUN] Skip Supabase write.")
         else:
             self._sb.upsert_health_daily_risk(sb_payload, chunk_size=chunk_size)
+
             flagged = build_consolidated_flagged_rows(payload)
+            reviewed_keys = self._sb.fetch_reviewed_supplier_keys()
+            before_count = len(flagged)
+            flagged = [
+                r for r in flagged
+                if normalize_key(r.get("supplier_key")) not in reviewed_keys
+            ]
+            skipped = before_count - len(flagged)
+            if skipped:
+                print(f"[INFO] Skipped {skipped} already-reviewed suppliers from consolidated list.")
+
             self._sb.upsert_consolidated_flagged(flagged, chunk_size=chunk_size)
 
         if export_json:
