@@ -19,7 +19,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 # ── Metric Parameters (adjustable) ─────────────────────────
 PARAMS = {
     # Metric 1
-    "ship_sla_days": 3,       # Buffer days before flagging as untracked
+    "ship_sla_days": 5,       # Buffer days before flagging as untracked
     "window_days": 7,          # Rolling window for untracked rate
 
     # Metric 2

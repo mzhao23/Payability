@@ -113,28 +113,49 @@ Suppliers are skipped (score defaulted to 0) if they have insufficient order vol
 
 Scoring is split between Python (quantitative) and LLM (qualitative + price/lag).
 
-**Step 1 — Python computes `untracked_score` (0–5):**
+**Step 1 — Python computes `untracked_score` (0–8):**
 
-For each carrier (FEDEX, UPS, USPS):
+For each carrier (FEDEX, UPS, USPS) with ≥ 10 orders:
 
 ```
-confidence = min(1.0, exp(order_volume / 100) / exp(1))
-carrier_score = untracked_rate × confidence × 7
+confidence = min(1.0, exp(order_volume / 50) / exp(3))
+carrier_score = untracked_rate × confidence × 30
 ```
 
-All carrier scores are summed and capped at 5. The confidence function uses an exponential curve — volume has a bigger impact at higher order counts (e.g. 100 orders = full confidence, 20 orders ≈ 0.45 confidence).
+Carrier scores are combined using **sqrt(sum of squares)** and capped at 8. This gives diminishing returns for multi-carrier stacking — two carriers at moderate risk score less than one carrier at high risk.
+
+The confidence function is steeply exponential — full confidence (1.0) is reached at ~150 orders. Carriers with fewer than 10 orders are excluded from scoring entirely but their raw rate is still stored in `metrics`.
+
+| Orders | Confidence | 100% rate score |
+|--------|-----------|----------------|
+| 10 | 0.061 | 1.82 |
+| 50 | 0.135 | 4.06 |
+| 72 | 0.210 | 6.30 → cap 8 |
+| 150 | 1.000 | 30 → cap 8 |
 
 **Step 2 — Python computes `price_weight` based on `untracked_score`:**
 
 | untracked_score | price_weight |
 |---|---|
 | ≥ 3 | 1.0 |
-| 1.5 – 3 | 0.6 |
-| < 1.5 | 0.3 |
+| 1 – 3 | 0.6 |
+| < 1 | 0.3 |
 
 Price signals matter most when untracked activity is already elevated. A supplier with high price escalation but normal shipping behavior is weighted down.
 
-**Step 3 — LLM scores price escalation and pickup lag, then combines:**
+**Step 3 — LLM adjusts `untracked_score` for carrier-level systemic issues:**
+
+Each carrier's `carrier_baseline` (overall untracked rate across all suppliers for that carrier on the same day) is passed to the LLM. This allows the LLM to distinguish supplier-specific risk from system-wide carrier problems (e.g. USPS outage affecting everyone).
+
+| Carrier baseline | Supplier vs baseline | Adjustment |
+|---|---|---|
+| ≥ 50% | Within 15pp of carrier rate | × 0.5 (systemic issue, not supplier-specific) |
+| ≥ 50% | Exceeds carrier by > 15pp | × 1.0 (supplier meaningfully worse than carrier) |
+| 20–50% | Supplier notably higher | × 0.75 (mixed signal) |
+| < 20% | Supplier significantly higher | × 1.0 (clear supplier-specific risk) |
+| Absent | — | × 1.0 |
+
+**Step 4 — LLM scores price escalation and pickup lag, then combines:**
 
 Price escalation (raw score before weight):
 
@@ -170,7 +191,7 @@ Capped at 10. Result is a decimal.
 - `supplier_name`: backfilled from BigQuery at pipeline runtime
 
 **`consolidated_flagged_supplier_list`** (upsert by `supplier_key + source`):
-- Suppliers with `overall_risk_score ≥ 5` are written here
+- Suppliers with `overall_risk_score ≥ 6` are written here
 - Updated each run — always reflects the latest score
 
 ---
