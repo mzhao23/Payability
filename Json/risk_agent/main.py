@@ -69,7 +69,7 @@ def _save_checkpoint(date_filter: str | None, supplier_key: str) -> None:
             f.write(supplier_key + "\n")
 
 
-def _process_row(row: dict) -> tuple[str, str, RiskReport | None]:
+def _process_row(row: dict, dry_run: bool = False) -> tuple[str, str, RiskReport | None]:
     """
     Process a single BQ row end-to-end.
     Returns (supplier_key, status, report_or_None)
@@ -97,8 +97,9 @@ def _process_row(row: dict) -> tuple[str, str, RiskReport | None]:
         report = analyse(fs, pre, TABLE_NAME)
         report.mp_sup_key = row.get("mp_sup_key")
 
-        # Step 4: Write to Supabase
-        upsert_report(report)
+        # Step 4: Write to Supabase (skip if dry_run)
+        if not dry_run:
+            upsert_report(report)
 
         # Mirror the same logic used in claude_agent.py
         _LLM_SCORE_THRESHOLD = _cfg_int("llm_score_threshold")
@@ -118,6 +119,9 @@ def _process_row(row: dict) -> tuple[str, str, RiskReport | None]:
             fs.data_quality_flag,
             "yes" if used_llm else "no",
         )
+        if dry_run:
+            import json as _json
+            print(_json.dumps(report.to_supabase_dict(), indent=2, default=str))
         return supplier_key, "ok", report
 
     except Exception as exc:
@@ -129,6 +133,7 @@ def run_pipeline(
     source: str = "bq",
     input_file: str | None = None,
     date_filter: str | None = None,
+    dry_run: bool = False,
 ) -> None:
     start = time.time()
     load_config()  # Load tuning params from Supabase once at startup
@@ -143,7 +148,7 @@ def run_pipeline(
         date_filter or "latest",
         TABLE_NAME,
         settings.PIPELINE_WORKERS,
-        settings.DRY_RUN,
+        dry_run or settings.DRY_RUN,
     )
     log.info("=" * 60)
 
@@ -190,8 +195,10 @@ def run_pipeline(
     skipped = 0
     scores: list[float] = []
 
+    _dry = dry_run or settings.DRY_RUN
+
     with ThreadPoolExecutor(max_workers=settings.PIPELINE_WORKERS) as executor:
-        futures = {executor.submit(_process_row, row): row for row in pending_rows}
+        futures = {executor.submit(_process_row, row, _dry): row for row in pending_rows}
 
         for future in as_completed(futures):
             supplier_key, status, report = future.result()
@@ -199,10 +206,12 @@ def run_pipeline(
                 processed += 1
                 if report:
                     scores.append(report.overall_risk_score)
-                _save_checkpoint(date_filter, supplier_key)
+                if not _dry:
+                    _save_checkpoint(date_filter, supplier_key)
             elif status == "skipped":
                 skipped += 1
-                _save_checkpoint(date_filter, supplier_key)
+                if not _dry:
+                    _save_checkpoint(date_filter, supplier_key)
             else:
                 errors += 1
 
@@ -242,5 +251,10 @@ if __name__ == "__main__":
         default=None,
         help="Path to a specific local input JSON file (overrides --date when used with --source local)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Run pipeline but skip writing to Supabase. Prints full report JSON to stdout instead.",
+    )
     args = parser.parse_args()
-    run_pipeline(source=args.source, input_file=args.input_file, date_filter=args.date)
+    run_pipeline(source=args.source, input_file=args.input_file, date_filter=args.date, dry_run=args.dry_run)
