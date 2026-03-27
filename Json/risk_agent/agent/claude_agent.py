@@ -354,6 +354,14 @@ def analyse(
 
     # ── Validate and coerce ────────────────────────────────────────────────────
     try:
+        # Filter LLM-returned metrics to only triggered ones
+        _triggered_ids = {
+            mid
+            for rule in pre.triggered_rules
+            for key, ids in _RULE_METRIC_MAP.items()
+            if key in rule.upper()
+            for mid in ids
+        } | _ALWAYS_INCLUDE_METRICS
         metrics = [
             Metric(
                 metric_id=str(m.get("metric_id", "")),
@@ -361,7 +369,11 @@ def analyse(
                 unit=m.get("unit"),
             )
             for m in parsed.get("metrics", [])
+            if str(m.get("metric_id", "")) in _triggered_ids
         ]
+        # If LLM returned nothing relevant, fallback to rule-derived metrics
+        if not metrics:
+            metrics = _metrics_for_triggered_rules(fs, pre.triggered_rules)
 
         score = float(parsed.get("overall_risk_score", pre.preliminary_score))
         score = max(1.0, min(10.0, score))
@@ -481,7 +493,7 @@ def _fallback_report(
     error: str = "",
 ) -> RiskReport:
     """Rule-only report — used when LLM is skipped or unavailable."""
-    metrics = _build_fallback_metrics(fs)
+    metrics = _metrics_for_triggered_rules(fs, pre.triggered_rules)
     return RiskReport(
         table_name=table_name,
         supplier_key=fs.supplier_key,
@@ -493,6 +505,67 @@ def _fallback_report(
         data_quality_flag=fs.data_quality_flag,
         raw_error=fs.raw_error,
     )
+
+
+# Maps rule name keywords → metric_ids to include when that rule fires
+_RULE_METRIC_MAP: dict[str, list[str]] = {
+    "ACCOUNT_STATUS":           ["account_status"],
+    "LOAN_PAST_DUE":            ["past_due_amount", "outstanding_loan_amount"],
+    "ORDER_DEFECT_RATE":        ["order_defect_rate"],
+    "LATE_SHIPMENT_RATE":       ["late_shipment_rate"],
+    "NEG_FEEDBACK_TREND":       ["feedback_negative_30d", "feedback_negative_60d_window", "feedback_negative_trend_delta", "feedback_count_30d"],
+    "POLICY_COMPLIANCE":        ["policy_compliance_total", "policy_compliance_delta"],
+    "ACCOUNT_LEVEL_RESERVE":    ["stmt_reserve_consecutive_negative", "stmt_reserve_max_negative"],
+    "FAILED_DISBURSEMENT":      ["failed_disbursement_count"],
+    "HIGH_RISK_NOTIFICATION":   ["high_risk_notification_count"],
+    "CANCELLATION":             ["cancellation_rate"],
+    "VALID_TRACKING":           ["valid_tracking_rate"],
+    "DELIVERED_ON_TIME":        ["delivered_on_time"],
+    "NEGATIVE_FEEDBACK":        ["feedback_negative_30d", "feedback_count_30d"],
+    "LOAN_OUTSTANDING":         ["outstanding_loan_amount"],
+    "UNAVAILABLE_BALANCE":      ["unavailable_balance"],
+    "DATA_QUALITY":             ["account_status"],
+}
+
+# Always include these regardless of triggered rules
+_ALWAYS_INCLUDE_METRICS = {"account_status", "overall_feedback_rating"}
+
+
+def _metrics_for_triggered_rules(fs: FeatureSet, triggered_rules: list[str]) -> list[Metric]:
+    """Return only metrics relevant to the triggered rules."""
+    # Collect metric_ids from triggered rules
+    metric_ids: set[str] = set(_ALWAYS_INCLUDE_METRICS)
+    for rule in triggered_rules:
+        rule_upper = rule.upper()
+        for key, ids in _RULE_METRIC_MAP.items():
+            if key in rule_upper:
+                metric_ids.update(ids)
+
+    # Full metric pool to pick from
+    all_metrics: dict[str, Metric] = {
+        "order_defect_rate":               Metric(metric_id="order_defect_rate",               value=fs.seller_fulfilled_odr,              unit="%"),
+        "late_shipment_rate":              Metric(metric_id="late_shipment_rate",              value=fs.late_shipment_rate,                unit="%"),
+        "cancellation_rate":               Metric(metric_id="cancellation_rate",               value=fs.cancellation_rate,                 unit="%"),
+        "valid_tracking_rate":             Metric(metric_id="valid_tracking_rate",             value=fs.valid_tracking_rate,               unit="%"),
+        "delivered_on_time":               Metric(metric_id="delivered_on_time",               value=fs.delivered_on_time,                 unit="%"),
+        "feedback_negative_30d":           Metric(metric_id="feedback_negative_30d",           value=fs.feedback_negative_30d,             unit="%"),
+        "feedback_negative_60d_window":    Metric(metric_id="feedback_negative_60d_window",    value=fs.feedback_negative_prior60d_pct,    unit="%"),
+        "feedback_negative_trend_delta":   Metric(metric_id="feedback_negative_trend_delta",   value=fs.feedback_negative_trend_delta,     unit="pp"),
+        "feedback_count_30d":              Metric(metric_id="feedback_count_30d",              value=fs.feedback_count_30d,                unit=None),
+        "overall_feedback_rating":         Metric(metric_id="overall_feedback_rating",         value=fs.feedback_rating_summary or None,   unit=None),
+        "outstanding_loan_amount":         Metric(metric_id="outstanding_loan_amount",         value=fs.outstanding_loan_amount,           unit="USD"),
+        "past_due_amount":                 Metric(metric_id="past_due_amount",                 value=fs.past_due_amount,                   unit="USD"),
+        "policy_compliance_total":         Metric(metric_id="policy_compliance_total",         value=fs.curr_policy_total,                 unit=None),
+        "policy_compliance_delta":         Metric(metric_id="policy_compliance_delta",         value=fs.policy_total_delta,                unit=None),
+        "stmt_reserve_consecutive_negative": Metric(metric_id="stmt_reserve_consecutive_negative", value=fs.stmt_reserve_consecutive_negative, unit="periods"),
+        "stmt_reserve_max_negative":       Metric(metric_id="stmt_reserve_max_negative",       value=fs.stmt_reserve_max_negative or None, unit="USD"),
+        "failed_disbursement_count":       Metric(metric_id="failed_disbursement_count",       value=fs.failed_disbursement_count or None, unit=None),
+        "high_risk_notification_count":    Metric(metric_id="high_risk_notification_count",    value=fs.high_risk_notification_count,      unit=None),
+        "account_status":                  Metric(metric_id="account_status",                  value=fs.account_status,                    unit=None),
+        "unavailable_balance":             Metric(metric_id="unavailable_balance",             value=fs.unavailable_balance_amount or None, unit="USD"),
+    }
+
+    return [m for mid, m in all_metrics.items() if mid in metric_ids and m.value is not None]
 
 
 def _build_fallback_metrics(fs: FeatureSet) -> list[Metric]:
