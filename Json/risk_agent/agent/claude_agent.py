@@ -68,7 +68,7 @@ REQUIRED metrics to include (use null if data is unavailable):
   outstanding_loan_amount, past_due_amount,
   policy_compliance_total,
   sales_30_days, total_balance, funds_available,
-  stmt_reserve_consecutive_negative, stmt_reserve_max_negative, stmt_reserve_is_worsening,
+  stmt_reserve_latest_ratio, stmt_reserve_avg_ratio, stmt_reserve_change_pct,
   failed_disbursement_count,
   high_risk_notification_count, account_status
 
@@ -91,10 +91,11 @@ IMPORTANT JUDGEMENT GUIDELINES:
      event, not an active risk.
    - Only treat as active risk if the most recent statement(s) show a failed transfer.
 
-4. Interpreting reserve (stmt_reserve_periods_usd):
-   - Reserve being negative means Amazon is holding funds — this is common for high-volume
-     sellers and not inherently risky.
-   - Focus on whether the reserve is growing (worsening) or stable/shrinking.
+4. Interpreting reserve:
+   - Reserve being negative means Amazon is holding funds — this is common and not inherently risky.
+   - Focus on stmt_reserve_change_pct: how much the reserve/revenue ratio has changed vs the 90-day average.
+   - A stable or shrinking ratio is normal. A ratio spike (>50%) signals Amazon is holding
+     a disproportionate share of recent revenue, which is a risk signal.
    - A large but stable reserve on a high-volume account is normal operational behaviour.
 
 5. Policy compliance:
@@ -161,6 +162,9 @@ def _build_user_message(
         "stmt_reserve_consecutive_negative": fs.stmt_reserve_consecutive_negative,
         "stmt_reserve_max_negative_usd": fs.stmt_reserve_max_negative,
         "stmt_reserve_is_worsening": fs.stmt_reserve_is_worsening,
+        "stmt_reserve_latest_ratio": fs.stmt_reserve_latest_ratio,
+        "stmt_reserve_avg_ratio": fs.stmt_reserve_avg_ratio,
+        "stmt_reserve_change_pct": fs.stmt_reserve_change_pct,
         "failed_disbursement_count": fs.failed_disbursement_count,
         "failed_disbursement_most_recent": fs.failed_disbursement_most_recent,
         "unavailable_balance_usd": fs.unavailable_balance_amount,
@@ -515,7 +519,7 @@ _RULE_METRIC_MAP: dict[str, list[str]] = {
     "LATE_SHIPMENT_RATE":       ["late_shipment_rate"],
     "NEG_FEEDBACK_TREND":       ["feedback_negative_30d", "feedback_negative_60d_window", "feedback_negative_trend_delta", "feedback_count_30d"],
     "POLICY_COMPLIANCE":        ["policy_compliance_total", "policy_compliance_delta"],
-    "ACCOUNT_LEVEL_RESERVE":    ["stmt_reserve_consecutive_negative", "stmt_reserve_max_negative"],
+    "ACCOUNT_LEVEL_RESERVE":    ["stmt_reserve_latest_ratio", "stmt_reserve_avg_ratio", "stmt_reserve_change_pct"],
     "FAILED_DISBURSEMENT":      ["failed_disbursement_count"],
     "HIGH_RISK_NOTIFICATION":   ["high_risk_notification_count"],
     "CANCELLATION":             ["cancellation_rate"],
@@ -559,6 +563,9 @@ def _metrics_for_triggered_rules(fs: FeatureSet, triggered_rules: list[str]) -> 
         "policy_compliance_delta":         Metric(metric_id="policy_compliance_delta",         value=fs.policy_total_delta,                unit=None),
         "stmt_reserve_consecutive_negative": Metric(metric_id="stmt_reserve_consecutive_negative", value=fs.stmt_reserve_consecutive_negative, unit="periods"),
         "stmt_reserve_max_negative":       Metric(metric_id="stmt_reserve_max_negative",       value=fs.stmt_reserve_max_negative or None, unit="USD"),
+        "stmt_reserve_latest_ratio":       Metric(metric_id="stmt_reserve_latest_ratio",       value=fs.stmt_reserve_latest_ratio,         unit="ratio"),
+        "stmt_reserve_avg_ratio":          Metric(metric_id="stmt_reserve_avg_ratio",          value=fs.stmt_reserve_avg_ratio,            unit="ratio"),
+        "stmt_reserve_change_pct":         Metric(metric_id="stmt_reserve_change_pct",         value=fs.stmt_reserve_change_pct,           unit="%"),
         "failed_disbursement_count":       Metric(metric_id="failed_disbursement_count",       value=fs.failed_disbursement_count or None, unit=None),
         "high_risk_notification_count":    Metric(metric_id="high_risk_notification_count",    value=fs.high_risk_notification_count,      unit=None),
         "account_status":                  Metric(metric_id="account_status",                  value=fs.account_status,                    unit=None),
@@ -583,8 +590,9 @@ def _build_fallback_metrics(fs: FeatureSet) -> list[Metric]:
         Metric(metric_id="past_due_amount",                  value=fs.past_due_amount,                      unit="USD"),
         Metric(metric_id="policy_compliance_total",          value=fs.curr_policy_total,                    unit=None),
         Metric(metric_id="policy_compliance_delta",          value=fs.policy_total_delta,                   unit=None),
-        Metric(metric_id="stmt_reserve_consecutive_negative", value=fs.stmt_reserve_consecutive_negative,     unit="periods"),
-        Metric(metric_id="stmt_reserve_max_negative",         value=fs.stmt_reserve_max_negative or None,     unit="USD"),
+        Metric(metric_id="stmt_reserve_latest_ratio",        value=fs.stmt_reserve_latest_ratio,             unit="ratio"),
+        Metric(metric_id="stmt_reserve_avg_ratio",            value=fs.stmt_reserve_avg_ratio,                unit="ratio"),
+        Metric(metric_id="stmt_reserve_change_pct",           value=fs.stmt_reserve_change_pct,               unit="%"),
         Metric(metric_id="failed_disbursement_count",        value=fs.failed_disbursement_count or None,    unit=None),
         Metric(metric_id="high_risk_notification_count",     value=fs.high_risk_notification_count,         unit=None),
         Metric(metric_id="account_status",                   value=fs.account_status,                       unit=None),

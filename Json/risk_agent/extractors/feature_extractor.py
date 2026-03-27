@@ -149,6 +149,10 @@ class FeatureSet:
     stmt_reserve_consecutive_negative: int = 0
     stmt_reserve_max_negative: float = 0.0
     stmt_reserve_is_worsening: bool = False
+    # Reserve ratio analysis
+    stmt_reserve_latest_ratio: Optional[float] = None   # reserve/gross_revenue for most recent closed stmt
+    stmt_reserve_avg_ratio: Optional[float] = None      # avg ratio across valid closed stmts (last 90d)
+    stmt_reserve_change_pct: Optional[float] = None     # (latest - avg) / avg * 100
     unavailable_balance_amount: float = 0.0               # max unavailable seen across statements
     failed_disbursement_count: int = 0                    # count of cancelled/failed transfers in statements (90d)
     failed_disbursement_most_recent: bool = False         # True if most recent closed statement is a failed disbursement
@@ -589,6 +593,62 @@ def extract_features(row: dict) -> FeatureSet:
         fs.stmt_reserve_max_negative = abs(min(stmt_reserve_values))
         if len(stmt_reserve_values) >= 2 and stmt_reserve_values[0] < 0 and stmt_reserve_values[1] < 0:
             fs.stmt_reserve_is_worsening = stmt_reserve_values[0] < stmt_reserve_values[1]
+
+    # ── Reserve ratio analysis ────────────────────────────────────────────────
+    # Only use closed statements within 90 days with gross revenue >= threshold
+    from config.agent_config import cfg as _cfg
+    _RESERVE_RATIO_MIN_REVENUE = _cfg("reserve_ratio_min_revenue_usd", 200.0)
+    _RESERVE_RATIO_WINDOW_DAYS = 90
+    _ratio_cutoff = _now - timedelta(days=_RESERVE_RATIO_WINDOW_DAYS)
+
+    valid_ratios: list[float] = []
+    latest_ratio: Optional[float] = None
+
+    for stmt in statements_list:
+        det = stmt.get("details", {}) or {}
+        status = (det.get("Status", "") or stmt.get("ProcessingStatus", "") or "").lower()
+        if status != "closed":
+            continue
+
+        # Parse end_date
+        end_date_str = stmt.get("end_date", "") or ""
+        try:
+            parts = [int(x) for x in end_date_str.split("-")]
+            stmt_end = datetime(parts[0], parts[1], parts[2], tzinfo=timezone.utc)
+        except (ValueError, TypeError, IndexError):
+            continue
+
+        if stmt_end < _ratio_cutoff:
+            continue
+
+        # Gross Revenue = Product Charges + Shipping - Refunded Sales
+        sales = det.get("Sales", {}) or {}
+        refunds = det.get("Refunds", {}) or {}
+        product_charges  = _money_to_float(sales.get("Product charges", "") or "") or 0.0
+        shipping         = _money_to_float(sales.get("Shipping", "") or "") or 0.0
+        refunded_sales   = abs(_money_to_float(refunds.get("Refunded sales", "") or "") or 0.0)
+        gross_revenue    = product_charges + shipping - refunded_sales
+
+        if gross_revenue < _RESERVE_RATIO_MIN_REVENUE:
+            continue
+
+        reserve_str = det.get("Account Level Reserve", {}).get("Reserve", "") or ""
+        reserve_amt = _money_to_float(reserve_str) or 0.0
+        if reserve_amt >= 0:
+            continue  # only care about negative reserve
+
+        ratio = abs(reserve_amt) / gross_revenue
+        valid_ratios.append(ratio)
+        if latest_ratio is None:
+            latest_ratio = ratio  # first valid closed stmt is the most recent
+
+    if valid_ratios and latest_ratio is not None:
+        fs.stmt_reserve_latest_ratio = latest_ratio
+        fs.stmt_reserve_avg_ratio = sum(valid_ratios) / len(valid_ratios)
+        if fs.stmt_reserve_avg_ratio > 0:
+            fs.stmt_reserve_change_pct = (
+                (latest_ratio - fs.stmt_reserve_avg_ratio) / fs.stmt_reserve_avg_ratio * 100
+            )
 
     # ── 12. Loans ─────────────────────────────────────────────────────────────
     # Active loans

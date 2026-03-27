@@ -112,16 +112,16 @@ def _process_row(row: dict, dry_run: bool = False) -> tuple[str, str, RiskReport
             and pre.preliminary_score >= _LLM_SCORE_THRESHOLD
         )
         log.info(
-            "[%s] %s — score=%.2f/10 | flag=%s | llm=%s",
+            "[%s] %s — pre=%.2f/10 | final=%.2f/10 | flag=%s | llm=%s | rules=%s",
             supplier_key[:8],
             (report.supplier_name or "?")[:30],
+            pre.preliminary_score,
             report.overall_risk_score,
             fs.data_quality_flag,
             "yes" if used_llm else "no",
+            "; ".join(pre.triggered_rules[:3]) or "none",
         )
-        if dry_run:
-            import json as _json
-            print(_json.dumps(report.to_supabase_dict(), indent=2, default=str))
+
         return supplier_key, "ok", report
 
     except Exception as exc:
@@ -134,6 +134,7 @@ def run_pipeline(
     input_file: str | None = None,
     date_filter: str | None = None,
     dry_run: bool = False,
+    output_file: str | None = None,
 ) -> None:
     start = time.time()
     load_config()  # Load tuning params from Supabase once at startup
@@ -197,6 +198,17 @@ def run_pipeline(
 
     _dry = dry_run or settings.DRY_RUN
 
+    # Prepare output file for dry-run
+    _dry_results: list[dict] = []
+    if _dry:
+        import json as _json
+        _out_path = pathlib.Path(output_file) if output_file else (
+            pathlib.Path(__file__).parent / "output" /
+            f"dry_run_{date_filter or datetime.now(timezone.utc).strftime('%Y-%m-%d')}.json"
+        )
+        _out_path.parent.mkdir(parents=True, exist_ok=True)
+        log.info("Dry-run mode — results will be saved to %s", _out_path)
+
     with ThreadPoolExecutor(max_workers=settings.PIPELINE_WORKERS) as executor:
         futures = {executor.submit(_process_row, row, _dry): row for row in pending_rows}
 
@@ -206,6 +218,8 @@ def run_pipeline(
                 processed += 1
                 if report:
                     scores.append(report.overall_risk_score)
+                    if _dry:
+                        _dry_results.append(report.to_supabase_dict())
                 if not _dry:
                     _save_checkpoint(date_filter, supplier_key)
             elif status == "skipped":
@@ -214,6 +228,11 @@ def run_pipeline(
                     _save_checkpoint(date_filter, supplier_key)
             else:
                 errors += 1
+
+    # Write dry-run results to file
+    if _dry and _dry_results:
+        _out_path.write_text(_json.dumps(_dry_results, indent=2, default=str))
+        log.info("Dry-run complete — %d reports saved to %s", len(_dry_results), _out_path)
 
     elapsed = time.time() - start
 
@@ -254,7 +273,18 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Run pipeline but skip writing to Supabase. Prints full report JSON to stdout instead.",
+        help="Run pipeline but skip writing to Supabase. Saves full report JSON to --output-file.",
+    )
+    parser.add_argument(
+        "--output-file",
+        default=None,
+        help="Path to save dry-run output JSON (default: output/dry_run_<date>.json)",
     )
     args = parser.parse_args()
-    run_pipeline(source=args.source, input_file=args.input_file, date_filter=args.date, dry_run=args.dry_run)
+    run_pipeline(
+        source=args.source,
+        input_file=args.input_file,
+        date_filter=args.date,
+        dry_run=args.dry_run,
+        output_file=args.output_file,
+    )

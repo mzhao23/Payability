@@ -37,13 +37,16 @@ _DEFAULTS: dict[str, float] = {
     "policy_delta_hard":              5,
     "stmt_reserve_consec_hard":       2,
     "stmt_reserve_amount_hard_usd":   5000.0,
+    "reserve_ratio_change_hard_pct":  50.0,  # change_pct >= 50% → hard rule floor 7
+    "reserve_ratio_change_soft_pct":  10.0,  # 10% < change_pct < 50% → soft +1
+    "reserve_ratio_min_revenue_usd":  200.0, # skip statements with gross revenue < this
     # Soft rule thresholds
     "cancellation_threshold_pct":     2.5,
     "cancellation_elevated_pct":      1.5,
     "valid_tracking_min_pct":         95.0,
-    "delivered_on_time_min_pct":      85.0,
-    "negative_feedback_high_pct":     10.0,
-    "negative_feedback_elev_pct":     5.0,
+    "delivered_on_time_min_pct":      90.0,
+    "negative_feedback_high_pct":     50.0,  # > 50% → soft +2
+    "negative_feedback_elev_pct":     30.0,  # 30–50% → soft +1
     "policy_delta_soft":              2,
     "deferred_soft_pct":              50.0,
     "deferred_soft_amt_usd":          5000.0,
