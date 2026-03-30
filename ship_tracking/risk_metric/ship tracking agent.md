@@ -50,10 +50,23 @@ risk_metric/
 
 **Table:** `bigqueryexport-183608.dynamodb.app_production_tracking_hub_trackingLabels0BF56DC6_19QOKS1UQM9IN`
 
+**Key characteristics:**
 - CDC (Change Data Capture) table — multiple rows per package, deduplicated by latest `_sdc_sequence` per `sk`
 - Soft deletes via `_sdc_deleted_at`
 - Data refreshes twice daily at UTC 00:00 and 12:00 (primary batch at UTC 12:00)
 - Pipeline runs at **UTC 14:00 (EST 9:00am)** to ensure completeness
+
+**Carrier coverage (2026 data):**
+
+| Carrier | init_timestamp | pickup_timestamp | Used in |
+|---------|---------------|-----------------|---------|
+| `FedEx` | ~94% | 100% of initialized | Metric 1 + 3 |
+| `UPS` | ~93% | 0% | Metric 1 only |
+| `USPS` | ~48% | 16% | Metric 1 (with caveat) |
+| `FEDEX` (all-caps) | 0% | 0% | Ghost order detection |
+| AMZN_US, OnTrac, others | 0% | 0% | Excluded |
+
+> `FedEx` and `FEDEX` are two distinct entries in the data. The all-caps variant has zero timestamp coverage and is treated as a separate fraud signal (`FEDEX_UNACTIVATED`).
 
 ---
 
@@ -65,9 +78,18 @@ risk_metric/
 
 **Logic:**
 - An order is **untracked** if all its packages have no `init_timestamp` after `ship_sla_days = 3` days from `order_date`
-- Computed daily per supplier per carrier (FEDEX, UPS, USPS)
+- Computed daily per supplier per carrier
 - Compared against the supplier's own 30-day rolling average (`diff = today_rate - rolling_avg_30d`)
 - Also compared against the carrier-wide untracked rate on the same day to separate supplier-specific anomalies from systemic carrier issues
+
+**Carriers scored:**
+
+| Carrier | Signal type |
+|---------|------------|
+| `FEDEX` | Primary — high coverage, reliable |
+| `UPS` | Primary — high coverage, reliable |
+| `USPS` | Secondary — ~48% coverage; compared against carrier baseline |
+| `FEDEX_UNACTIVATED` | Special — always 100% untracked; risk signal is order **volume**, not rate |
 
 ---
 
@@ -77,9 +99,12 @@ risk_metric/
 
 **Logic:**
 - `zscore`: z-score of today's average order value vs 30-day rolling mean/stddev of daily averages
-- `max_zscore`: z-score of today's single highest-value order vs 30-day rolling mean/stddev of **daily max order values** (uses its own distribution, not the average's)
+- `max_zscore`: z-score of today's single highest-value order vs 30-day rolling mean/stddev of **daily max order values** (uses its own distribution, not the average's distribution)
 - `total_cost` is order-level and repeated across packages — deduplicated by `order_id` before aggregation
+
+**Key design decisions:**
 - `zscore = NULL` when supplier has < 30 days of history — treated as neutral, not risky
+- `max_zscore` uses the historical distribution of max order values (not daily averages), so it is not artificially inflated by a small standard deviation
 - `max_zscore` is only meaningful when `order_count_today ≥ 5`
 
 ---
@@ -88,11 +113,14 @@ risk_metric/
 
 **What it measures:** Days between label creation (`init_timestamp`) and carrier pickup (`pickup_timestamp`) for FedEx shipments. A rising trend may indicate the seller is delaying handoff.
 
+**Why FedEx only:** Only carrier with reliable `pickup_timestamp` data (100% coverage for initialized records).
+
 **Logic:**
 - `pickup_lag_days = DATE_DIFF(pickup_date, init_date, DAY)` per package
 - Aggregated daily per supplier: `avg_pickup_lag`
 - Compared against 30-day rolling average: `diff = avg_pickup_lag - rolling_avg_30d`
-- Used as a **supporting signal only** — does not drive a high score on its own
+
+> **Metric 3B (Stuck Orders) was deprecated.** FedEx 2026 has 0 stuck orders; UPS/USPS have 400k+ but confirmed to be a data integration gap, not real delays.
 
 ---
 
@@ -113,8 +141,8 @@ confidence = min(0.5, exp(order_volume / 50) / exp(3))
 carrier_score = untracked_rate × confidence × 30
 ```
 
-- **confidence** is an exponential function of order volume, capped at **0.5**. The cap prevents high-volume suppliers with moderate rates from hitting the same score as suppliers with truly extreme rates.
-- Carrier scores are combined via **sqrt(sum of squares)** and capped at 8.
+- **confidence** is an exponential function of order volume, capped at **0.5**. The cap prevents over-confidence at very high volumes — a 30% untracked rate should not score the same as a 100% rate regardless of volume.
+- Carrier scores are combined via **sqrt(sum of squares)** and capped at 8. This gives diminishing returns for multi-carrier stacking.
 
 **Confidence reference:**
 
@@ -141,7 +169,7 @@ Price signals carry more weight when untracked activity is already elevated:
 
 ### Step 3 — LLM adjusts `untracked_score` for carrier-level systemic issues
 
-The carrier-wide untracked rate for the same day is passed to the LLM to distinguish supplier-specific risk from carrier-wide issues.
+The carrier-wide untracked rate for the same day is passed to the LLM. This distinguishes supplier-specific risk from carrier-wide outages or data gaps.
 
 | Carrier baseline | Supplier vs carrier | Adjustment |
 |-----------------|---------------------|------------|
@@ -152,7 +180,7 @@ The carrier-wide untracked rate for the same day is passed to the LLM to disting
 | < 20% | Supplier significantly higher | × 1.0 — clear supplier-specific risk |
 | Absent | — | × 1.0 |
 
-> The ≤ 15pp condition covers both cases where the supplier rate is below the carrier rate and where it is only slightly above — both indicate the signal may be systemic rather than supplier-specific.
+> The ≤ 15pp condition covers both cases where the supplier rate is below the carrier rate AND where it is only slightly above — both indicate a systemic rather than supplier-specific issue.
 
 ---
 
@@ -229,6 +257,7 @@ All tunable parameters are in `config/settings.py`:
 | `ship_sla_days` | 3 | Days buffer before flagging order as untracked |
 | `window_days` | 7 | Rolling window for untracked rate |
 | `zscore_threshold` | 2.0 | Minimum z-score to flag price escalation |
+| `stuck_days` | 5 | Days before flagging as stuck (FedEx only, deprecated) |
 | `baseline_days` | 30 | Historical baseline period |
 
 Authoritative LLM scoring rules: [`prompts/llm_risk_scorer.md`](./prompts/llm_risk_scorer.md)
