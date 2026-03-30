@@ -51,7 +51,7 @@ def _compute_untracked_score(rows: list[dict]) -> float:
         if volume < MIN_ORDERS_FOR_SIGNAL:
             continue
         rate = latest["m1_untracked_rate"]
-        confidence = min(1.0, math.exp(volume / 50) / math.exp(3))
+        confidence = min(0.5, math.exp(volume / 50) / math.exp(3))
         carrier_scores.append(rate * confidence * 30)
 
     if not carrier_scores:
@@ -221,7 +221,7 @@ def _build_output_row(supplier_key: str, rows: list[dict], llm_result: dict) -> 
         "last_purchase_date": str(last_purchase_date) if last_purchase_date else None,
         "metrics": metrics,
         "trigger_reason": llm_result.get("trigger_reason"),
-        "overall_risk_score": int(llm_result.get("overall_risk_score", 0)),
+        "overall_risk_score": round(llm_result.get("overall_risk_score", 0)),
     }
 
 

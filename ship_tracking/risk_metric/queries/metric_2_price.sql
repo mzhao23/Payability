@@ -48,7 +48,17 @@ rolling_baseline AS (
             PARTITION BY supplier_key
             ORDER BY order_date
             ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
-        ) AS stddev_of_avg
+        ) AS stddev_of_avg,
+        AVG(max_order_value) OVER (
+            PARTITION BY supplier_key
+            ORDER BY order_date
+            ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
+        ) AS avg_of_max,
+        STDDEV(max_order_value) OVER (
+            PARTITION BY supplier_key
+            ORDER BY order_date
+            ROWS BETWEEN 30 PRECEDING AND 1 PRECEDING
+        ) AS stddev_of_max
     FROM daily_supplier_stats
 )
 SELECT
@@ -61,7 +71,7 @@ SELECT
     min_order_value,
     avg_of_avg,
     SAFE_DIVIDE((avg_order_value - avg_of_avg), stddev_of_avg) AS zscore,
-    SAFE_DIVIDE((max_order_value - avg_of_avg), stddev_of_avg) AS max_zscore,
+    SAFE_DIVIDE((max_order_value - avg_of_max), stddev_of_max) AS max_zscore,
     CASE
         WHEN SAFE_DIVIDE((avg_order_value - avg_of_avg), stddev_of_avg) > zscore_threshold
         THEN 'YES' ELSE 'NO'

@@ -38,10 +38,11 @@ Use the following logic to interpret the comparison:
 
 Use the following logic. The adjustment applies to `untracked_score` when computing `overall_risk_score`:
 
-- If `carrier_untracked_rate` is **≥ 50%** AND supplier's `latest_rate` is within **15 percentage points** of the carrier rate (e.g. carrier 99.6%, supplier 100%): systemic carrier issue. **Multiply `untracked_score` by 0.5** before adding to final score. In `trigger_reason`, state that the carrier-wide rate is X% making this signal unreliable, and reflect the reduced weight in the score.
+- If `carrier_untracked_rate` is **≥ 50%** AND supplier's `latest_rate` does **not exceed** the carrier rate by more than **15 percentage points** (i.e. `supplier_rate - carrier_rate ≤ 15pp`, including cases where supplier rate is at or below the carrier rate): systemic carrier issue. **Multiply `untracked_score` by 0.5** before adding to final score. In `trigger_reason`, state that the carrier-wide rate is X% making this signal unreliable, and reflect the reduced weight in the score.
 - If `carrier_untracked_rate` is **≥ 50%** AND supplier's `latest_rate` exceeds carrier by **more than 15 percentage points**: systemic issue exists but supplier is meaningfully worse. **Use full `untracked_score`**. In `trigger_reason`, note the carrier-wide issue but state that the supplier's rate exceeds the carrier baseline, indicating real supplier-specific risk.
 - If `carrier_untracked_rate` is **< 20%** and supplier's `latest_rate` is significantly higher: signal is supplier-specific. **Use full `untracked_score`**. Note in `trigger_reason` that the rate is well above the carrier-wide baseline.
-- If `carrier_untracked_rate` is **20–50%** and supplier's rate is notably higher: **Multiply `untracked_score` by 0.75**. Note the mixed signal in `trigger_reason`.
+- If `carrier_untracked_rate` is **20–50%** and supplier's `latest_rate` does **not exceed** the carrier rate by more than **15 percentage points** (i.e. `supplier_rate - carrier_rate ≤ 15pp`, including cases where supplier rate is at or below the carrier rate): mixed or systemic signal. **Multiply `untracked_score` by 0.75**. Note the mixed signal in `trigger_reason`.
+- If `carrier_untracked_rate` is **20–50%** and supplier's rate exceeds the carrier rate by **more than 15 percentage points**: supplier-specific risk. **Use full `untracked_score`**. Note in `trigger_reason` that the supplier's rate substantially exceeds the carrier baseline.
 - If `carrier_baseline` is absent: use full `untracked_score` without adjustment.
 
 ---
