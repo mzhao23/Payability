@@ -79,6 +79,13 @@ python main.py --source local --date 2026-03-10
 
 # Re-run using a specific local file
 python main.py --source local --input-file input/2026-03-10.json
+
+# Dry run — skip Supabase write, save reports to local JSON file instead
+python main.py --source local --input-file input/test.json --dry-run
+python main.py --date 2026-03-10 --dry-run
+
+# Dry run with custom output file (default: output/dry_run_<date>.json)
+python main.py --source local --input-file input/test.json --dry-run --output-file output/test_results.json
 ```
 
 ### 5. Run tests (offline, no cloud required)
@@ -137,8 +144,7 @@ Hard rules represent clear, directional risk signals. Each hard rule sets the sc
 | `LATE_SHIPMENT_RATE` | LSR > 4% (Amazon red line) | 8 |
 | `NEG_FEEDBACK_TREND` | 30d neg rate ≥ 10pp above 60d window (min 10 orders) | 7 |
 | ~~`POLICY_COMPLIANCE_INCREASE`~~ | *Temporarily disabled — violations not distinguished by health impact* | 7 |
-| `ACCOUNT_LEVEL_RESERVE` | Negative reserve in ≥ 2 consecutive statement periods | 7 |
-| `ACCOUNT_LEVEL_RESERVE` | Single-period negative reserve > $5,000 | 7 |
+| `ACCOUNT_LEVEL_RESERVE` | Reserve/revenue ratio increased ≥ 50% vs 90-day average (closed statements only, gross revenue ≥ $200) | 7 |
 | `FAILED_DISBURSEMENT` | Most recent closed statement is a failed disbursement | 7 |
 
 ### Soft Rules — additive penalty points
@@ -148,17 +154,16 @@ Soft rules add penalty points to the score. They represent weaker signals that a
 |---|---|---|---|
 | Fulfillment | Cancellation rate | > 2.5% / 1.5–2.5% | +2 / +1 |
 | Fulfillment | Valid tracking rate | < 95% | +2 |
-| Fulfillment | Delivered on time | < 85% | +1 |
+| Fulfillment | Delivered on time | < 90% | +1 |
 | Fulfillment | Two-step verification | Inactive | +1 |
-| Feedback | 30d negative rate | > 10% (min 10 orders) | +2 |
-| Feedback | 30d negative rate | 5–10% (min 10 orders) | +1 |
+| Feedback | 30d negative rate | > 50% (min 10 orders) | +2 |
+| Feedback | 30d negative rate | 30–50% (min 10 orders) | +1 |
 | Loans | Outstanding balance | > $0 | +1 |
 | ~~Policy~~ | *Total violations — temporarily disabled* | ≥ 20 / 5–19 | +2 / +1 |
 | ~~Policy~~ | *Violations increase — temporarily disabled* | +2 to +4 vs prior record | +1 |
 | Notifications | High-risk notifications | ≥ 10 / 5–9 / 2–4 | +2 / +2 / +1 |
 | Payout | Failed disbursement | Historical (90d) but since recovered | +1 |
-| Payout | Reserve | 1 period negative | +1 |
-| Payout | Reserve | Worsening across periods | +1 |
+| Payout | Reserve ratio | 10–50% above 90-day average | +1 |
 | Payout | Unavailable balance (most recent statement only) | ≥ $1,000 | +1 |
 | Payout | Historical failed disbursement (recovered, within 90 days) | ≥ 1 | +1 |
 | Complaints | Authenticity/Safety/IP/Policy | Each > 0 | +1 each |
@@ -218,7 +223,7 @@ The LLM receives the full feature set including per-statement detail (period, de
 1. **Rule engine signals are alerts, not conclusions** — weigh them against the full picture
 2. **Current account health takes priority** — healthy ODR, LSR, feedback, and account status meaningfully offset historical flags; a seller with excellent current metrics should not score above 6 based solely on historical issues
 3. **Failed disbursements** — if followed by normal successful transfers, treat as resolved; only flag as active risk if most recent statement shows a failed transfer
-4. **Reserve** — large but stable reserve on a high-volume account is normal; focus on whether it is growing (worsening) or stable/shrinking
+4. **Reserve** — focus on `stmt_reserve_change_pct`: how much the reserve/revenue ratio has changed vs the 90-day average. A stable or shrinking ratio is normal; a spike >50% signals disproportionate withholding
 5. **Policy compliance** — high violation counts only matter if actively impacting the account (listings removed, enforcement actions); if account status is OK and fulfillment metrics are healthy, treat as moderate signal only
 
 ## Dynamic Configuration
@@ -242,12 +247,13 @@ UPDATE json_risk_agent_config SET value = 10  WHERE key = 'llm_score_threshold';
 | `floor_late_shipment_rate` | 8 | Hard rule floor — LSR > threshold |
 | `floor_neg_feedback_trend` | 7 | Hard rule floor — feedback spike |
 | `floor_policy_compliance` | 7 | Hard rule floor — policy violations increase |
-| `floor_reserve_consecutive` | 7 | Hard rule floor — consecutive negative reserve |
-| `floor_reserve_amount` | 7 | Hard rule floor — large single-period reserve |
+| `floor_reserve_consecutive` | 7 | Hard rule floor — reserve/revenue ratio spike |
 | `floor_failed_disbursement` | 7 | Hard rule floor — most recent statement failed |
 | `odr_threshold_pct` | 1.0 | ODR % to trigger hard rule |
 | `late_shipment_threshold_pct` | 4.0 | LSR % to trigger hard rule |
-| `stmt_reserve_amount_hard_usd` | 5000 | Reserve USD to trigger hard rule |
+| `reserve_ratio_change_hard_pct` | 50 | Reserve/revenue ratio change % to trigger hard rule |
+| `reserve_ratio_change_soft_pct` | 10 | Reserve/revenue ratio change % lower bound for soft +1 |
+| `reserve_ratio_min_revenue_usd` | 200 | Min gross revenue per statement for ratio calculation (USD) |
 | `failed_disb_window_days` | 90 | Lookback window for failed disbursements |
 | `llm_score_threshold` | 5 | Min pre-score to trigger LLM analysis |
 | `soft_only_max` | 6.0 | Max score when no hard rules fire |
@@ -281,11 +287,12 @@ UPDATE json_risk_agent_config SET value = 10  WHERE key = 'llm_score_threshold';
     {"metric_id": "feedback_negative_trend_delta", "value": 12.3, "unit": "pp"},
     {"metric_id": "policy_compliance_total", "value": 14, "unit": null},
     {"metric_id": "policy_compliance_delta", "value": 6, "unit": null},
-    {"metric_id": "stmt_reserve_consecutive_negative", "value": 3, "unit": "periods"},
-    {"metric_id": "stmt_reserve_max_negative", "value": 8200.0, "unit": "USD"},
+    {"metric_id": "stmt_reserve_latest_ratio", "value": 2.1, "unit": "ratio"},
+    {"metric_id": "stmt_reserve_avg_ratio", "value": 1.1, "unit": "ratio"},
+    {"metric_id": "stmt_reserve_change_pct", "value": 91.0, "unit": "%"},
     {"metric_id": "failed_disbursement_count", "value": 2, "unit": null}
   ],
-  "trigger_reason": "Negative feedback rate has increased 12.3pp in the last 30 days vs the prior 60-day window, and policy compliance violations have risen by 6 vs the previous record. Account level reserve has been negative for 3 consecutive statement periods.",
+  "trigger_reason": "Negative feedback rate has increased 12.3pp in the last 30 days vs the prior 60-day window. Reserve/revenue ratio has spiked 91% above the 90-day average, indicating Amazon is withholding a disproportionate share of recent revenue.",
   "overall_risk_score": 8.33
 }
 ```

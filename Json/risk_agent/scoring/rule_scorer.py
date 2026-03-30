@@ -91,19 +91,16 @@ def score(fs: FeatureSet) -> PreScoreResult:
     #             f"prev={fs.prev_policy_total}, threshold +{cfg_int('policy_delta_hard')})"
     #         ))
 
-    # ── 6. B2B Account Level Reserve ─────────────────────────────────────────
-    if fs.stmt_reserve_consecutive_negative >= cfg_int("stmt_reserve_consec_hard"):
-        hard(cfg_int("floor_reserve_consecutive"), (
-            f"ACCOUNT_LEVEL_RESERVE: negative reserve for "
-            f"{fs.stmt_reserve_consecutive_negative} consecutive periods "
-            f"(max ${fs.stmt_reserve_max_negative:,.0f}, threshold {cfg_int('stmt_reserve_consec_hard')} periods)"
-        ))
-    elif fs.stmt_reserve_max_negative >= cfg("stmt_reserve_amount_hard_usd"):
-        hard(cfg_int("floor_reserve_amount"), (
-            f"ACCOUNT_LEVEL_RESERVE: single-period reserve "
-            f"${fs.stmt_reserve_max_negative:,.0f} "
-            f"(threshold ${cfg("stmt_reserve_amount_hard_usd"):,.0f})"
-        ))
+    # ── 6. Account Level Reserve (ratio-based) ───────────────────────────────
+    if fs.stmt_reserve_change_pct is not None:
+        change = fs.stmt_reserve_change_pct
+        if change >= cfg("reserve_ratio_change_hard_pct"):
+            hard(cfg_int("floor_reserve_consecutive"), (
+                f"ACCOUNT_LEVEL_RESERVE: reserve/revenue ratio increased {change:.0f}% "
+                f"(latest={fs.stmt_reserve_latest_ratio:.2f}x, "
+                f"avg={fs.stmt_reserve_avg_ratio:.2f}x, "
+                f"threshold +{cfg('reserve_ratio_change_hard_pct'):.0f}%)"
+            ))
 
     # ── 7. Failed / cancelled disbursement ───────────────────────────────────
     # Most recent closed statement is a failed disbursement → active risk
@@ -176,10 +173,13 @@ def score(fs: FeatureSet) -> PreScoreResult:
     elif fs.high_risk_notification_count >= cfg_int("notifications_soft_lo_count"):
         soft(1, f"HIGH_RISK_NOTIFICATIONS: {fs.high_risk_notification_count}")
 
-    if fs.stmt_reserve_consecutive_negative == 1:
-        soft(1, f"ACCOUNT_LEVEL_RESERVE: 1 period with negative reserve (${fs.stmt_reserve_max_negative:,.0f})")
-    if fs.stmt_reserve_is_worsening and fs.stmt_reserve_consecutive_negative < cfg_int("stmt_reserve_consec_hard"):
-        soft(1, f"ACCOUNT_LEVEL_RESERVE: reserve worsening across periods")
+    if fs.stmt_reserve_change_pct is not None:
+        change = fs.stmt_reserve_change_pct
+        if cfg("reserve_ratio_change_soft_pct") < change < cfg("reserve_ratio_change_hard_pct"):
+            soft(1, (
+                f"ACCOUNT_LEVEL_RESERVE: reserve/revenue ratio elevated {change:.0f}% above avg "
+                f"(latest={fs.stmt_reserve_latest_ratio:.2f}x, avg={fs.stmt_reserve_avg_ratio:.2f}x)"
+            ))
 
     if not fs.failed_disbursement_most_recent and fs.unavailable_balance_amount >= cfg("unavailable_balance_soft_usd"):
         soft(1, f"UNAVAILABLE_BALANCE: ${fs.unavailable_balance_amount:,.0f} in recent statement")

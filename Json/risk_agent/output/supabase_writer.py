@@ -12,11 +12,17 @@ Make sure you create a UNIQUE constraint on those two columns in Supabase:
 
 from __future__ import annotations
 
+import time
 from supabase import create_client, Client
+from postgrest.exceptions import APIError
 
 from config import settings
 from config.models import RiskReport
 from utils.logger import get_logger
+
+_RETRY_STATUS_CODES = {502, 503, 504}
+_MAX_RETRIES = 3
+_RETRY_DELAY = 5  # seconds
 
 log = get_logger("supabase_writer")
 
@@ -49,24 +55,37 @@ def upsert_report(report: RiskReport) -> None:
     client = _get_client()
     data = report.to_supabase_dict()
 
-    response = (
-        client.table(settings.SUPABASE_RISK_TABLE)
-        .upsert(data, on_conflict="supplier_key,report_date")
-        .execute()
-    )
-
-    if hasattr(response, "data") and response.data:
-        log.debug(
-            "Upserted report for supplier_key=%s (score=%d)",
-            report.supplier_key,
-            report.overall_risk_score,
-        )
-    else:
-        log.warning(
-            "Unexpected Supabase response for supplier_key=%s: %s",
-            report.supplier_key,
-            response,
-        )
+    for attempt in range(1, _MAX_RETRIES + 1):
+        try:
+            response = (
+                client.table(settings.SUPABASE_RISK_TABLE)
+                .upsert(data, on_conflict="mp_sup_key,report_date")
+                .execute()
+            )
+            if hasattr(response, "data") and response.data:
+                log.debug(
+                    "Upserted report for supplier_key=%s (score=%s)",
+                    report.supplier_key,
+                    report.overall_risk_score,
+                )
+            else:
+                log.warning(
+                    "Unexpected Supabase response for supplier_key=%s: %s",
+                    report.supplier_key,
+                    response,
+                )
+            return
+        except APIError as exc:
+            code = int(exc.code) if str(exc.code).isdigit() else 0
+            if code in _RETRY_STATUS_CODES and attempt < _MAX_RETRIES:
+                log.warning(
+                    "Supabase %s error for supplier_key=%s (attempt %d/%d) — retrying in %ds",
+                    code, report.supplier_key, attempt, _MAX_RETRIES, _RETRY_DELAY,
+                )
+                time.sleep(_RETRY_DELAY)
+                _supabase = None  # reset client to get fresh connection
+            else:
+                raise
 
 
 def upsert_reports_bulk(reports: list[RiskReport]) -> tuple[int, int]:
