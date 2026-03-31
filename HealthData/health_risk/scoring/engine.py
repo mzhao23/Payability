@@ -13,7 +13,7 @@ class RiskScoreEngine:
     Swap or subclass to experiment with new formulas without touching I/O.
     """
 
-    PIPELINE_VERSION = "risk_formula_v3_production"
+    PIPELINE_VERSION = "risk_formula_v4_fba_aware"
 
     def score_supplier_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
         metric_values: Dict[str, Any] = {
@@ -39,6 +39,13 @@ class RiskScoreEngine:
         }
 
         orders_count_60 = safe_float(row.get("orders_count_60"))
+        fba_orders_60 = safe_float(row.get("fba_orders_60"))
+        fbm_orders_60 = safe_float(row.get("fbm_orders_60"))
+        channel_total_60 = (
+            (fba_orders_60 or 0) + (fbm_orders_60 or 0)
+            if fba_orders_60 is not None or fbm_orders_60 is not None
+            else None
+        )
 
         outcome_subscores = {
             "ORDER_DEFECT_RATE_60": S.score_odr(metric_values["ORDER_DEFECT_RATE_60"]),
@@ -102,12 +109,22 @@ class RiskScoreEngine:
         compliance_score = round(0.7 * comp_max + 0.3 * comp_avg, 2)
 
         act_gate = S.activity_gate(orders_count_60)
+        ops_gate = S.activity_gate_operational(fbm_orders_60, channel_total_60)
         inact_penalty = S.inactivity_penalty(orders_count_60)
 
+        # Operational metrics credibility scales with FBM volume.
+        # When ops_gate is low (pure FBA), redistribute unused operational
+        # weight proportionally to outcome (80 %) and compliance (20 %).
+        ops_weight_full = 0.35
+        ops_weight = round(ops_weight_full * ops_gate, 4)
+        redistributed = ops_weight_full - ops_weight
+        outcome_weight = round(0.55 + redistributed * 0.80, 4)
+        compliance_weight = round(0.10 + redistributed * 0.20, 4)
+
         base_risk = round(
-            0.55 * outcome_score
-            + 0.35 * operational_score
-            + 0.10 * compliance_score,
+            outcome_weight * outcome_score
+            + ops_weight * operational_score
+            + compliance_weight * compliance_score,
             2,
         )
 
@@ -119,29 +136,21 @@ class RiskScoreEngine:
         risk_level = S.risk_level_from_score(risk_score)
 
         driver_contributions: Dict[str, float] = {
-            "ORDER_DEFECT_RATE_60": 0.55 * 0.55 * outcome_subscores["ORDER_DEFECT_RATE_60"],
-            "CHARGEBACK_RATE_90": 0.55 * 0.18 * outcome_subscores["CHARGEBACK_RATE_90"],
-            "A_TO_Z_CLAIM_RATE_90": 0.55 * 0.15 * outcome_subscores["A_TO_Z_CLAIM_RATE_90"],
-            "NEGATIVE_FEEDBACK_RATE_90": 0.55 * 0.12 * outcome_subscores["NEGATIVE_FEEDBACK_RATE_90"],
-            "LATE_SHIPMENT_RATE_30": 0.35 * 0.25 * operational_subscores["LATE_SHIPMENT_RATE_30"],
-            "PRE_FULFILL_CANCEL_RATE_30": 0.35
-            * 0.20
-            * operational_subscores["PRE_FULFILL_CANCEL_RATE_30"],
-            "AVG_RESPONSE_HOURS_30": 0.35 * 0.08 * operational_subscores["AVG_RESPONSE_HOURS_30"],
-            "NO_RESPONSE_OVER_24H_30": 0.35
-            * 0.07
-            * operational_subscores["NO_RESPONSE_OVER_24H_30"],
-            "VALID_TRACKING_RATE_30": 0.35 * 0.20 * operational_subscores["VALID_TRACKING_RATE_30"],
-            "ON_TIME_DELIVERY_RATE_30": 0.35
-            * 0.20
-            * operational_subscores["ON_TIME_DELIVERY_RATE_30"],
-            "PRODUCT_SAFETY_STATUS": 0.10 * compliance_subscores["PRODUCT_SAFETY_STATUS"],
-            "PRODUCT_AUTHENTICITY_STATUS": 0.10
-            * compliance_subscores["PRODUCT_AUTHENTICITY_STATUS"],
-            "POLICY_VIOLATION_STATUS": 0.10 * compliance_subscores["POLICY_VIOLATION_STATUS"],
-            "LISTING_POLICY_STATUS": 0.10 * compliance_subscores["LISTING_POLICY_STATUS"],
-            "INTELLECTUAL_PROPERTY_STATUS": 0.10
-            * compliance_subscores["INTELLECTUAL_PROPERTY_STATUS"],
+            "ORDER_DEFECT_RATE_60": outcome_weight * 0.55 * outcome_subscores["ORDER_DEFECT_RATE_60"],
+            "CHARGEBACK_RATE_90": outcome_weight * 0.18 * outcome_subscores["CHARGEBACK_RATE_90"],
+            "A_TO_Z_CLAIM_RATE_90": outcome_weight * 0.15 * outcome_subscores["A_TO_Z_CLAIM_RATE_90"],
+            "NEGATIVE_FEEDBACK_RATE_90": outcome_weight * 0.12 * outcome_subscores["NEGATIVE_FEEDBACK_RATE_90"],
+            "LATE_SHIPMENT_RATE_30": ops_weight * 0.25 * operational_subscores["LATE_SHIPMENT_RATE_30"],
+            "PRE_FULFILL_CANCEL_RATE_30": ops_weight * 0.20 * operational_subscores["PRE_FULFILL_CANCEL_RATE_30"],
+            "AVG_RESPONSE_HOURS_30": ops_weight * 0.08 * operational_subscores["AVG_RESPONSE_HOURS_30"],
+            "NO_RESPONSE_OVER_24H_30": ops_weight * 0.07 * operational_subscores["NO_RESPONSE_OVER_24H_30"],
+            "VALID_TRACKING_RATE_30": ops_weight * 0.20 * operational_subscores["VALID_TRACKING_RATE_30"],
+            "ON_TIME_DELIVERY_RATE_30": ops_weight * 0.20 * operational_subscores["ON_TIME_DELIVERY_RATE_30"],
+            "PRODUCT_SAFETY_STATUS": compliance_weight * compliance_subscores["PRODUCT_SAFETY_STATUS"],
+            "PRODUCT_AUTHENTICITY_STATUS": compliance_weight * compliance_subscores["PRODUCT_AUTHENTICITY_STATUS"],
+            "POLICY_VIOLATION_STATUS": compliance_weight * compliance_subscores["POLICY_VIOLATION_STATUS"],
+            "LISTING_POLICY_STATUS": compliance_weight * compliance_subscores["LISTING_POLICY_STATUS"],
+            "INTELLECTUAL_PROPERTY_STATUS": compliance_weight * compliance_subscores["INTELLECTUAL_PROPERTY_STATUS"],
         }
 
         top_risk_drivers = [
@@ -203,6 +212,8 @@ class RiskScoreEngine:
             "driver_3": driver_3,
             "red_metric_count": red_metric_count,
             "yellow_metric_count": yellow_metric_count,
+            "fba_orders_60": safe_float(row.get("fba_orders_60")),
+            "fbm_orders_60": safe_float(row.get("fbm_orders_60")),
             "created_at": utc_now_iso(),
             "updated_at": utc_now_iso(),
             "_metric_values": metric_values,

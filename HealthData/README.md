@@ -18,6 +18,9 @@ Rule-based risk scoring for Amazon third-party sellers, with LLM-powered narrati
 ```
 BigQuery: customer_health_metrics
   │  (mp_sup_key + 15 health metrics)
+  │
+  ├── LEFT JOIN: customer_order_metrics
+  │     fba_orders_60, fbm_orders_60 (60-day FBA/FBM order counts)
   ▼
 Supabase: suppliers table
   │  mp_sup_key → supplier_key, supplier_name
@@ -27,7 +30,7 @@ BigQuery: v_supplier_summary
   ▼
 Filter: remove suspended / pending
   ▼
-RiskScoreEngine: threshold-based scoring (0–10)
+RiskScoreEngine: threshold-based scoring (0–10), FBA/FBM-aware operational weighting
   ▼
 LLM Narrative: OpenAI generates explanation for score > 6
   ▼
@@ -77,16 +80,16 @@ HealthData/
     └── test_utils.py
 ```
 
-## Scoring Logic (v3)
+## Scoring Logic (v4 — FBA-aware)
 
-Pipeline version: `risk_formula_v3_production`
+Pipeline version: `risk_formula_v4_fba_aware`
 
 ### Three Dimensions
 
-| Dimension | Weight | Metrics |
-|-----------|--------|---------|
+| Dimension | Base Weight | Metrics |
+|-----------|-------------|---------|
 | **Outcome** | 55% | Order Defect Rate, Chargeback Rate, A-to-Z Claim Rate, Negative Feedback Rate |
-| **Operational** | 35% | Late Shipment, Pre-Fulfillment Cancel, Avg Response Hours, No Response >24h, Valid Tracking, On-Time Delivery |
+| **Operational** | 35% (scaled by FBM ratio) | Late Shipment, Pre-Fulfillment Cancel, Avg Response Hours, No Response >24h, Valid Tracking, On-Time Delivery |
 | **Compliance** | 10% | Product Safety, Authenticity, Policy Violation, Listing Policy, Intellectual Property |
 
 ### Outcome Weights (within group)
@@ -134,12 +137,36 @@ outcome_score     = weighted sum of outcome subscores
 operational_score = weighted sum of operational subscores
 compliance_score  = 0.7 × max(compliance subscores) + 0.3 × avg(compliance subscores)
 
-base_risk  = 0.55 × outcome + 0.35 × operational + 0.10 × compliance
-risk_score = activity_gate × base_risk + (1 - activity_gate) × inactivity_penalty
+# Operational weight scales with FBM ratio (ops_gate).
+# Unused operational weight is redistributed: 80% → outcome, 20% → compliance.
+ops_weight        = 0.35 × ops_gate
+redistributed     = 0.35 − ops_weight
+outcome_weight    = 0.55 + redistributed × 0.80
+compliance_weight = 0.10 + redistributed × 0.20
+
+base_risk  = outcome_weight × outcome + ops_weight × operational + compliance_weight × compliance
+risk_score = activity_gate × base_risk + (1 − activity_gate) × inactivity_penalty
 risk_score = clamp(risk_score, 0, 10)
 ```
 
-### Activity Gate (order volume adjustment)
+### FBA/FBM Operational Gate (v4)
+
+Operational metrics (late shipment, tracking, on-time delivery) are only meaningful for merchant-fulfilled (FBM) orders. The operational gate scales their weight by the seller's FBM ratio, sourced from `customer_order_metrics`.
+
+| FBM Ratio | Gate | Effect |
+|-----------|------|--------|
+| 0% (pure FBA) | 0.10 | Operational weight drops to 0.035; redistributed to outcome/compliance |
+| > 0% – 5% | 0.20 | |
+| 5% – 20% | 0.40 | |
+| 20% – 50% | 0.70 | |
+| 50% – 80% | 0.90 | |
+| ≥ 80% | 1.00 | Full operational weight (0.35) applies |
+
+**Low-volume cap**: if FBM orders < 10 (regardless of ratio), gate is capped at 0.40 because the metrics are statistically noisy.
+
+**Data missing**: if `customer_order_metrics` has no data for a seller, gate defaults to 0.30 (conservative).
+
+### Activity Gate (total order volume adjustment)
 
 | 60-day Orders | Gate | Inactivity Penalty |
 |---------------|------|--------------------|
@@ -169,7 +196,7 @@ risk_score = clamp(risk_score, 0, 10)
 | Table | Purpose | Key |
 |-------|---------|-----|
 | `suppliers` | mp_sup_key → supplier_key mapping | mp_sup_key |
-| `health_daily_risk` | Daily risk scores for all sellers | report_date + mp_sup_key |
+| `health_daily_risk` | Daily risk scores for all sellers (includes `fba_orders_60`, `fbm_orders_60`) | report_date + mp_sup_key |
 | `consolidated_flagged_supplier_list` | High-risk suppliers for review | supplier_key + source |
 | `reviewed_suppliers` | Suppliers already reviewed (excluded from flagged list) | supplier_key |
 

@@ -35,7 +35,7 @@ class BigQueryRepository:
 
         selected_cols = ["mp_sup_key", "snapshot_date"] + metric_cols + BQ_STATUS_COLS
         selected_cols = list(dict.fromkeys(selected_cols))
-        select_sql = ",\n        ".join([f"`{c}`" for c in selected_cols])
+        select_sql = ",\n            ".join([f"h.`{c}`" for c in selected_cols])
 
         q = f"""
         WITH ranked AS (
@@ -43,14 +43,26 @@ class BigQueryRepository:
             DATE(snapshot_date) AS report_date,
             {select_sql},
             ROW_NUMBER() OVER (
-              PARTITION BY mp_sup_key, DATE(snapshot_date)
-              ORDER BY snapshot_date DESC
+              PARTITION BY h.mp_sup_key, DATE(h.snapshot_date)
+              ORDER BY h.snapshot_date DESC
             ) AS rn
-          FROM {self._settings.bq_full_table}
-          WHERE DATE(snapshot_date) = @report_date
+          FROM {self._settings.bq_full_table} h
+          WHERE DATE(h.snapshot_date) = @report_date
+        ),
+        order_channel AS (
+          SELECT
+            mp_sup_key,
+            COUNT(DISTINCT CASE WHEN fulfillment_channel = 'Amazon' THEN amazon_order_id END) AS fba_orders_60,
+            COUNT(DISTINCT CASE WHEN fulfillment_channel = 'Merchant' THEN amazon_order_id END) AS fbm_orders_60
+          FROM `bigqueryexport-183608.amazon.customer_order_metrics`
+          WHERE purchase_day >= DATE_SUB(@report_date, INTERVAL 60 DAY)
+            AND purchase_day <= @report_date
+            AND order_status != 'Cancelled'
+          GROUP BY mp_sup_key
         )
-        SELECT *
+        SELECT ranked.*, oc.fba_orders_60, oc.fbm_orders_60
         FROM ranked
+        LEFT JOIN order_channel oc USING(mp_sup_key)
         WHERE rn = 1
         LIMIT @lim
         """

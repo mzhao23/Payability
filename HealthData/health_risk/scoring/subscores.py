@@ -156,6 +156,40 @@ def activity_gate(order_count_60: Optional[float]) -> float:
     return 1.0
 
 
+def activity_gate_operational(
+    fbm_orders_60: Optional[float],
+    total_orders_60: Optional[float],
+) -> float:
+    """Operational metrics (late shipment, tracking, on-time delivery) are only
+    meaningful for merchant-fulfilled orders.  Scale their credibility by the
+    FBM *ratio* so that primarily-FBA sellers are not penalised for metrics
+    they don't control.
+
+    A low-volume FBM cap is applied on top: even if the ratio is high, fewer
+    than 10 FBM orders means the metrics are statistically noisy."""
+    if total_orders_60 is None or total_orders_60 == 0:
+        return 0.30
+    fbm = fbm_orders_60 or 0.0
+    fbm_ratio = fbm / total_orders_60
+
+    if fbm_ratio >= 0.80:
+        gate = 1.0
+    elif fbm_ratio >= 0.50:
+        gate = 0.90
+    elif fbm_ratio >= 0.20:
+        gate = 0.70
+    elif fbm_ratio >= 0.05:
+        gate = 0.40
+    elif fbm_ratio > 0:
+        gate = 0.20
+    else:
+        gate = 0.10
+
+    if fbm < 10:
+        gate = min(gate, 0.40)
+    return gate
+
+
 def inactivity_penalty(order_count_60: Optional[float]) -> float:
     if order_count_60 is None:
         return 5.0
