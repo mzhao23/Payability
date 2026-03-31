@@ -189,6 +189,7 @@ class FeatureSet:
     notification_titles: list[str] = field(default_factory=list)
     notification_count: int = 0
     high_risk_notification_count: int = 0   # computed during extraction
+    inv_credit_card_notification: bool = False  # credit card notification on report date or day before
 
     # inventory
     inv_report_value: Optional[float] = None
@@ -699,6 +700,28 @@ def extract_features(row: dict) -> FeatureSet:
         fs.notification_titles = notif_titles
         fs.notification_count = len(notif_titles)
         fs.high_risk_notification_count = _count_risky_notifications(notif_titles)
+
+        # Check for credit card notification on report date or previous day
+        try:
+            from datetime import date as _date_cls, timedelta as _td
+            _report_dt = _date_cls.fromisoformat(fs.report_date) if fs.report_date else None
+            if _report_dt:
+                _window = {_report_dt, _report_dt - _td(days=1)}
+                for title in notif_titles:
+                    if "credit card" in title.lower():
+                        # Parse date from title: "March 15, 2026: ..."
+                        try:
+                            _date_part = title.split(":")[0].strip()
+                            _notif_dt = _date_cls.fromisoformat(
+                                datetime.strptime(_date_part, "%B %d, %Y").strftime("%Y-%m-%d")
+                            )
+                            if _notif_dt in _window:
+                                fs.inv_credit_card_notification = True
+                                break
+                        except (ValueError, IndexError):
+                            continue
+        except Exception:
+            pass
 
     # ── 14. Inventory ─────────────────────────────────────────────────────────
     fs.inv_report_value = _bq_float("inv_report_value")

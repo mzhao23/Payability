@@ -102,7 +102,13 @@ def score(fs: FeatureSet) -> PreScoreResult:
                 f"threshold +{cfg('reserve_ratio_change_hard_pct'):.0f}%)"
             ))
 
-    # ── 7. Failed / cancelled disbursement ───────────────────────────────────
+    # ── 7. Credit card notification (invoice/payment issue) ─────────────────
+    if fs.inv_credit_card_notification:
+        hard(cfg_int("floor_inv_credit_card"), (
+            "INV_CREDIT_CARD: credit card update required notification on or before report date"
+        ))
+
+    # ── 8. Failed / cancelled disbursement ───────────────────────────────────
     # Most recent closed statement is a failed disbursement → active risk
     if fs.failed_disbursement_most_recent:
         hard(cfg_int("floor_failed_disbursement"), "FAILED_DISBURSEMENT: most recent closed statement is a failed disbursement")

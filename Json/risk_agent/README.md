@@ -145,6 +145,7 @@ Hard rules represent clear, directional risk signals. Each hard rule sets the sc
 | `NEG_FEEDBACK_TREND` | 30d neg rate ≥ 10pp above 60d window (min 10 orders) | 7 |
 | ~~`POLICY_COMPLIANCE_INCREASE`~~ | *Temporarily disabled — violations not distinguished by health impact* | 7 |
 | `ACCOUNT_LEVEL_RESERVE` | Reserve/revenue ratio increased ≥ 50% vs 90-day average (closed statements only, gross revenue ≥ $200) | 7 |
+| `INV_CREDIT_CARD` | Credit card update required notification on report date or previous day | 8 |
 | `FAILED_DISBURSEMENT` | Most recent closed statement is a failed disbursement | 7 |
 
 ### Soft Rules — additive penalty points
@@ -252,6 +253,7 @@ UPDATE json_risk_agent_config SET value = 10  WHERE key = 'llm_score_threshold';
 | `floor_neg_feedback_trend` | 7 | Hard rule floor — feedback spike |
 | `floor_policy_compliance` | 7 | Hard rule floor — policy violations increase |
 | `floor_reserve_consecutive` | 7 | Hard rule floor — reserve/revenue ratio spike |
+| `floor_inv_credit_card` | 8 | Hard rule floor — credit card notification on/before report date |
 | `floor_failed_disbursement` | 7 | Hard rule floor — most recent statement failed |
 | `odr_threshold_pct` | 1.0 | ODR % to trigger hard rule |
 | `late_shipment_threshold_pct` | 4.0 | LSR % to trigger hard rule |
