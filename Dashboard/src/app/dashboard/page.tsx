@@ -36,6 +36,7 @@ type SupplierReview = {
   created_at: string;
   updated_at: string;
   flagged_record_id?: number | null;
+  decision_daily_report_id?: number | null;
   supplier_key: string;
   report_date?: string | null;
   reviewer_id: string;
@@ -249,6 +250,14 @@ const SOURCE_LABELS: Record<string, string> = {
   json_report: "JSON Agent",
   health_report: "Health Agent",
 };
+
+function labelToAgentKey(label: string): AgentFilterKey | null {
+  const trimmed = String(label ?? "").trim();
+  for (const [k, v] of Object.entries(SOURCE_LABELS)) {
+    if (String(v).trim() === trimmed) return k as AgentFilterKey;
+  }
+  return null;
+}
 
 type AgentFilterKey = "decision_agent" | "daily_summary_report" | "ship_tracking" | "json_report" | "health_report";
 
@@ -724,18 +733,25 @@ export default function DashboardPage() {
   }
 
   async function loadReviewsForDecisionRecord(record: DecisionAgentDailyRecord) {
+    // Preferred: link by decision_daily_report_id (new schema).
+    // Fallback: legacy rows keyed by (supplier_key, report_date).
     const supplierKey = record.supplier_key ?? "";
     const reportDate = record.report_date ?? "";
-    if (!supplierKey || !reportDate) {
+
+    const base = supabase.from("supplier_reviews").select("*").order("created_at", { ascending: true });
+    const q =
+      typeof record.id === "number" && Number.isFinite(record.id)
+        ? base.eq("decision_daily_report_id", record.id)
+        : supplierKey && reportDate
+          ? base.eq("supplier_key", supplierKey).eq("report_date", reportDate)
+          : null;
+
+    if (!q) {
       setSupplierReviews([]);
       return;
     }
-    const { data, error } = await supabase
-      .from("supplier_reviews")
-      .select("*")
-      .eq("supplier_key", supplierKey)
-      .eq("report_date", reportDate)
-      .order("created_at", { ascending: true });
+
+    const { data, error } = await q;
     if (error) {
       console.error("Load reviews error:", error);
       setSupplierReviews([]);
@@ -920,6 +936,31 @@ export default function DashboardPage() {
       return;
     }
 
+    // If Decision detail is reviewing a sub-agent, also attach the consolidated parent id in the same row
+    // (schema: at-least-one-parent, allows both).
+    let consolidatedFlagId: number | null = null;
+    if (decisionRec) {
+      const agentKey = labelToAgentKey(reviewAgentLabel);
+      if (agentKey && agentKey !== "decision_agent") {
+        const ymd = String(decisionRec.report_date ?? "").trim().slice(0, 10);
+        const supplierKey2 = String(decisionRec.supplier_key ?? "").trim();
+        if (ymd && supplierKey2) {
+          const { startIso, endIso } = easternYmdToUtcRange(ymd);
+          const { data: consRow } = await supabase
+            .from("consolidated_flagged_supplier_list")
+            .select("id")
+            .eq("supplier_key", supplierKey2)
+            .eq("source", agentKey)
+            .gte("created_at", startIso)
+            .lte("created_at", endIso)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (consRow?.id) consolidatedFlagId = Number(consRow.id);
+        }
+      }
+    }
+
     const insertRow: Record<string, unknown> = {
       supplier_key: supplierKey,
       report_date: reportDate,
@@ -932,7 +973,13 @@ export default function DashboardPage() {
       emailed: reviewEmailed,
       monitored: reviewMonitored,
     };
-    if (consRec) insertRow.flagged_record_id = consRec.id;
+    if (consRec) {
+      insertRow.flagged_record_id = consRec.id;
+      insertRow.decision_daily_report_id = null;
+    } else if (decisionRec) {
+      insertRow.decision_daily_report_id = decisionRec.id;
+      insertRow.flagged_record_id = consolidatedFlagId;
+    }
 
     const { error: insertError } = await supabase.from("supplier_reviews").insert(insertRow);
 
