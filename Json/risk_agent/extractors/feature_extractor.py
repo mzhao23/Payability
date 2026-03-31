@@ -190,6 +190,7 @@ class FeatureSet:
     notification_count: int = 0
     high_risk_notification_count: int = 0   # computed during extraction
     inv_credit_card_notification: bool = False  # credit card notification on report date or day before
+    acc_deactivation_notification: bool = False  # account deactivation risk notification on report date or day before
 
     # inventory
     inv_report_value: Optional[float] = None
@@ -708,18 +709,25 @@ def extract_features(row: dict) -> FeatureSet:
             if _report_dt:
                 _window = {_report_dt, _report_dt - _td(days=1)}
                 for title in notif_titles:
-                    if "credit card" in title.lower():
-                        # Parse date from title: "March 15, 2026: ..."
-                        try:
-                            _date_part = title.split(":")[0].strip()
-                            _notif_dt = _date_cls.fromisoformat(
-                                datetime.strptime(_date_part, "%B %d, %Y").strftime("%Y-%m-%d")
-                            )
-                            if _notif_dt in _window:
-                                fs.inv_credit_card_notification = True
-                                break
-                        except (ValueError, IndexError):
-                            continue
+                    title_lower = title.lower()
+                    # Parse date from title: "March 15, 2026: ..."
+                    try:
+                        _date_part = title.split(":")[0].strip()
+                        _notif_dt = _date_cls.fromisoformat(
+                            datetime.strptime(_date_part, "%B %d, %Y").strftime("%Y-%m-%d")
+                        )
+                    except (ValueError, IndexError):
+                        continue
+                    if _notif_dt not in _window:
+                        continue
+                    if "credit card" in title_lower:
+                        fs.inv_credit_card_notification = True
+                    if (
+                        "at risk of deactivation" in title_lower
+                        or "account is at risk" in title_lower
+                        or "selling account" in title_lower and "deactivat" in title_lower
+                    ):
+                        fs.acc_deactivation_notification = True
         except Exception:
             pass
 

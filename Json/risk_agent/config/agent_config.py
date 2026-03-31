@@ -29,6 +29,7 @@ _DEFAULTS: dict[str, float] = {
     "floor_reserve_consecutive":      7,
     "floor_reserve_amount":           7,
     "floor_failed_disbursement":      7,
+    "floor_acc_deactivation":          9,  # account deactivation risk notification on/before report date
     "floor_inv_credit_card":           8,  # credit card notification on/before report date
     # Hard rule thresholds
     "odr_threshold_pct":              1.0,

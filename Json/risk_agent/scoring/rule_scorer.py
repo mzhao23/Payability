@@ -102,7 +102,13 @@ def score(fs: FeatureSet) -> PreScoreResult:
                 f"threshold +{cfg('reserve_ratio_change_hard_pct'):.0f}%)"
             ))
 
-    # ── 7. Credit card notification (invoice/payment issue) ─────────────────
+    # ── 7. Account deactivation risk notification ────────────────────────────
+    if fs.acc_deactivation_notification:
+        hard(cfg_int("floor_acc_deactivation"), (
+            "ACC_DEACTIVATION: account at risk of deactivation notification on or before report date"
+        ))
+
+    # ── 7b. Credit card notification (invoice/payment issue) ─────────────────
     if fs.inv_credit_card_notification:
         hard(cfg_int("floor_inv_credit_card"), (
             "INV_CREDIT_CARD: credit card update required notification on or before report date"
