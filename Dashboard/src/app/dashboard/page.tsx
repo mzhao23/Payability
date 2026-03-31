@@ -354,7 +354,7 @@ type TableSortState =
   | { mode: "default" }
   | { mode: "column"; column: TableSortColumn; ascending: boolean; step: 1 | 2 };
 
-type SummaryQuickFilter = "all" | "critical" | "flagged" | "unflagged" | "pending_review" | "reviewed";
+type SummaryQuickFilter = "all" | "critical" | "flagged" | "pending_review" | "reviewed";
 
 /** Narrow table by human review state (Decision: any supplier_reviews row; Consolidated: row status). */
 type ReviewStatusFilter = "all" | "pending" | "reviewed";
@@ -651,17 +651,21 @@ export default function DashboardPage() {
       if (!a || typeof a !== "object") return false;
       return Object.values(a).some((v: any) => Boolean(v?.flagged));
     };
+    const hasHumanReview = (r: DecisionAgentDailyRecord) => {
+      const pairKey = `${String(r.supplier_key ?? "").trim()}__${String(r.report_date ?? "").trim().slice(0, 10)}`;
+      return pairKey.length > 2 && decisionReviewedPairSet.has(pairKey);
+    };
     switch (summaryQuickFilter) {
       case "critical":
         return decisionRecords.filter((r) => (r.final_score ?? 0) >= 8);
       case "flagged":
         return decisionRecords.filter(anyFlagged);
-      case "unflagged":
-        return decisionRecords.filter((r) => !anyFlagged(r));
+      case "reviewed":
+        return decisionRecords.filter(hasHumanReview);
       default:
         return decisionRecords;
     }
-  }, [decisionRecords, summaryQuickFilter]);
+  }, [decisionRecords, summaryQuickFilter, decisionReviewedPairSet]);
 
   const displayConsolidatedRecords = useMemo(() => {
     switch (summaryQuickFilter) {
@@ -1351,10 +1355,10 @@ export default function DashboardPage() {
           </button>
           <button
             type="button"
-            onClick={() => onSummaryCardClick(isDecisionView ? "unflagged" : "reviewed")}
-            aria-pressed={summaryQuickFilter === (isDecisionView ? "unflagged" : "reviewed")}
+            onClick={() => onSummaryCardClick("reviewed")}
+            aria-pressed={summaryQuickFilter === "reviewed"}
             className={`rounded-lg shadow border p-4 text-center cursor-pointer transition w-full bg-white dark:bg-zinc-900 border-gray-200 dark:border-zinc-800 hover:bg-gray-50 dark:hover:bg-zinc-800/80 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
-              summaryQuickFilter === (isDecisionView ? "unflagged" : "reviewed")
+              summaryQuickFilter === "reviewed"
                 ? "ring-2 ring-blue-600 ring-offset-2 ring-offset-gray-50 dark:ring-blue-400 dark:ring-offset-zinc-950"
                 : ""
             }`}
@@ -1362,15 +1366,12 @@ export default function DashboardPage() {
             <div className="text-2xl font-bold text-green-600 dark:text-green-400">
               {isDecisionView
                 ? decisionRecords.filter((r) => {
-                    const a = r.agent_scores as any;
-                    if (!a || typeof a !== "object") return true;
-                    return !Object.values(a).some((v: any) => Boolean(v?.flagged));
+                    const pairKey = `${String(r.supplier_key ?? "").trim()}__${String(r.report_date ?? "").trim().slice(0, 10)}`;
+                    return pairKey.length > 2 && decisionReviewedPairSet.has(pairKey);
                   }).length
                 : consolidatedRecords.filter((r) => r.status === "reviewed").length}
             </div>
-            <div className="text-xs text-gray-500 dark:text-zinc-400">
-              {isDecisionView ? "Unflagged" : "Reviewed"}
-            </div>
+            <div className="text-xs text-gray-500 dark:text-zinc-400">Reviewed</div>
           </button>
         </div>
 
@@ -1555,7 +1556,7 @@ export default function DashboardPage() {
                         Agent:{" "}
                         <span className="font-medium text-gray-700 dark:text-zinc-200">
                           {selectedDecisionRecord
-                            ? reviewAgentLabel
+                            ? "Decision Agent"
                             : SOURCE_LABELS[selectedConsolidatedRecord!.source] ?? selectedConsolidatedRecord!.source}
                         </span>
                       </span>
