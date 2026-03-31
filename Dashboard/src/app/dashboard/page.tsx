@@ -459,8 +459,6 @@ export default function DashboardPage() {
   const [agentDetailKey, setAgentDetailKey] = useState<string | null>(null);
   const [hoveredAgent, setHoveredAgent] = useState<string | null>(null);
   const [appRole, setAppRole] = useState<AppRole | null>(null);
-  /** `(supplier_key)__(report_date)` keys that have at least one supplier_reviews row — Decision list Status column. */
-  const [decisionReviewedPairSet, setDecisionReviewedPairSet] = useState<Set<string>>(() => new Set());
 
   const canReview = appRole === "reviewer" || appRole === "admin";
   const isAdmin = appRole === "admin";
@@ -501,56 +499,6 @@ export default function DashboardPage() {
   useEffect(() => {
     if (user) loadRecords();
   }, [user, dateMode, dateSingleYmd, dateRangeStartYmd, dateRangeEndYmd, sourceFilter, searchTerm, scoreMin, scoreMax, tableSortState]);
-
-  useEffect(() => {
-    if (!user || !isDecisionView || decisionRecords.length === 0) {
-      setDecisionReviewedPairSet(new Set());
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      const keys = Array.from(
-        new Set(decisionRecords.map((r) => String(r.supplier_key ?? "").trim()).filter(Boolean))
-      );
-      const dates = Array.from(
-        new Set(decisionRecords.map((r) => String(r.report_date ?? "").trim()).filter(Boolean))
-      );
-      if (keys.length === 0 || dates.length === 0) {
-        if (!cancelled) setDecisionReviewedPairSet(new Set());
-        return;
-      }
-      const sorted = dates.slice().sort();
-      const lo = sorted[0];
-      const hi = sorted[sorted.length - 1];
-      const { data, error } = await supabase
-        .from("supplier_reviews")
-        .select("supplier_key,report_date")
-        .in("supplier_key", keys)
-        .gte("report_date", lo)
-        .lte("report_date", hi);
-      if (cancelled) return;
-      if (error) {
-        console.error("Load decision review status:", error);
-        setDecisionReviewedPairSet(new Set());
-        return;
-      }
-      const validPairs = new Set(
-        decisionRecords.map(
-          (r) => `${String(r.supplier_key ?? "").trim()}__${String(r.report_date ?? "").trim().slice(0, 10)}`
-        )
-      );
-      const reviewed = new Set<string>();
-      for (const row of data ?? []) {
-        const d = row.report_date != null ? String(row.report_date).trim().slice(0, 10) : "";
-        const k = `${String(row.supplier_key ?? "").trim()}__${d}`;
-        if (d && validPairs.has(k)) reviewed.add(k);
-      }
-      setDecisionReviewedPairSet(reviewed);
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [user, isDecisionView, decisionRecords, supabase]);
 
   async function loadAgentMeta() {
     const { data } = await supabase
@@ -1418,22 +1366,11 @@ export default function DashboardPage() {
                         {(r as DecisionAgentDailyRecord).reason ?? ""}
                       </td>
                       <td className="px-4 py-3">
-                        {(() => {
-                          const dr = r as DecisionAgentDailyRecord;
-                          const pairKey = `${String(dr.supplier_key ?? "").trim()}__${String(dr.report_date ?? "").trim().slice(0, 10)}`;
-                          const isReviewed = pairKey.length > 2 && decisionReviewedPairSet.has(pairKey);
-                          return (
-                            <span
-                              className={`inline-flex px-2 py-0.5 rounded text-xs ${
-                                isReviewed
-                                  ? "bg-green-100 text-green-700 dark:bg-green-950/50 dark:text-green-300"
-                                  : "bg-orange-100 text-orange-700 dark:bg-orange-950/40 dark:text-orange-300"
-                              }`}
-                            >
-                              {isReviewed ? "Reviewed" : "Pending"}
-                            </span>
-                          );
-                        })()}
+                        <span className={`inline-flex px-2 py-0.5 rounded text-xs ${
+                          (((r as DecisionAgentDailyRecord).final_score ?? 0) >= 8)
+                            ? "bg-red-100 text-red-700 dark:bg-red-950/50 dark:text-red-300"
+                            : "bg-gray-100 text-gray-700 dark:bg-zinc-800 dark:text-zinc-300"
+                        }`}>{((r as DecisionAgentDailyRecord).final_score ?? 0) >= 8 ? "Critical" : "—"}</span>
                       </td>
                     </tr>
                   ) : (
@@ -1782,29 +1719,28 @@ export default function DashboardPage() {
                       {selectedConsolidatedRecord.overall_risk_score ?? "—"}
                     </div>
                   </div>
-                  <div
-                    className={`rounded-lg border px-3 py-2 ${
-                      selectedConsolidatedRecord.status === "reviewed"
-                        ? "border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-950/30"
-                        : "border-orange-200 dark:border-orange-800 bg-orange-50 dark:bg-orange-950/25"
-                    }`}
-                  >
+                  <div className="bg-gray-50 dark:bg-zinc-800 rounded-lg border border-gray-200 dark:border-zinc-700 px-3 py-2">
                     <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-zinc-400">Review status</div>
-                    <div
-                      className={`text-lg font-bold capitalize ${
-                        selectedConsolidatedRecord.status === "reviewed"
-                          ? "text-green-700 dark:text-green-300"
-                          : "text-orange-700 dark:text-orange-300"
-                      }`}
-                    >
-                      {selectedConsolidatedRecord.status === "reviewed"
-                        ? "Reviewed"
-                        : selectedConsolidatedRecord.status === "pending_review"
-                          ? "Pending"
-                          : (selectedConsolidatedRecord.status?.replace(/_/g, " ") ?? "—")}
+                    <div className="text-lg font-bold text-gray-900 dark:text-zinc-100 capitalize">
+                      {selectedConsolidatedRecord.status?.replace(/_/g, " ") ?? "—"}
                     </div>
                   </div>
                 </div>
+              </div>
+
+              <div className="mb-6">
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Flag reasons</h3>
+                {Array.isArray(selectedConsolidatedRecord.reasons) && selectedConsolidatedRecord.reasons.length > 0 ? (
+                  <ul className="list-disc list-inside space-y-1 text-sm text-gray-700 dark:text-zinc-300">
+                    {selectedConsolidatedRecord.reasons.map((reason, i) => (
+                      <li key={i} className="leading-snug">
+                        {reason}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-sm text-gray-500 dark:text-zinc-400">—</p>
+                )}
               </div>
 
               {(() => {
@@ -1881,21 +1817,6 @@ export default function DashboardPage() {
                   </div>
                 );
               })()}
-
-              <div className="mb-6">
-                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Flag reasons</h3>
-                {Array.isArray(selectedConsolidatedRecord.reasons) && selectedConsolidatedRecord.reasons.length > 0 ? (
-                  <ul className="list-disc list-inside space-y-1 text-sm text-gray-700 dark:text-zinc-300">
-                    {selectedConsolidatedRecord.reasons.map((reason, i) => (
-                      <li key={i} className="leading-snug">
-                        {reason}
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="text-sm text-gray-500 dark:text-zinc-400">—</p>
-                )}
-              </div>
               </>
               )}
 
