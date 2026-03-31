@@ -27,6 +27,8 @@ type ConsolidatedFlaggedRecord = {
   reasons: string[];
   status: string;
   created_at: string;
+  /** Optional jsonb: metrics array or object with nested `metrics` (e.g. daily risk blob). */
+  metrics?: unknown;
 };
 
 type SupplierReview = {
@@ -241,14 +243,58 @@ function formatEastern(
 }
 
 const SOURCE_LABELS: Record<string, string> = {
+  decision_agent: "Decision Agent",
   daily_summary_report: "Daily Summary Agent",
   ship_tracking: "Shipment Agent",
   json_report: "JSON Agent",
   health_report: "Health Agent",
-  decision_agent: "Decision Agent",
 };
 
 type AgentFilterKey = "decision_agent" | "daily_summary_report" | "ship_tracking" | "json_report" | "health_report";
+
+/** Sub-agent entries may include optional structured metrics (e.g. daily_summary_report). */
+function agentEntryMetrics(entry: unknown): Record<string, unknown>[] {
+  if (entry == null || typeof entry !== "object") return [];
+  const o = entry as Record<string, unknown>;
+  const raw = o.metrics ?? o.trigger_metrics;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((m): m is Record<string, unknown> => m != null && typeof m === "object");
+}
+
+function formatAgentMetricValue(m: Record<string, unknown>): string {
+  const v = m.value;
+  const unit = m.unit != null ? String(m.unit) : "";
+  if (v == null || v === "") return unit ? `— ${unit}`.trim() : "—";
+  if (typeof v === "number" && Number.isFinite(v)) {
+    const s = unit === "%" ? v.toFixed(2) : String(v);
+    return unit ? `${s} ${unit}` : s;
+  }
+  return unit ? `${String(v)} ${unit}` : String(v);
+}
+
+function metricTriggered(m: Record<string, unknown>): boolean {
+  return m.triggered === true || m.triggered === "true";
+}
+
+function consolidatedReportYmd(record: ConsolidatedFlaggedRecord): string {
+  const normalized = record.created_at.includes("T") ? record.created_at : record.created_at.replace(" ", "T");
+  const d = new Date(normalized);
+  return Number.isNaN(d.getTime()) ? record.created_at.slice(0, 10) : easternDateYmd(d);
+}
+
+/** Top-level metrics array or nested `{ metrics: [...] }` from consolidated_flagged_supplier_list. */
+function consolidatedMetricsRows(record: ConsolidatedFlaggedRecord): Record<string, unknown>[] {
+  const m = record.metrics as unknown;
+  if (Array.isArray(m)) {
+    return m.filter((x): x is Record<string, unknown> => x != null && typeof x === "object");
+  }
+  if (m && typeof m === "object" && Array.isArray((m as Record<string, unknown>).metrics)) {
+    return ((m as Record<string, unknown>).metrics as unknown[]).filter(
+      (x): x is Record<string, unknown> => x != null && typeof x === "object"
+    );
+  }
+  return [];
+}
 
 const FIELD =
   "border border-gray-300 dark:border-zinc-600 rounded text-sm text-gray-900 dark:text-zinc-100 bg-white dark:bg-zinc-800 placeholder:text-gray-600 dark:placeholder:text-zinc-400";
@@ -620,6 +666,20 @@ export default function DashboardPage() {
     setSupplierReviews((data as SupplierReview[]) ?? []);
   }
 
+  async function loadReviewsForConsolidatedRecord(record: ConsolidatedFlaggedRecord) {
+    const { data, error } = await supabase
+      .from("supplier_reviews")
+      .select("*")
+      .eq("flagged_record_id", record.id)
+      .order("created_at", { ascending: true });
+    if (error) {
+      console.error("Load reviews error:", error);
+      setSupplierReviews([]);
+      return;
+    }
+    setSupplierReviews((data as SupplierReview[]) ?? []);
+  }
+
   async function openDecisionDetail(record: DecisionAgentDailyRecord) {
     setSelectedDecisionRecord(record);
     setSelectedConsolidatedRecord(null);
@@ -637,8 +697,9 @@ export default function DashboardPage() {
     setSupplierReviews([]);
     resetReviewForm();
     setReviewAgentLabel(SOURCE_LABELS[record.source] ?? record.source);
-    // TODO: If you want reviews in consolidated view, re-add flagged_record_id based loading here.
+    setAgentDetailKey(null);
     setRiskHistory([]);
+    await loadReviewsForConsolidatedRecord(record);
   }
 
   function validateReviewFields() {
@@ -674,7 +735,10 @@ export default function DashboardPage() {
   }
 
   async function saveReviewEdit() {
-    if (!selectedDecisionRecord || !user || !editingReviewId) return;
+    if (!user || !editingReviewId) return;
+    const decisionRec = selectedDecisionRecord;
+    const consRec = selectedConsolidatedRecord;
+    if (!decisionRec && !consRec) return;
     setReviewError("");
     if (!canReview) {
       setReviewError(NO_PERMISSION);
@@ -682,8 +746,8 @@ export default function DashboardPage() {
     }
     if (!validateReviewFields()) return;
 
-    const supplierKey = selectedDecisionRecord.supplier_key ?? "";
-    const reportDate = selectedDecisionRecord.report_date ?? "";
+    const supplierKey = decisionRec ? (decisionRec.supplier_key ?? "") : consRec!.supplier_key;
+    const reportDate = decisionRec ? (decisionRec.report_date ?? "") : consolidatedReportYmd(consRec!);
     if (!supplierKey || !reportDate) {
       setReviewError("Missing supplier_key or report_date for this record.");
       return;
@@ -715,12 +779,15 @@ export default function DashboardPage() {
       return;
     }
 
-    await loadReviewsForDecisionRecord(selectedDecisionRecord);
+    if (decisionRec) await loadReviewsForDecisionRecord(decisionRec);
+    else await loadReviewsForConsolidatedRecord(consRec!);
     resetReviewForm();
   }
 
   async function deleteReview(review: SupplierReview) {
-    if (!selectedDecisionRecord || !user) return;
+    if (!user || (!selectedDecisionRecord && !selectedConsolidatedRecord)) return;
+    const decisionRec = selectedDecisionRecord;
+    const consRec = selectedConsolidatedRecord;
     setReviewError("");
     if (!canReview) {
       setReviewError(NO_PERMISSION);
@@ -739,19 +806,28 @@ export default function DashboardPage() {
       return;
     }
     if (editingReviewId === review.id) resetReviewForm();
-    await loadReviewsForDecisionRecord(selectedDecisionRecord);
+    if (decisionRec) await loadReviewsForDecisionRecord(decisionRec);
+    else if (consRec) await loadReviewsForConsolidatedRecord(consRec);
     loadRecords();
   }
 
   async function submitReview() {
-    if (!selectedDecisionRecord || !user || editingReviewId) return;
+    if (!user || editingReviewId) return;
+    const decisionRec = selectedDecisionRecord;
+    const consRec = selectedConsolidatedRecord;
+    if (!decisionRec && !consRec) return;
 
     setReviewError("");
     if (!canReview) {
       setReviewError(NO_PERMISSION);
       return;
     }
-    if (
+    if (consRec) {
+      if (supplierReviews.some((r) => sameReviewerId(r.reviewer_id, user.id))) {
+        setReviewError("You already submitted a review for this flag. Edit or delete it first.");
+        return;
+      }
+    } else if (
       supplierReviews.some((r) => sameReviewerId(r.reviewer_id, user.id) && (r.source ?? "").trim() === reviewAgentLabel)
     ) {
       setReviewError("You already have a review for this agent. Edit or delete it first.");
@@ -759,14 +835,14 @@ export default function DashboardPage() {
     }
     if (!validateReviewFields()) return;
 
-    const supplierKey = selectedDecisionRecord.supplier_key ?? "";
-    const reportDate = selectedDecisionRecord.report_date ?? "";
+    const supplierKey = decisionRec ? (decisionRec.supplier_key ?? "") : consRec!.supplier_key;
+    const reportDate = decisionRec ? (decisionRec.report_date ?? "") : consolidatedReportYmd(consRec!);
     if (!supplierKey || !reportDate) {
       setReviewError("Missing supplier_key or report_date for this record.");
       return;
     }
 
-    const { error: insertError } = await supabase.from("supplier_reviews").insert({
+    const insertRow: Record<string, unknown> = {
       supplier_key: supplierKey,
       report_date: reportDate,
       reviewer_id: user.id,
@@ -777,14 +853,18 @@ export default function DashboardPage() {
       suspended: reviewSuspended,
       emailed: reviewEmailed,
       monitored: reviewMonitored,
-    });
+    };
+    if (consRec) insertRow.flagged_record_id = consRec.id;
+
+    const { error: insertError } = await supabase.from("supplier_reviews").insert(insertRow);
 
     if (insertError) {
       setReviewError(mapSupabasePermissionError(insertError));
       return;
     }
 
-    await loadReviewsForDecisionRecord(selectedDecisionRecord);
+    if (decisionRec) await loadReviewsForDecisionRecord(decisionRec);
+    else await loadReviewsForConsolidatedRecord(consRec!);
     resetReviewForm();
     loadRecords();
   }
@@ -986,10 +1066,19 @@ export default function DashboardPage() {
     router.push("/login");
   }
 
+  const hasMyReview = useMemo(() => {
+    if (!user?.id) return false;
+    if (selectedConsolidatedRecord) {
+      return supplierReviews.some((r) => sameReviewerId(r.reviewer_id, user.id));
+    }
+    return supplierReviews.some(
+      (r) => sameReviewerId(r.reviewer_id, user.id) && (r.source ?? "").trim() === reviewAgentLabel.trim()
+    );
+  }, [user, supplierReviews, reviewAgentLabel, selectedConsolidatedRecord]);
+
   if (!user || appRole === null) return null;
 
   const sortQuery = sortStateToQuery(tableSortState);
-  const hasMyReview = supplierReviews.some((r) => sameReviewerId(r.reviewer_id, user.id));
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-zinc-950">
@@ -1332,8 +1421,8 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {/* Detail Modal (Decision Agent) */}
-      {selectedDecisionRecord && (
+      {/* Detail Modal (Decision daily report or single-agent consolidated flag) */}
+      {(selectedDecisionRecord || selectedConsolidatedRecord) && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
           <div className="bg-white dark:bg-zinc-900 rounded-lg shadow-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto border border-gray-200 dark:border-zinc-800">
             <div className="p-6">
@@ -1341,21 +1430,31 @@ export default function DashboardPage() {
                 <div className="flex justify-between items-start gap-4">
                   <div className="min-w-0">
                     <h2 className="text-lg font-bold text-gray-900 dark:text-zinc-100 truncate">
-                      {selectedDecisionRecord.supplier_name ?? "—"}
+                      {selectedDecisionRecord
+                        ? (selectedDecisionRecord.supplier_name ?? "—")
+                        : selectedConsolidatedRecord!.supplier_name}
                     </h2>
                     <p className="text-sm text-gray-500 dark:text-zinc-400 font-mono truncate">
-                      {selectedDecisionRecord.supplier_key ?? "—"}
+                      {selectedDecisionRecord
+                        ? (selectedDecisionRecord.supplier_key ?? "—")
+                        : selectedConsolidatedRecord!.supplier_key}
                     </p>
                     <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-500 dark:text-zinc-400">
                       <span>
                         Date:{" "}
                         <span className="font-medium text-gray-700 dark:text-zinc-200">
-                          {selectedDecisionRecord.report_date ?? "—"}
+                          {selectedDecisionRecord
+                            ? (selectedDecisionRecord.report_date ?? "—")
+                            : consolidatedReportYmd(selectedConsolidatedRecord!)}
                         </span>
                       </span>
                       <span>
                         Agent:{" "}
-                        <span className="font-medium text-gray-700 dark:text-zinc-200">{reviewAgentLabel}</span>
+                        <span className="font-medium text-gray-700 dark:text-zinc-200">
+                          {selectedDecisionRecord
+                            ? reviewAgentLabel
+                            : SOURCE_LABELS[selectedConsolidatedRecord!.source] ?? selectedConsolidatedRecord!.source}
+                        </span>
                       </span>
                     </div>
                   </div>
@@ -1370,6 +1469,8 @@ export default function DashboardPage() {
                 </div>
               </div>
 
+              {selectedDecisionRecord && (
+              <>
               {/* Decision Agent Summary */}
               <div className="mb-6 pt-4">
                 <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Decision Agent</h3>
@@ -1469,7 +1570,7 @@ export default function DashboardPage() {
               </div>
 
               {/* Agent Detail Popup */}
-              {agentDetailKey && (
+              {selectedDecisionRecord && agentDetailKey && (
                 <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
                   <button
                     type="button"
@@ -1498,6 +1599,11 @@ export default function DashboardPage() {
                     </div>
                     {(() => {
                       const e = (selectedDecisionRecord.agent_scores ?? {})[agentDetailKey] as any;
+                      const metricsRows = agentEntryMetrics(e);
+                      const sortedMetrics = [...metricsRows].sort(
+                        (a, b) => Number(metricTriggered(b)) - Number(metricTriggered(a))
+                      );
+                      const hasTriggeredMetric = sortedMetrics.some(metricTriggered);
                       return (
                         <div className="space-y-3 text-sm">
                           <div className="flex flex-wrap gap-3">
@@ -1510,6 +1616,73 @@ export default function DashboardPage() {
                               <div className="text-lg font-bold text-gray-900 dark:text-zinc-100">{e?.flagged ? "true" : "false"}</div>
                             </div>
                           </div>
+                          {sortedMetrics.length > 0 && (
+                            <div>
+                              <div className="text-xs font-semibold text-gray-700 dark:text-zinc-200 mb-2">
+                                {hasTriggeredMetric ? "Trigger metrics" : "Metrics"}
+                              </div>
+                              <ul className="space-y-2">
+                                {sortedMetrics.map((m, idx) => {
+                                  const id =
+                                    m.metric_id != null
+                                      ? String(m.metric_id)
+                                      : m.name != null
+                                        ? String(m.name)
+                                        : `metric-${idx}`;
+                                  const trig = metricTriggered(m);
+                                  const sev =
+                                    m.severity != null && String(m.severity) !== "NONE"
+                                      ? String(m.severity)
+                                      : null;
+                                  const contrib = m.score_contribution;
+                                  const contribStr =
+                                    typeof contrib === "number" && Number.isFinite(contrib)
+                                      ? String(contrib)
+                                      : contrib != null
+                                        ? String(contrib)
+                                        : null;
+                                  return (
+                                    <li
+                                      key={`${id}-${idx}`}
+                                      className={`rounded-lg border px-3 py-2 ${
+                                        trig
+                                          ? "border-red-300 dark:border-red-800 bg-red-50/80 dark:bg-red-950/25"
+                                          : "border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800/60"
+                                      }`}
+                                    >
+                                      <div className="flex flex-wrap items-center gap-2 mb-1">
+                                        <span className="font-mono text-xs font-semibold text-gray-900 dark:text-zinc-100">
+                                          {id}
+                                        </span>
+                                        {trig ? (
+                                          <span className="inline-flex rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide bg-red-200 text-red-900 dark:bg-red-900/50 dark:text-red-100">
+                                            Triggered
+                                          </span>
+                                        ) : null}
+                                        {sev ? (
+                                          <span className="text-[10px] text-gray-600 dark:text-zinc-400">{sev}</span>
+                                        ) : null}
+                                      </div>
+                                      <div className="text-xs text-gray-700 dark:text-zinc-300">
+                                        <span className="font-medium">Value:</span>{" "}
+                                        {formatAgentMetricValue(m)}
+                                        {contribStr != null && (
+                                          <span className="ml-2 text-gray-500 dark:text-zinc-500">
+                                            · contribution {contribStr}
+                                          </span>
+                                        )}
+                                      </div>
+                                      {m.explanation != null && String(m.explanation).trim() !== "" && (
+                                        <p className="mt-1 text-xs text-gray-600 dark:text-zinc-400 leading-snug">
+                                          {String(m.explanation)}
+                                        </p>
+                                      )}
+                                    </li>
+                                  );
+                                })}
+                              </ul>
+                            </div>
+                          )}
                           <div>
                             <div className="text-xs font-semibold text-gray-700 dark:text-zinc-200 mb-1">Reason</div>
                             <div className="text-sm text-gray-700 dark:text-zinc-300 whitespace-pre-wrap">
@@ -1530,11 +1703,129 @@ export default function DashboardPage() {
                   {selectedDecisionRecord.reason ?? "—"}
                 </p>
               </div>
+              </>
+              )}
+
+              {selectedConsolidatedRecord && (
+              <>
+              <div className="mb-6 pt-4">
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">
+                  {SOURCE_LABELS[selectedConsolidatedRecord.source] ?? selectedConsolidatedRecord.source}
+                </h3>
+                <div className="flex flex-wrap items-center gap-3">
+                  <div className="bg-gray-50 dark:bg-zinc-800 rounded-lg border border-gray-200 dark:border-zinc-700 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-zinc-400">Risk score</div>
+                    <div className="text-lg font-bold text-gray-900 dark:text-zinc-100">
+                      {selectedConsolidatedRecord.overall_risk_score ?? "—"}
+                    </div>
+                  </div>
+                  <div className="bg-gray-50 dark:bg-zinc-800 rounded-lg border border-gray-200 dark:border-zinc-700 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-zinc-400">Review status</div>
+                    <div className="text-lg font-bold text-gray-900 dark:text-zinc-100 capitalize">
+                      {selectedConsolidatedRecord.status?.replace(/_/g, " ") ?? "—"}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mb-6">
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Flag reasons</h3>
+                {Array.isArray(selectedConsolidatedRecord.reasons) && selectedConsolidatedRecord.reasons.length > 0 ? (
+                  <ul className="list-disc list-inside space-y-1 text-sm text-gray-700 dark:text-zinc-300">
+                    {selectedConsolidatedRecord.reasons.map((reason, i) => (
+                      <li key={i} className="leading-snug">
+                        {reason}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-sm text-gray-500 dark:text-zinc-400">—</p>
+                )}
+              </div>
+
+              {(() => {
+                const metricsRows = consolidatedMetricsRows(selectedConsolidatedRecord);
+                const sortedMetrics = [...metricsRows].sort(
+                  (a, b) => Number(metricTriggered(b)) - Number(metricTriggered(a))
+                );
+                const hasTriggeredMetric = sortedMetrics.some(metricTriggered);
+                if (sortedMetrics.length === 0) return null;
+                return (
+                  <div className="mb-6">
+                    <div className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">
+                      {hasTriggeredMetric ? "Trigger metrics" : "Metrics"}
+                    </div>
+                    <ul className="space-y-2">
+                      {sortedMetrics.map((m, idx) => {
+                        const id =
+                          m.metric_id != null
+                            ? String(m.metric_id)
+                            : m.name != null
+                              ? String(m.name)
+                              : `metric-${idx}`;
+                        const trig = metricTriggered(m);
+                        const sev =
+                          m.severity != null && String(m.severity) !== "NONE"
+                            ? String(m.severity)
+                            : null;
+                        const contrib = m.score_contribution;
+                        const contribStr =
+                          typeof contrib === "number" && Number.isFinite(contrib)
+                            ? String(contrib)
+                            : contrib != null
+                              ? String(contrib)
+                              : null;
+                        return (
+                          <li
+                            key={`${id}-${idx}`}
+                            className={`rounded-lg border px-3 py-2 text-sm ${
+                              trig
+                                ? "border-red-300 dark:border-red-800 bg-red-50/80 dark:bg-red-950/25"
+                                : "border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800/60"
+                            }`}
+                          >
+                            <div className="flex flex-wrap items-center gap-2 mb-1">
+                              <span className="font-mono text-xs font-semibold text-gray-900 dark:text-zinc-100">
+                                {id}
+                              </span>
+                              {trig ? (
+                                <span className="inline-flex rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide bg-red-200 text-red-900 dark:bg-red-900/50 dark:text-red-100">
+                                  Triggered
+                                </span>
+                              ) : null}
+                              {sev ? (
+                                <span className="text-[10px] text-gray-600 dark:text-zinc-400">{sev}</span>
+                              ) : null}
+                            </div>
+                            <div className="text-xs text-gray-700 dark:text-zinc-300">
+                              <span className="font-medium">Value:</span> {formatAgentMetricValue(m)}
+                              {contribStr != null && (
+                                <span className="ml-2 text-gray-500 dark:text-zinc-500">
+                                  · contribution {contribStr}
+                                </span>
+                              )}
+                            </div>
+                            {m.explanation != null && String(m.explanation).trim() !== "" && (
+                              <p className="mt-1 text-xs text-gray-600 dark:text-zinc-400 leading-snug">
+                                {String(m.explanation)}
+                              </p>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                );
+              })()}
+              </>
+              )}
 
               {/* Review Section — reviewers/admins can submit; viewers see history only */}
               <div className="border-t border-gray-200 dark:border-zinc-700 pt-4 space-y-4">
                 <p className="text-sm text-gray-600 dark:text-zinc-400">
-                  Reviews are associated with this supplier and report date, and can target Decision Agent or a specific sub-agent.
+                  {selectedDecisionRecord
+                    ? "Reviews are associated with this supplier and report date, and can target Decision Agent or a specific sub-agent."
+                    : "Reviews are stored for this flagged record and listed by reviewer. One review per user per flag."}
                 </p>
 
                 <div>
@@ -1619,25 +1910,35 @@ export default function DashboardPage() {
                     <p className="text-sm text-gray-600 dark:text-zinc-400 mb-3">{NO_PERMISSION}</p>
                   ) : (
                     <>
-                  <div className="mb-3">
-                    <label className={LABEL}>Agent</label>
-                    <select
-                      value={reviewAgentLabel}
-                      onChange={(e) => setReviewAgentLabel(e.target.value)}
-                      className={FIELD_FULL}
-                    >
-                      <option value="Decision Agent">Decision Agent</option>
-                      {Object.entries(SOURCE_LABELS).map(([k, label]) => (
-                        <option key={k} value={label}>
-                          {label}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
+                  {selectedDecisionRecord ? (
+                    <div className="mb-3">
+                      <label className={LABEL}>Agent</label>
+                      <select
+                        value={reviewAgentLabel}
+                        onChange={(e) => setReviewAgentLabel(e.target.value)}
+                        className={FIELD_FULL}
+                      >
+                        {Object.entries(SOURCE_LABELS).map(([k, label]) => (
+                          <option key={k} value={label}>
+                            {label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-gray-600 dark:text-zinc-400 mb-3">
+                      Agent for this review:{" "}
+                      <span className="font-medium text-gray-800 dark:text-zinc-200">
+                        {SOURCE_LABELS[selectedConsolidatedRecord!.source] ?? selectedConsolidatedRecord!.source}
+                      </span>
+                    </p>
+                  )}
                   {hasMyReview && !editingReviewId && (
                     <p className="text-sm text-gray-600 dark:text-zinc-400 mb-3">
-                      You already submitted a review for this flag. Use <strong>Edit</strong> or <strong>Delete</strong>{" "}
-                      in the list above to change it. Submit is disabled until you delete that review.
+                      {selectedConsolidatedRecord
+                        ? "You already submitted a review for this flag. Use Edit or Delete in the list above."
+                        : "You already submitted a review for this agent. Use Edit or Delete in the list above."}{" "}
+                      Submit is disabled until you delete that review.
                     </p>
                   )}
                   <div className="flex gap-4 mb-3 flex-wrap">
