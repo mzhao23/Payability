@@ -1641,7 +1641,7 @@ export default function DashboardPage() {
               <div className="mb-6">
                 <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Agent Scores</h3>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  {Object.entries(SOURCE_LABELS).map(([agentKey, label]) => {
+                  {Object.entries(SOURCE_LABELS).filter(([agentKey]) => agentKey !== "decision_agent").map(([agentKey, label]) => {
                     const entry = (selectedDecisionRecord.agent_scores ?? {})[agentKey] as any;
                     const score = entry?.score;
                     const flagged = Boolean(entry?.flagged);
