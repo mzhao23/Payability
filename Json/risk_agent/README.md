@@ -205,15 +205,19 @@ ODR is only evaluated using seller-fulfilled data from the `Performance Over Tim
 - **No SF data available**: ODR skipped — no fallback to global ODR field
 
 ### Data Quality Short-Circuit
-If the data collection returned an error flag, the supplier is scored directly — no rules evaluated, no LLM called:
+If the data collection returned an error flag, the supplier is scored directly — no rules evaluated. Most flags skip the LLM entirely; pipeline errors (`internal_error`) are the exception and do go through the LLM with a score floor of 8.
 
 | Flag | Score |
 |---|---|
+| `scraper_error` | 8 |
 | `not_authorized` | 8 |
 | `login_error` / `wrong_password` | 7 |
-| `bank_page_error` | 5 |
-| `internal_error` / `json_parse_error` | 4 |
+| `bank_page_error` | 8 |
+| `json_parse_error` | 4 |
 | `advance_only` / `onboarding_only` | 2 |
+
+`scraper_error` is triggered when the scraped JSON contains a top-level `Error` field, indicating the scraper encountered an access or processing error (e.g. bank page not loaded, access diverted).
+
 
 ### LLM Usage
 Claude AI is only called when the rule engine pre-score is **≥ 5**. Rows scoring below 5 receive a rule-engine-only report. The LLM may adjust the final score up or down from the pre-score based on contextual analysis.
@@ -260,7 +264,13 @@ UPDATE json_risk_agent_config SET value = 10  WHERE key = 'llm_score_threshold';
 | `score_max` | 10.0 | Absolute score ceiling |
 | `dq_score_not_authorized` | 8 | Score for not_authorized data quality flag |
 | `dq_score_login_error` | 7 | Score for login_error data quality flag |
+| `dq_score_scraper_error` | 8 | Score for scraper_error (JSON with top-level Error field) |
+| `dq_score_bank_page_error` | 8 | Score for bank_page_error data quality flag |
+| `dq_score_json_parse_error` | 4 | Score for json_parse_error data quality flag |
+| `dq_score_advance_only` | 2 | Score for advance_only data quality flag |
+| `dq_score_onboarding_only` | 2 | Score for onboarding_only data quality flag |
 | `dq_score_default` | 3 | Default score for unknown data quality flags |
+| ~~`dq_score_internal_error`~~ | *No longer used — internal errors go through LLM with floor 8* | |
 
 ## Risk Score Guide
 

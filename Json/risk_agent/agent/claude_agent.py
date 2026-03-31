@@ -279,7 +279,7 @@ _SKIP_LLM_FLAGS = {
     "not_authorized",
     "wrong_password",
     "bank_page_error",
-    "internal_error",
+    # "internal_error" removed — errors now go through LLM with score floor 8
     "json_parse_error",
     "advance_only",
     "onboarding_only",

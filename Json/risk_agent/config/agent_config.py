@@ -44,7 +44,7 @@ _DEFAULTS: dict[str, float] = {
     "cancellation_threshold_pct":     2.5,
     "cancellation_elevated_pct":      1.5,
     "valid_tracking_min_pct":         95.0,
-    "delivered_on_time_min_pct":      90.0,
+    "delivered_on_time_min_pct":      85.0,
     "negative_feedback_high_pct":     50.0,  # > 50% → soft +2
     "negative_feedback_elev_pct":     30.0,  # 30–50% → soft +1
     "policy_delta_soft":              2,
@@ -64,8 +64,9 @@ _DEFAULTS: dict[str, float] = {
     "dq_score_not_authorized":        8,
     "dq_score_login_error":           7,
     "dq_score_wrong_password":        7,
-    "dq_score_bank_page_error":       5,
-    "dq_score_internal_error":        4,
+    "dq_score_scraper_error":         8,  # JSON has top-level Error field — score 8
+    "dq_score_bank_page_error":       8,  # raised from 5 — bank page errors indicate access issues
+    "dq_score_internal_error":        8,  # no longer used in short-circuit — internal errors now go through LLM with floor 8
     "dq_score_json_parse_error":      4,
     "dq_score_advance_only":          2,
     "dq_score_onboarding_only":       2,

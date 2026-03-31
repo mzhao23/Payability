@@ -46,7 +46,17 @@ _ERROR_PATTERNS: dict[str, str] = {
 
 
 def classify_error(data_str: str) -> Optional[str]:
-    """Return an error class string if the data column signals a known error, else None."""
+    """Return an error class string if the data column signals a known error, else None.
+    If the JSON contains a top-level 'Error' field, returns 'scraper_error' immediately.
+    """
+    # Check for top-level Error field in JSON first
+    try:
+        d = json.loads(data_str)
+        if isinstance(d, dict) and d.get("Error"):
+            return "scraper_error"
+    except (json.JSONDecodeError, TypeError):
+        pass
+
     lower = data_str.lower()
     for label, pattern in _ERROR_PATTERNS.items():
         if re.search(pattern, lower):

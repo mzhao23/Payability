@@ -34,8 +34,8 @@ from config import settings
 from config.agent_config import load_config, cfg_int as _cfg_int
 import argparse
 from extractors.bq_loader import fetch_rows, fetch_rows_from_file
-from extractors.feature_extractor import extract_features
-from scoring.rule_scorer import score as rule_score
+from extractors.feature_extractor import extract_features, FeatureSet
+from scoring.rule_scorer import score as rule_score, PreScoreResult
 from agent.claude_agent import analyse
 from output.supabase_writer import upsert_report
 from config.models import RiskReport
@@ -106,7 +106,7 @@ def _process_row(row: dict, dry_run: bool = False) -> tuple[str, str, RiskReport
         used_llm = (
             fs.data_quality_flag not in {
                 "login_error","not_authorized","wrong_password",
-                "bank_page_error","internal_error","json_parse_error",
+                "bank_page_error","json_parse_error",
                 "advance_only","onboarding_only",
             }
             and pre.preliminary_score >= _LLM_SCORE_THRESHOLD
@@ -126,7 +126,42 @@ def _process_row(row: dict, dry_run: bool = False) -> tuple[str, str, RiskReport
 
     except Exception as exc:
         log.error("Error processing supplier_key=%s: %s", supplier_key, exc, exc_info=True)
-        return supplier_key, "error", None
+        # Attempt LLM analysis with error context, fallback to score=8 if that also fails
+        try:
+            fs_err = FeatureSet()
+            fs_err.supplier_key = row.get("mp_sup_key", supplier_key)
+            fs_err.report_date = row.get("created_date", "")
+            fs_err.data_quality_flag = "internal_error"
+            fs_err.raw_error = str(exc)[:500]
+            fs_err.account_status = ""
+            pre_err = PreScoreResult()
+            pre_err.preliminary_score = 8.0
+            pre_err.triggered_rules = [f"PIPELINE_ERROR: {str(exc)[:150]}"]
+            pre_err.hard_floors = [8]
+            try:
+                error_report = analyse(fs_err, pre_err, TABLE_NAME)
+                error_report.mp_sup_key = row.get("mp_sup_key")
+                error_report.overall_risk_score = max(error_report.overall_risk_score, 8.0)
+            except Exception:
+                from config.models import RiskReport
+                error_report = RiskReport(
+                    table_name=TABLE_NAME,
+                    supplier_key=row.get("mp_sup_key", supplier_key),
+                    mp_sup_key=row.get("mp_sup_key"),
+                    supplier_name="",
+                    report_date=row.get("created_date", ""),
+                    metrics=[],
+                    trigger_reason=f"Pipeline error — could not complete assessment: {str(exc)[:200]}",
+                    overall_risk_score=8.0,
+                    data_quality_flag="internal_error",
+                    raw_error=str(exc)[:500],
+                )
+            if not dry_run:
+                upsert_report(error_report)
+            return supplier_key, "error", error_report
+        except Exception as inner_exc:
+            log.error("Failed to write error report for supplier_key=%s: %s", supplier_key, inner_exc)
+            return supplier_key, "error", None
 
 
 def run_pipeline(
@@ -219,8 +254,11 @@ def run_pipeline(
 
         for future in as_completed(futures):
             supplier_key, status, report = future.result()
-            if status == "ok":
-                processed += 1
+            if status in ("ok", "error"):
+                if status == "ok":
+                    processed += 1
+                else:
+                    errors += 1
                 if report:
                     scores.append(report.overall_risk_score)
                     if _dry:
@@ -229,8 +267,6 @@ def run_pipeline(
             elif status == "skipped":
                 skipped += 1
                 _save_checkpoint(date_filter, supplier_key, label=_checkpoint_label)
-            else:
-                errors += 1
 
     # Write dry-run results to file
     if _dry and _dry_results:
