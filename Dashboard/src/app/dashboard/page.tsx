@@ -356,6 +356,9 @@ type TableSortState =
 
 type SummaryQuickFilter = "all" | "critical" | "flagged" | "unflagged" | "pending_review" | "reviewed";
 
+/** Narrow table by human review state (Decision: any supplier_reviews row; Consolidated: row status). */
+type ReviewStatusFilter = "all" | "pending" | "reviewed";
+
 const DECISION_TABLE_ORDER_COLUMN: Record<TableSortColumn, string> = {
   date: "report_date",
   supplier: "supplier_name",
@@ -424,7 +427,8 @@ function TableSortHeader({
 }
 
 export default function DashboardPage() {
-  const supabase = getSupabaseBrowser();
+  /** Single client for the page lifetime — avoids unstable reference in effect deps (see decision review Set). */
+  const supabase = useMemo(() => getSupabaseBrowser(), []);
   const router = useRouter();
 
   const [user, setUser] = useState<any>(null);
@@ -443,6 +447,7 @@ export default function DashboardPage() {
   const [scoreMax, setScoreMax] = useState(10);
   const [tableSortState, setTableSortState] = useState<TableSortState>({ mode: "default" });
   const [summaryQuickFilter, setSummaryQuickFilter] = useState<SummaryQuickFilter>("all");
+  const [reviewStatusFilter, setReviewStatusFilter] = useState<ReviewStatusFilter>("all");
 
   const [selectedDecisionRecord, setSelectedDecisionRecord] = useState<DecisionAgentDailyRecord | null>(null);
   const [selectedConsolidatedRecord, setSelectedConsolidatedRecord] = useState<ConsolidatedFlaggedRecord | null>(null);
@@ -459,6 +464,8 @@ export default function DashboardPage() {
   const [agentDetailKey, setAgentDetailKey] = useState<string | null>(null);
   const [hoveredAgent, setHoveredAgent] = useState<string | null>(null);
   const [appRole, setAppRole] = useState<AppRole | null>(null);
+  /** `(supplier_key)__(report_date)` with any supplier_reviews row — Decision table Status. */
+  const [decisionReviewedPairSet, setDecisionReviewedPairSet] = useState<Set<string>>(() => new Set());
 
   const canReview = appRole === "reviewer" || appRole === "admin";
   const isAdmin = appRole === "admin";
@@ -570,6 +577,56 @@ export default function DashboardPage() {
     tableSortState,
   ]);
 
+  useEffect(() => {
+    if (!user || !isDecisionView || decisionRecords.length === 0) {
+      setDecisionReviewedPairSet(new Set());
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const keys = Array.from(
+        new Set(decisionRecords.map((r) => String(r.supplier_key ?? "").trim()).filter(Boolean))
+      );
+      const dates = Array.from(
+        new Set(decisionRecords.map((r) => String(r.report_date ?? "").trim()).filter(Boolean))
+      );
+      if (keys.length === 0 || dates.length === 0) {
+        if (!cancelled) setDecisionReviewedPairSet(new Set());
+        return;
+      }
+      const sorted = dates.slice().sort();
+      const lo = sorted[0];
+      const hi = sorted[sorted.length - 1];
+      const { data, error } = await supabase
+        .from("supplier_reviews")
+        .select("supplier_key,report_date")
+        .in("supplier_key", keys)
+        .gte("report_date", lo)
+        .lte("report_date", hi);
+      if (cancelled) return;
+      if (error) {
+        console.error("Load decision review status:", error);
+        setDecisionReviewedPairSet(new Set());
+        return;
+      }
+      const validPairs = new Set(
+        decisionRecords.map(
+          (r) => `${String(r.supplier_key ?? "").trim()}__${String(r.report_date ?? "").trim().slice(0, 10)}`
+        )
+      );
+      const reviewed = new Set<string>();
+      for (const row of data ?? []) {
+        const d = row.report_date != null ? String(row.report_date).trim().slice(0, 10) : "";
+        const k = `${String(row.supplier_key ?? "").trim()}__${d}`;
+        if (d && validPairs.has(k)) reviewed.add(k);
+      }
+      setDecisionReviewedPairSet(reviewed);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user, isDecisionView, decisionRecords, supabase]);
+
   function requestTableSort(column: TableSortColumn) {
     setTableSortState((prev) => {
       if (prev.mode === "default") {
@@ -618,6 +675,23 @@ export default function DashboardPage() {
         return consolidatedRecords;
     }
   }, [consolidatedRecords, summaryQuickFilter]);
+
+  const tableDecisionRecords = useMemo(() => {
+    if (reviewStatusFilter === "all") return displayDecisionRecords;
+    return displayDecisionRecords.filter((r) => {
+      const pairKey = `${String(r.supplier_key ?? "").trim()}__${String(r.report_date ?? "").trim().slice(0, 10)}`;
+      const isReviewed = pairKey.length > 2 && decisionReviewedPairSet.has(pairKey);
+      return reviewStatusFilter === "reviewed" ? isReviewed : !isReviewed;
+    });
+  }, [displayDecisionRecords, reviewStatusFilter, decisionReviewedPairSet]);
+
+  const tableConsolidatedRecords = useMemo(() => {
+    if (reviewStatusFilter === "all") return displayConsolidatedRecords;
+    if (reviewStatusFilter === "reviewed") {
+      return displayConsolidatedRecords.filter((r) => r.status === "reviewed");
+    }
+    return displayConsolidatedRecords.filter((r) => r.status !== "reviewed");
+  }, [displayConsolidatedRecords, reviewStatusFilter]);
 
   function onSummaryCardClick(filter: SummaryQuickFilter) {
     if (filter === "all") {
@@ -889,9 +963,9 @@ export default function DashboardPage() {
       ];
 
       const keys = Array.from(
-        new Set(displayDecisionRecords.map((r) => String(r.supplier_key ?? "")).filter(Boolean))
+        new Set(tableDecisionRecords.map((r) => String(r.supplier_key ?? "")).filter(Boolean))
       );
-      const dates = Array.from(new Set(displayDecisionRecords.map((r) => String(r.report_date ?? "")).filter(Boolean)));
+      const dates = Array.from(new Set(tableDecisionRecords.map((r) => String(r.report_date ?? "")).filter(Boolean)));
       let allReviews: SupplierReview[] = [];
       if (keys.length > 0 && dates.length > 0) {
         // PostgREST can't do composite IN (supplier_key, report_date), so we overfetch by supplier_key and date bounds
@@ -910,7 +984,7 @@ export default function DashboardPage() {
       }
 
       const wantedPairs = new Set(
-        displayDecisionRecords.map((r) => `${r.supplier_key ?? ""}__${r.report_date ?? ""}`)
+        tableDecisionRecords.map((r) => `${r.supplier_key ?? ""}__${r.report_date ?? ""}`)
       );
       const byPair = new Map<string, SupplierReview[]>();
       for (const rev of allReviews) {
@@ -925,7 +999,7 @@ export default function DashboardPage() {
       }
 
       const rows: unknown[][] = [];
-      for (const r of displayDecisionRecords) {
+      for (const r of tableDecisionRecords) {
         const reportDate = r.report_date ?? "";
         const base = [
           reportDate,
@@ -991,7 +1065,7 @@ export default function DashboardPage() {
       "monitored",
     ];
 
-    const ids = displayConsolidatedRecords.map((r) => r.id);
+    const ids = tableConsolidatedRecords.map((r) => r.id);
     let allReviews: SupplierReview[] = [];
     if (ids.length > 0) {
       const { data, error } = await supabase.from("supplier_reviews").select("*").in("flagged_record_id", ids);
@@ -1013,7 +1087,7 @@ export default function DashboardPage() {
     for (const list of byFlag.values()) list.sort((a, b) => a.created_at.localeCompare(b.created_at));
 
     const rows: unknown[][] = [];
-    for (const r of displayConsolidatedRecords) {
+    for (const r of tableConsolidatedRecords) {
       const normalized = r.created_at.includes("T") ? r.created_at : r.created_at.replace(" ", "T");
       const d = new Date(normalized);
       const reportDate = Number.isNaN(d.getTime()) ? r.created_at.slice(0, 10) : easternDateYmd(d);
@@ -1103,7 +1177,7 @@ export default function DashboardPage() {
           </div>
         )}
         {/* Filters */}
-        <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 mb-6 grid grid-cols-2 md:grid-cols-5 gap-3">
+        <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 mb-6 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
           <div>
             <label className={LABEL}>Date</label>
             <select
@@ -1175,6 +1249,18 @@ export default function DashboardPage() {
               <option value="json_report">JSON Agent</option>
               <option value="ship_tracking">Shipment Agent</option>
               <option value="daily_summary_report">Daily Summary Agent</option>
+            </select>
+          </div>
+          <div>
+            <label className={LABEL}>Review status</label>
+            <select
+              value={reviewStatusFilter}
+              onChange={(e) => setReviewStatusFilter(e.target.value as ReviewStatusFilter)}
+              className={FIELD_FULL}
+            >
+              <option value="all">All</option>
+              <option value="pending">Pending</option>
+              <option value="reviewed">Reviewed</option>
             </select>
           </div>
           <div>
@@ -1343,8 +1429,14 @@ export default function DashboardPage() {
                     No rows match this summary filter. Click the same card again or choose &quot;Flagged Total&quot; to show all.
                   </td>
                 </tr>
+              ) : (isDecisionView ? tableDecisionRecords.length === 0 : tableConsolidatedRecords.length === 0) ? (
+                <tr>
+                  <td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">
+                    No rows match this review status filter. Choose &quot;All&quot; or another option to show rows.
+                  </td>
+                </tr>
               ) : (
-                (isDecisionView ? displayDecisionRecords : displayConsolidatedRecords).map((r) => (
+                (isDecisionView ? tableDecisionRecords : tableConsolidatedRecords).map((r) => (
                   isDecisionView ? (
                     <tr key={(r as DecisionAgentDailyRecord).id} onClick={() => openDecisionDetail(r as DecisionAgentDailyRecord)} className="hover:bg-blue-50 dark:hover:bg-zinc-800 cursor-pointer">
                       <td className="px-4 py-3 text-gray-600 dark:text-zinc-300">{(r as DecisionAgentDailyRecord).report_date ?? "—"}</td>
@@ -1366,11 +1458,22 @@ export default function DashboardPage() {
                         {(r as DecisionAgentDailyRecord).reason ?? ""}
                       </td>
                       <td className="px-4 py-3">
-                        <span className={`inline-flex px-2 py-0.5 rounded text-xs ${
-                          (((r as DecisionAgentDailyRecord).final_score ?? 0) >= 8)
-                            ? "bg-red-100 text-red-700 dark:bg-red-950/50 dark:text-red-300"
-                            : "bg-gray-100 text-gray-700 dark:bg-zinc-800 dark:text-zinc-300"
-                        }`}>{((r as DecisionAgentDailyRecord).final_score ?? 0) >= 8 ? "Critical" : "—"}</span>
+                        {(() => {
+                          const dr = r as DecisionAgentDailyRecord;
+                          const pairKey = `${String(dr.supplier_key ?? "").trim()}__${String(dr.report_date ?? "").trim().slice(0, 10)}`;
+                          const isReviewed = pairKey.length > 2 && decisionReviewedPairSet.has(pairKey);
+                          return (
+                            <span
+                              className={`inline-flex px-2 py-0.5 rounded text-xs ${
+                                isReviewed
+                                  ? "bg-green-100 text-green-700 dark:bg-green-950/50 dark:text-green-300"
+                                  : "bg-orange-100 text-orange-700 dark:bg-orange-950/40 dark:text-orange-300"
+                              }`}
+                            >
+                              {isReviewed ? "Reviewed" : "Pending"}
+                            </span>
+                          );
+                        })()}
                       </td>
                     </tr>
                   ) : (
@@ -1719,28 +1822,29 @@ export default function DashboardPage() {
                       {selectedConsolidatedRecord.overall_risk_score ?? "—"}
                     </div>
                   </div>
-                  <div className="bg-gray-50 dark:bg-zinc-800 rounded-lg border border-gray-200 dark:border-zinc-700 px-3 py-2">
+                  <div
+                    className={`rounded-lg border px-3 py-2 ${
+                      selectedConsolidatedRecord.status === "reviewed"
+                        ? "border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-950/30"
+                        : "border-orange-200 dark:border-orange-800 bg-orange-50 dark:bg-orange-950/25"
+                    }`}
+                  >
                     <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-zinc-400">Review status</div>
-                    <div className="text-lg font-bold text-gray-900 dark:text-zinc-100 capitalize">
-                      {selectedConsolidatedRecord.status?.replace(/_/g, " ") ?? "—"}
+                    <div
+                      className={`text-lg font-bold capitalize ${
+                        selectedConsolidatedRecord.status === "reviewed"
+                          ? "text-green-700 dark:text-green-300"
+                          : "text-orange-700 dark:text-orange-300"
+                      }`}
+                    >
+                      {selectedConsolidatedRecord.status === "reviewed"
+                        ? "Reviewed"
+                        : selectedConsolidatedRecord.status === "pending_review"
+                          ? "Pending"
+                          : (selectedConsolidatedRecord.status?.replace(/_/g, " ") ?? "—")}
                     </div>
                   </div>
                 </div>
-              </div>
-
-              <div className="mb-6">
-                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Flag reasons</h3>
-                {Array.isArray(selectedConsolidatedRecord.reasons) && selectedConsolidatedRecord.reasons.length > 0 ? (
-                  <ul className="list-disc list-inside space-y-1 text-sm text-gray-700 dark:text-zinc-300">
-                    {selectedConsolidatedRecord.reasons.map((reason, i) => (
-                      <li key={i} className="leading-snug">
-                        {reason}
-                      </li>
-                    ))}
-                  </ul>
-                ) : (
-                  <p className="text-sm text-gray-500 dark:text-zinc-400">—</p>
-                )}
               </div>
 
               {(() => {
@@ -1817,6 +1921,21 @@ export default function DashboardPage() {
                   </div>
                 );
               })()}
+
+              <div className="mb-6">
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Flag reasons</h3>
+                {Array.isArray(selectedConsolidatedRecord.reasons) && selectedConsolidatedRecord.reasons.length > 0 ? (
+                  <ul className="list-disc list-inside space-y-1 text-sm text-gray-700 dark:text-zinc-300">
+                    {selectedConsolidatedRecord.reasons.map((reason, i) => (
+                      <li key={i} className="leading-snug">
+                        {reason}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-sm text-gray-500 dark:text-zinc-400">—</p>
+                )}
+              </div>
               </>
               )}
 
