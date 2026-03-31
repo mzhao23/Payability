@@ -5,27 +5,40 @@ import { EASTERN_TZ, easternDateYmd, easternYmdToUtcRange } from "@/lib/eastern-
 import { useRouter } from "next/navigation";
 import { ThemeToggle } from "@/components/ThemeToggle";
 
-type FlaggedRecord = {
+type DecisionAgentDailyRecord = {
+  id: number;
+  supplier_key: string | null;
+  supplier_name: string | null;
+  report_date: string | null; // date (YYYY-MM-DD)
+  final_score: number | null;
+  agent_scores: any; // jsonb
+  history_summary: any; // jsonb
+  resonance_count: number | null;
+  reason: string | null;
+  created_at: string;
+};
+
+type ConsolidatedFlaggedRecord = {
   id: number;
   supplier_key: string;
   supplier_name: string;
   source: string;
   overall_risk_score: number;
   reasons: string[];
-  metrics: any[];
   status: string;
   created_at: string;
-  /** After DB migration to uuid[]: array of reviewer user ids; legacy rows may be a single string. */
-  reviewed_by: string | string[] | null;
-  reviewed_at: string | null;
+  /** Optional jsonb: metrics array or object with nested `metrics` (e.g. daily risk blob). */
+  metrics?: unknown;
 };
 
 type SupplierReview = {
   id: string;
   created_at: string;
   updated_at: string;
-  flagged_record_id: number;
+  flagged_record_id?: number | null;
+  decision_daily_report_id?: number | null;
   supplier_key: string;
+  report_date?: string | null;
   reviewer_id: string;
   reviewer_email: string;
   /** Stored as "True Positive" / "False Positive"; legacy values normalized when editing/displaying. */
@@ -231,12 +244,66 @@ function formatEastern(
 }
 
 const SOURCE_LABELS: Record<string, string> = {
+  decision_agent: "Decision Agent",
   daily_summary_report: "Daily Summary Agent",
   ship_tracking: "Shipment Agent",
   json_report: "JSON Agent",
   health_report: "Health Agent",
-  decision_agent: "Decision Agent",
 };
+
+function labelToAgentKey(label: string): AgentFilterKey | null {
+  const trimmed = String(label ?? "").trim();
+  for (const [k, v] of Object.entries(SOURCE_LABELS)) {
+    if (String(v).trim() === trimmed) return k as AgentFilterKey;
+  }
+  return null;
+}
+
+type AgentFilterKey = "decision_agent" | "daily_summary_report" | "ship_tracking" | "json_report" | "health_report";
+
+/** Sub-agent entries may include optional structured metrics (e.g. daily_summary_report). */
+function agentEntryMetrics(entry: unknown): Record<string, unknown>[] {
+  if (entry == null || typeof entry !== "object") return [];
+  const o = entry as Record<string, unknown>;
+  const raw = o.metrics ?? o.trigger_metrics;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((m): m is Record<string, unknown> => m != null && typeof m === "object");
+}
+
+function formatAgentMetricValue(m: Record<string, unknown>): string {
+  const v = m.value;
+  const unit = m.unit != null ? String(m.unit) : "";
+  if (v == null || v === "") return unit ? `— ${unit}`.trim() : "—";
+  if (typeof v === "number" && Number.isFinite(v)) {
+    const s = unit === "%" ? v.toFixed(2) : String(v);
+    return unit ? `${s} ${unit}` : s;
+  }
+  return unit ? `${String(v)} ${unit}` : String(v);
+}
+
+function metricTriggered(m: Record<string, unknown>): boolean {
+  return m.triggered === true || m.triggered === "true";
+}
+
+function consolidatedReportYmd(record: ConsolidatedFlaggedRecord): string {
+  const normalized = record.created_at.includes("T") ? record.created_at : record.created_at.replace(" ", "T");
+  const d = new Date(normalized);
+  return Number.isNaN(d.getTime()) ? record.created_at.slice(0, 10) : easternDateYmd(d);
+}
+
+/** Top-level metrics array or nested `{ metrics: [...] }` from consolidated_flagged_supplier_list. */
+function consolidatedMetricsRows(record: ConsolidatedFlaggedRecord): Record<string, unknown>[] {
+  const m = record.metrics as unknown;
+  if (Array.isArray(m)) {
+    return m.filter((x): x is Record<string, unknown> => x != null && typeof x === "object");
+  }
+  if (m && typeof m === "object" && Array.isArray((m as Record<string, unknown>).metrics)) {
+    return ((m as Record<string, unknown>).metrics as unknown[]).filter(
+      (x): x is Record<string, unknown> => x != null && typeof x === "object"
+    );
+  }
+  return [];
+}
 
 const FIELD =
   "border border-gray-300 dark:border-zinc-600 rounded text-sm text-gray-900 dark:text-zinc-100 bg-white dark:bg-zinc-800 placeholder:text-gray-600 dark:placeholder:text-zinc-400";
@@ -296,9 +363,21 @@ type TableSortState =
   | { mode: "default" }
   | { mode: "column"; column: TableSortColumn; ascending: boolean; step: 1 | 2 };
 
-type SummaryQuickFilter = "all" | "critical" | "pending_review" | "reviewed";
+type SummaryQuickFilter = "all" | "critical" | "flagged" | "pending_review" | "reviewed";
 
-const TABLE_ORDER_COLUMN: Record<TableSortColumn, string> = {
+/** Narrow table by human review state (Decision: any supplier_reviews row; Consolidated: row status). */
+type ReviewStatusFilter = "all" | "pending" | "reviewed";
+
+const DECISION_TABLE_ORDER_COLUMN: Record<TableSortColumn, string> = {
+  date: "report_date",
+  supplier: "supplier_name",
+  key: "supplier_key",
+  score: "final_score",
+  // In decision_agent_daily_report this is effectively constant in UI.
+  flagged_by: "created_at",
+};
+
+const CONSOLIDATED_TABLE_ORDER_COLUMN: Record<TableSortColumn, string> = {
   date: "created_at",
   supplier: "supplier_name",
   key: "supplier_key",
@@ -357,11 +436,13 @@ function TableSortHeader({
 }
 
 export default function DashboardPage() {
-  const supabase = getSupabaseBrowser();
+  /** Single client for the page lifetime — avoids unstable reference in effect deps (see decision review Set). */
+  const supabase = useMemo(() => getSupabaseBrowser(), []);
   const router = useRouter();
 
   const [user, setUser] = useState<any>(null);
-  const [records, setRecords] = useState<FlaggedRecord[]>([]);
+  const [decisionRecords, setDecisionRecords] = useState<DecisionAgentDailyRecord[]>([]);
+  const [consolidatedRecords, setConsolidatedRecords] = useState<ConsolidatedFlaggedRecord[]>([]);
   const [loading, setLoading] = useState(true);
   const [agentMeta, setAgentMeta] = useState<Record<string, AgentMeta>>({});
 
@@ -369,15 +450,16 @@ export default function DashboardPage() {
   const [dateSingleYmd, setDateSingleYmd] = useState(() => easternDateYmd());
   const [dateRangeStartYmd, setDateRangeStartYmd] = useState(() => easternDateYmd());
   const [dateRangeEndYmd, setDateRangeEndYmd] = useState(() => easternDateYmd());
-  const [sourceFilter, setSourceFilter] = useState("all");
+  const [sourceFilter, setSourceFilter] = useState<AgentFilterKey>("decision_agent");
   const [searchTerm, setSearchTerm] = useState("");
   const [scoreMin, setScoreMin] = useState(1);
   const [scoreMax, setScoreMax] = useState(10);
-  const [statusFilter, setStatusFilter] = useState("all");
   const [tableSortState, setTableSortState] = useState<TableSortState>({ mode: "default" });
   const [summaryQuickFilter, setSummaryQuickFilter] = useState<SummaryQuickFilter>("all");
+  const [reviewStatusFilter, setReviewStatusFilter] = useState<ReviewStatusFilter>("all");
 
-  const [selectedRecord, setSelectedRecord] = useState<FlaggedRecord | null>(null);
+  const [selectedDecisionRecord, setSelectedDecisionRecord] = useState<DecisionAgentDailyRecord | null>(null);
+  const [selectedConsolidatedRecord, setSelectedConsolidatedRecord] = useState<ConsolidatedFlaggedRecord | null>(null);
   const [riskHistory, setRiskHistory] = useState<any[]>([]);
   const [reviewComment, setReviewComment] = useState("");
   const [reviewVerdict, setReviewVerdict] = useState<ReviewVerdict>(VERDICT_TRUE);
@@ -385,13 +467,18 @@ export default function DashboardPage() {
   const [reviewEmailed, setReviewEmailed] = useState(false);
   const [reviewMonitored, setReviewMonitored] = useState(false);
   const [reviewError, setReviewError] = useState("");
+  const [reviewAgentLabel, setReviewAgentLabel] = useState<string>("Decision Agent");
   const [supplierReviews, setSupplierReviews] = useState<SupplierReview[]>([]);
   const [editingReviewId, setEditingReviewId] = useState<string | null>(null);
+  const [agentDetailKey, setAgentDetailKey] = useState<string | null>(null);
   const [hoveredAgent, setHoveredAgent] = useState<string | null>(null);
   const [appRole, setAppRole] = useState<AppRole | null>(null);
+  /** `(supplier_key)__(report_date)` with any supplier_reviews row — Decision table Status. */
+  const [decisionReviewedPairSet, setDecisionReviewedPairSet] = useState<Set<string>>(() => new Set());
 
   const canReview = appRole === "reviewer" || appRole === "admin";
   const isAdmin = appRole === "admin";
+  const isDecisionView = sourceFilter === "decision_agent";
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => {
@@ -427,7 +514,7 @@ export default function DashboardPage() {
 
   useEffect(() => {
     if (user) loadRecords();
-  }, [user, dateMode, dateSingleYmd, dateRangeStartYmd, dateRangeEndYmd, sourceFilter, searchTerm, scoreMin, scoreMax, statusFilter, tableSortState]);
+  }, [user, dateMode, dateSingleYmd, dateRangeStartYmd, dateRangeEndYmd, sourceFilter, searchTerm, scoreMin, scoreMax, tableSortState]);
 
   async function loadAgentMeta() {
     const { data } = await supabase
@@ -440,9 +527,35 @@ export default function DashboardPage() {
 
   const loadRecords = useCallback(async () => {
     setLoading(true);
+    if (sourceFilter === "decision_agent") {
+      let query = supabase
+        .from("decision_agent_daily_report")
+        .select("*")
+        .gte("final_score", scoreMin)
+        .lte("final_score", scoreMax);
+      if (dateMode === "single") {
+        query = query.eq("report_date", dateSingleYmd);
+      } else if (dateMode === "range") {
+        const lo = dateRangeStartYmd <= dateRangeEndYmd ? dateRangeStartYmd : dateRangeEndYmd;
+        const hi = dateRangeStartYmd <= dateRangeEndYmd ? dateRangeEndYmd : dateRangeStartYmd;
+        query = query.gte("report_date", lo).lte("report_date", hi);
+      }
+      if (searchTerm) query = query.or(`supplier_name.ilike.%${searchTerm}%,supplier_key.ilike.%${searchTerm}%`);
+      const { column: orderCol, ascending: orderAsc } = sortStateToQuery(tableSortState);
+      query = query.order(DECISION_TABLE_ORDER_COLUMN[orderCol], { ascending: orderAsc });
+
+      const { data, error } = await query.limit(200);
+      if (error) console.error("Load error:", error);
+      setDecisionRecords((data as DecisionAgentDailyRecord[]) ?? []);
+      setConsolidatedRecords([]);
+      setLoading(false);
+      return;
+    }
+
     let query = supabase
       .from("consolidated_flagged_supplier_list")
       .select("*")
+      .eq("source", sourceFilter)
       .gte("overall_risk_score", scoreMin)
       .lte("overall_risk_score", scoreMax);
     if (dateMode === "single") {
@@ -452,18 +565,76 @@ export default function DashboardPage() {
       const { startIso, endIso } = easternYmdRangeToUtcBounds(dateRangeStartYmd, dateRangeEndYmd);
       query = query.gte("created_at", startIso).lte("created_at", endIso);
     }
-    const { column: orderCol, ascending: orderAsc } = sortStateToQuery(tableSortState);
-    query = query.order(TABLE_ORDER_COLUMN[orderCol], { ascending: orderAsc });
-
-    if (sourceFilter !== "all") query = query.eq("source", sourceFilter);
-    if (statusFilter !== "all") query = query.eq("status", statusFilter);
     if (searchTerm) query = query.or(`supplier_name.ilike.%${searchTerm}%,supplier_key.ilike.%${searchTerm}%`);
+    const { column: orderCol, ascending: orderAsc } = sortStateToQuery(tableSortState);
+    query = query.order(CONSOLIDATED_TABLE_ORDER_COLUMN[orderCol], { ascending: orderAsc });
 
     const { data, error } = await query.limit(200);
     if (error) console.error("Load error:", error);
-    setRecords((data as FlaggedRecord[]) ?? []);
+    setConsolidatedRecords((data as ConsolidatedFlaggedRecord[]) ?? []);
+    setDecisionRecords([]);
     setLoading(false);
-  }, [dateMode, dateSingleYmd, dateRangeStartYmd, dateRangeEndYmd, sourceFilter, searchTerm, scoreMin, scoreMax, statusFilter, tableSortState]);
+  }, [
+    dateMode,
+    dateSingleYmd,
+    dateRangeStartYmd,
+    dateRangeEndYmd,
+    sourceFilter,
+    searchTerm,
+    scoreMin,
+    scoreMax,
+    tableSortState,
+  ]);
+
+  useEffect(() => {
+    if (!user || !isDecisionView || decisionRecords.length === 0) {
+      setDecisionReviewedPairSet(new Set());
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const keys = Array.from(
+        new Set(decisionRecords.map((r) => String(r.supplier_key ?? "").trim()).filter(Boolean))
+      );
+      const dates = Array.from(
+        new Set(decisionRecords.map((r) => String(r.report_date ?? "").trim()).filter(Boolean))
+      );
+      if (keys.length === 0 || dates.length === 0) {
+        if (!cancelled) setDecisionReviewedPairSet(new Set());
+        return;
+      }
+      const sorted = dates.slice().sort();
+      const lo = sorted[0];
+      const hi = sorted[sorted.length - 1];
+      const { data, error } = await supabase
+        .from("supplier_reviews")
+        .select("supplier_key,report_date")
+        .in("supplier_key", keys)
+        .gte("report_date", lo)
+        .lte("report_date", hi);
+      if (cancelled) return;
+      if (error) {
+        console.error("Load decision review status:", error);
+        setDecisionReviewedPairSet(new Set());
+        return;
+      }
+      const validPairs = new Set(
+        decisionRecords.map(
+          (r) => `${String(r.supplier_key ?? "").trim()}__${String(r.report_date ?? "").trim().slice(0, 10)}`
+        )
+      );
+      const reviewed = new Set<string>();
+      for (const row of data ?? []) {
+        const d = row.report_date != null ? String(row.report_date).trim().slice(0, 10) : "";
+        const k = `${String(row.supplier_key ?? "").trim()}__${d}`;
+        if (d && validPairs.has(k)) reviewed.add(k);
+      }
+      setDecisionReviewedPairSet(reviewed);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user, isDecisionView, decisionRecords, supabase]);
 
   function requestTableSort(column: TableSortColumn) {
     setTableSortState((prev) => {
@@ -483,18 +654,57 @@ export default function DashboardPage() {
     });
   }
 
-  const displayRecords = useMemo(() => {
+  const displayDecisionRecords = useMemo(() => {
+    const anyFlagged = (r: DecisionAgentDailyRecord) => {
+      const a = r.agent_scores as any;
+      if (!a || typeof a !== "object") return false;
+      return Object.values(a).some((v: any) => Boolean(v?.flagged));
+    };
+    const hasHumanReview = (r: DecisionAgentDailyRecord) => {
+      const pairKey = `${String(r.supplier_key ?? "").trim()}__${String(r.report_date ?? "").trim().slice(0, 10)}`;
+      return pairKey.length > 2 && decisionReviewedPairSet.has(pairKey);
+    };
     switch (summaryQuickFilter) {
       case "critical":
-        return records.filter((r) => r.overall_risk_score >= 8);
-      case "pending_review":
-        return records.filter((r) => r.status === "pending_review");
+        return decisionRecords.filter((r) => (r.final_score ?? 0) >= 8);
+      case "flagged":
+        return decisionRecords.filter(anyFlagged);
       case "reviewed":
-        return records.filter((r) => r.status === "reviewed");
+        return decisionRecords.filter(hasHumanReview);
       default:
-        return records;
+        return decisionRecords;
     }
-  }, [records, summaryQuickFilter]);
+  }, [decisionRecords, summaryQuickFilter, decisionReviewedPairSet]);
+
+  const displayConsolidatedRecords = useMemo(() => {
+    switch (summaryQuickFilter) {
+      case "critical":
+        return consolidatedRecords.filter((r) => r.overall_risk_score >= 8);
+      case "pending_review":
+        return consolidatedRecords.filter((r) => r.status === "pending_review");
+      case "reviewed":
+        return consolidatedRecords.filter((r) => r.status === "reviewed");
+      default:
+        return consolidatedRecords;
+    }
+  }, [consolidatedRecords, summaryQuickFilter]);
+
+  const tableDecisionRecords = useMemo(() => {
+    if (reviewStatusFilter === "all") return displayDecisionRecords;
+    return displayDecisionRecords.filter((r) => {
+      const pairKey = `${String(r.supplier_key ?? "").trim()}__${String(r.report_date ?? "").trim().slice(0, 10)}`;
+      const isReviewed = pairKey.length > 2 && decisionReviewedPairSet.has(pairKey);
+      return reviewStatusFilter === "reviewed" ? isReviewed : !isReviewed;
+    });
+  }, [displayDecisionRecords, reviewStatusFilter, decisionReviewedPairSet]);
+
+  const tableConsolidatedRecords = useMemo(() => {
+    if (reviewStatusFilter === "all") return displayConsolidatedRecords;
+    if (reviewStatusFilter === "reviewed") {
+      return displayConsolidatedRecords.filter((r) => r.status === "reviewed");
+    }
+    return displayConsolidatedRecords.filter((r) => r.status !== "reviewed");
+  }, [displayConsolidatedRecords, reviewStatusFilter]);
 
   function onSummaryCardClick(filter: SummaryQuickFilter) {
     if (filter === "all") {
@@ -515,16 +725,46 @@ export default function DashboardPage() {
   }
 
   function closeDetail() {
-    setSelectedRecord(null);
+    setSelectedDecisionRecord(null);
+    setSelectedConsolidatedRecord(null);
     setSupplierReviews([]);
     resetReviewForm();
+    setAgentDetailKey(null);
   }
 
-  async function loadReviewsForFlag(flaggedRecordId: number) {
+  async function loadReviewsForDecisionRecord(record: DecisionAgentDailyRecord) {
+    // Preferred: link by decision_daily_report_id (new schema).
+    // Fallback: legacy rows keyed by (supplier_key, report_date).
+    const supplierKey = record.supplier_key ?? "";
+    const reportDate = record.report_date ?? "";
+
+    const base = supabase.from("supplier_reviews").select("*").order("created_at", { ascending: true });
+    const q =
+      typeof record.id === "number" && Number.isFinite(record.id)
+        ? base.eq("decision_daily_report_id", record.id)
+        : supplierKey && reportDate
+          ? base.eq("supplier_key", supplierKey).eq("report_date", reportDate)
+          : null;
+
+    if (!q) {
+      setSupplierReviews([]);
+      return;
+    }
+
+    const { data, error } = await q;
+    if (error) {
+      console.error("Load reviews error:", error);
+      setSupplierReviews([]);
+      return;
+    }
+    setSupplierReviews((data as SupplierReview[]) ?? []);
+  }
+
+  async function loadReviewsForConsolidatedRecord(record: ConsolidatedFlaggedRecord) {
     const { data, error } = await supabase
       .from("supplier_reviews")
       .select("*")
-      .eq("flagged_record_id", flaggedRecordId)
+      .eq("flagged_record_id", record.id)
       .order("created_at", { ascending: true });
     if (error) {
       console.error("Load reviews error:", error);
@@ -534,63 +774,26 @@ export default function DashboardPage() {
     setSupplierReviews((data as SupplierReview[]) ?? []);
   }
 
-  /** Set consolidated row from actual supplier_reviews (distinct reviewer_id). Requires reviewed_by uuid[]. */
-  async function syncConsolidatedReviewersFromReviews(flaggedRecordId: number) {
-    const { data: rows, error } = await supabase
-      .from("supplier_reviews")
-      .select("reviewer_id")
-      .eq("flagged_record_id", flaggedRecordId);
-    if (error) {
-      console.error("Sync reviewers error:", error);
-      return;
-    }
-    const ids = Array.from(new Set((rows ?? []).map((r) => String(r.reviewer_id)).filter(Boolean)));
-    if (ids.length === 0) {
-      const { error: uerr } = await supabase
-        .from("consolidated_flagged_supplier_list")
-        .update({
-          status: "pending_review",
-          reviewed_by: null,
-          reviewed_at: null,
-        })
-        .eq("id", flaggedRecordId);
-      if (uerr) console.error("Consolidated update error:", uerr);
-    } else {
-      const { error: uerr } = await supabase
-        .from("consolidated_flagged_supplier_list")
-        .update({
-          status: "reviewed",
-          reviewed_by: ids,
-          reviewed_at: new Date().toISOString(),
-        })
-        .eq("id", flaggedRecordId);
-      if (uerr) console.error("Consolidated update error:", uerr);
-    }
-
-    const { data: updatedRow, error: refetchError } = await supabase
-      .from("consolidated_flagged_supplier_list")
-      .select("*")
-      .eq("id", flaggedRecordId)
-      .single();
-    if (!refetchError && updatedRow) {
-      setSelectedRecord((prev) => (prev?.id === flaggedRecordId ? (updatedRow as FlaggedRecord) : prev));
-    }
-  }
-
-  async function openDetail(record: FlaggedRecord) {
-    setSelectedRecord(record);
+  async function openDecisionDetail(record: DecisionAgentDailyRecord) {
+    setSelectedDecisionRecord(record);
+    setSelectedConsolidatedRecord(null);
     setSupplierReviews([]);
     resetReviewForm();
+    setReviewAgentLabel("Decision Agent");
 
-    await loadReviewsForFlag(record.id);
+    await loadReviewsForDecisionRecord(record);
+    setRiskHistory([]);
+  }
 
-    const { data } = await supabase
-      .from("consolidated_flagged_supplier_list")
-      .select("overall_risk_score, source, created_at")
-      .eq("supplier_key", record.supplier_key)
-      .order("created_at", { ascending: true })
-      .limit(50);
-    setRiskHistory(data ?? []);
+  async function openConsolidatedDetail(record: ConsolidatedFlaggedRecord) {
+    setSelectedConsolidatedRecord(record);
+    setSelectedDecisionRecord(null);
+    setSupplierReviews([]);
+    resetReviewForm();
+    setReviewAgentLabel(SOURCE_LABELS[record.source] ?? record.source);
+    setAgentDetailKey(null);
+    setRiskHistory([]);
+    await loadReviewsForConsolidatedRecord(record);
   }
 
   function validateReviewFields() {
@@ -622,10 +825,14 @@ export default function DashboardPage() {
     setReviewSuspended(r.suspended);
     setReviewEmailed(r.emailed);
     setReviewMonitored(r.monitored);
+    setReviewAgentLabel(r.source?.trim() ? r.source : "Decision Agent");
   }
 
   async function saveReviewEdit() {
-    if (!selectedRecord || !user || !editingReviewId) return;
+    if (!user || !editingReviewId) return;
+    const decisionRec = selectedDecisionRecord;
+    const consRec = selectedConsolidatedRecord;
+    if (!decisionRec && !consRec) return;
     setReviewError("");
     if (!canReview) {
       setReviewError(NO_PERMISSION);
@@ -633,11 +840,21 @@ export default function DashboardPage() {
     }
     if (!validateReviewFields()) return;
 
+    const supplierKey = decisionRec ? (decisionRec.supplier_key ?? "") : consRec!.supplier_key;
+    const reportDate = decisionRec ? (decisionRec.report_date ?? "") : consolidatedReportYmd(consRec!);
+    if (!supplierKey || !reportDate) {
+      setReviewError("Missing supplier_key or report_date for this record.");
+      return;
+    }
+
     let q = supabase
       .from("supplier_reviews")
       .update({
         verdict: reviewVerdict,
         comment: reviewComment,
+        source: reviewAgentLabel,
+        supplier_key: supplierKey,
+        report_date: reportDate,
         suspended: reviewSuspended,
         emailed: reviewEmailed,
         monitored: reviewMonitored,
@@ -656,12 +873,15 @@ export default function DashboardPage() {
       return;
     }
 
-    await loadReviewsForFlag(selectedRecord.id);
+    if (decisionRec) await loadReviewsForDecisionRecord(decisionRec);
+    else await loadReviewsForConsolidatedRecord(consRec!);
     resetReviewForm();
   }
 
   async function deleteReview(review: SupplierReview) {
-    if (!selectedRecord || !user) return;
+    if (!user || (!selectedDecisionRecord && !selectedConsolidatedRecord)) return;
+    const decisionRec = selectedDecisionRecord;
+    const consRec = selectedConsolidatedRecord;
     setReviewError("");
     if (!canReview) {
       setReviewError(NO_PERMISSION);
@@ -680,51 +900,205 @@ export default function DashboardPage() {
       return;
     }
     if (editingReviewId === review.id) resetReviewForm();
-    await loadReviewsForFlag(selectedRecord.id);
-    await syncConsolidatedReviewersFromReviews(selectedRecord.id);
+    if (decisionRec) await loadReviewsForDecisionRecord(decisionRec);
+    else if (consRec) await loadReviewsForConsolidatedRecord(consRec);
     loadRecords();
   }
 
   async function submitReview() {
-    if (!selectedRecord || !user || editingReviewId) return;
+    if (!user || editingReviewId) return;
+    const decisionRec = selectedDecisionRecord;
+    const consRec = selectedConsolidatedRecord;
+    if (!decisionRec && !consRec) return;
 
     setReviewError("");
     if (!canReview) {
       setReviewError(NO_PERMISSION);
       return;
     }
-    if (supplierReviews.some((r) => sameReviewerId(r.reviewer_id, user.id))) {
-      setReviewError("You already have a review for this flag. Edit or delete it first.");
+    if (consRec) {
+      if (supplierReviews.some((r) => sameReviewerId(r.reviewer_id, user.id))) {
+        setReviewError("You already submitted a review for this flag. Edit or delete it first.");
+        return;
+      }
+    } else if (
+      supplierReviews.some((r) => sameReviewerId(r.reviewer_id, user.id) && (r.source ?? "").trim() === reviewAgentLabel)
+    ) {
+      setReviewError("You already have a review for this agent. Edit or delete it first.");
       return;
     }
     if (!validateReviewFields()) return;
 
-    const { error: insertError } = await supabase.from("supplier_reviews").insert({
-      flagged_record_id: selectedRecord.id,
-      supplier_key: selectedRecord.supplier_key,
+    const supplierKey = decisionRec ? (decisionRec.supplier_key ?? "") : consRec!.supplier_key;
+    const reportDate = decisionRec ? (decisionRec.report_date ?? "") : consolidatedReportYmd(consRec!);
+    if (!supplierKey || !reportDate) {
+      setReviewError("Missing supplier_key or report_date for this record.");
+      return;
+    }
+
+    // If Decision detail is reviewing a sub-agent, also attach the consolidated parent id in the same row
+    // (schema: at-least-one-parent, allows both).
+    let consolidatedFlagId: number | null = null;
+    if (decisionRec) {
+      const agentKey = labelToAgentKey(reviewAgentLabel);
+      if (agentKey && agentKey !== "decision_agent") {
+        const ymd = String(decisionRec.report_date ?? "").trim().slice(0, 10);
+        const supplierKey2 = String(decisionRec.supplier_key ?? "").trim();
+        if (ymd && supplierKey2) {
+          const { startIso, endIso } = easternYmdToUtcRange(ymd);
+          const { data: consRow } = await supabase
+            .from("consolidated_flagged_supplier_list")
+            .select("id")
+            .eq("supplier_key", supplierKey2)
+            .eq("source", agentKey)
+            .gte("created_at", startIso)
+            .lte("created_at", endIso)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle();
+          if (consRow?.id) consolidatedFlagId = Number(consRow.id);
+        }
+      }
+    }
+
+    const insertRow: Record<string, unknown> = {
+      supplier_key: supplierKey,
+      report_date: reportDate,
       reviewer_id: user.id,
       reviewer_email: user.email,
       verdict: reviewVerdict,
       comment: reviewComment,
-      source: selectedRecord.source,
+      source: reviewAgentLabel,
       suspended: reviewSuspended,
       emailed: reviewEmailed,
       monitored: reviewMonitored,
-    });
+    };
+    if (consRec) {
+      insertRow.flagged_record_id = consRec.id;
+      insertRow.decision_daily_report_id = null;
+    } else if (decisionRec) {
+      insertRow.decision_daily_report_id = decisionRec.id;
+      insertRow.flagged_record_id = consolidatedFlagId;
+    }
+
+    const { error: insertError } = await supabase.from("supplier_reviews").insert(insertRow);
 
     if (insertError) {
       setReviewError(mapSupabasePermissionError(insertError));
       return;
     }
 
-    await syncConsolidatedReviewersFromReviews(selectedRecord.id);
-
-    await loadReviewsForFlag(selectedRecord.id);
+    if (decisionRec) await loadReviewsForDecisionRecord(decisionRec);
+    else await loadReviewsForConsolidatedRecord(consRec!);
     resetReviewForm();
     loadRecords();
   }
 
   async function exportCSV() {
+    if (isDecisionView) {
+      const headers = [
+        "Report Date",
+        "Supplier Key",
+        "Supplier Name",
+        "Risk Score",
+        "Decision Agent Score",
+        "Resonance Count",
+        "Reason",
+        "reviewed_by",
+        "reviewed_date",
+        "verdict",
+        "comment",
+        "suspended",
+        "emailed",
+        "monitored",
+      ];
+
+      const keys = Array.from(
+        new Set(tableDecisionRecords.map((r) => String(r.supplier_key ?? "")).filter(Boolean))
+      );
+      const dates = Array.from(new Set(tableDecisionRecords.map((r) => String(r.report_date ?? "")).filter(Boolean)));
+      let allReviews: SupplierReview[] = [];
+      if (keys.length > 0 && dates.length > 0) {
+        // PostgREST can't do composite IN (supplier_key, report_date), so we overfetch by supplier_key and date bounds
+        // then filter in-memory.
+        const lo = dates.slice().sort()[0];
+        const hi = dates.slice().sort().slice(-1)[0];
+        let q = supabase.from("supplier_reviews").select("*").in("supplier_key", keys);
+        q = q.gte("report_date", lo).lte("report_date", hi);
+        const { data, error } = await q;
+        if (error) {
+          console.error("Export reviews error:", error);
+          window.alert("Could not load reviews for export. Please try again.");
+          return;
+        }
+        allReviews = (data as SupplierReview[]) ?? [];
+      }
+
+      const wantedPairs = new Set(
+        tableDecisionRecords.map((r) => `${r.supplier_key ?? ""}__${r.report_date ?? ""}`)
+      );
+      const byPair = new Map<string, SupplierReview[]>();
+      for (const rev of allReviews) {
+        const pairKey = `${String((rev as any).supplier_key ?? "")}__${String((rev as any).report_date ?? "")}`;
+        if (!wantedPairs.has(pairKey)) continue;
+        const list = byPair.get(pairKey);
+        if (list) list.push(rev);
+        else byPair.set(pairKey, [rev]);
+      }
+      for (const list of byPair.values()) {
+        list.sort((a, b) => a.created_at.localeCompare(b.created_at));
+      }
+
+      const rows: unknown[][] = [];
+      for (const r of tableDecisionRecords) {
+        const reportDate = r.report_date ?? "";
+        const base = [
+          reportDate,
+          r.supplier_key ?? "",
+          r.supplier_name ?? "",
+          r.final_score ?? "",
+          r.final_score ?? "",
+          r.resonance_count ?? "",
+          r.reason ?? "",
+        ];
+        const pairKey = `${r.supplier_key ?? ""}__${r.report_date ?? ""}`;
+        const reviews = byPair.get(pairKey) ?? [];
+        if (reviews.length === 0) {
+          rows.push([...base, "", "", "", "", "false", "false", "false"]);
+        } else {
+          for (const rev of reviews) {
+            rows.push([
+              ...base,
+              rev.reviewer_email,
+              formatEastern(rev.created_at),
+              normalizeVerdictFromDb(rev.verdict),
+              rev.comment?.trim() ? rev.comment : "",
+              rev.suspended ? "true" : "false",
+              rev.emailed ? "true" : "false",
+              rev.monitored ? "true" : "false",
+            ]);
+          }
+        }
+      }
+
+      const csv = [headers, ...rows].map((row) => row.map(csvEscapeCell).join(",")).join("\n");
+      const blob = new Blob([csv], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const dateSuffix =
+        dateMode === "all"
+          ? "all_dates"
+          : dateMode === "single"
+            ? dateSingleYmd
+            : `${dateRangeStartYmd}_to_${dateRangeEndYmd}`;
+      a.download = `flagged_suppliers_${dateSuffix}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+      return;
+    }
+
+    // Consolidated export (one row per review; falls back to a single empty-review row).
     const headers = [
       "Report Date",
       "Supplier Key",
@@ -742,7 +1116,7 @@ export default function DashboardPage() {
       "monitored",
     ];
 
-    const ids = displayRecords.map((r) => r.id);
+    const ids = tableConsolidatedRecords.map((r) => r.id);
     let allReviews: SupplierReview[] = [];
     if (ids.length > 0) {
       const { data, error } = await supabase.from("supplier_reviews").select("*").in("flagged_record_id", ids);
@@ -753,20 +1127,18 @@ export default function DashboardPage() {
       }
       allReviews = (data as SupplierReview[]) ?? [];
     }
-
     const byFlag = new Map<number, SupplierReview[]>();
     for (const rev of allReviews) {
-      const fid = rev.flagged_record_id;
+      const fid = Number((rev as any).flagged_record_id);
+      if (!Number.isFinite(fid)) continue;
       const list = byFlag.get(fid);
       if (list) list.push(rev);
       else byFlag.set(fid, [rev]);
     }
-    for (const list of byFlag.values()) {
-      list.sort((a, b) => a.created_at.localeCompare(b.created_at));
-    }
+    for (const list of byFlag.values()) list.sort((a, b) => a.created_at.localeCompare(b.created_at));
 
     const rows: unknown[][] = [];
-    for (const r of displayRecords) {
+    for (const r of tableConsolidatedRecords) {
       const normalized = r.created_at.includes("T") ? r.created_at : r.created_at.replace(" ", "T");
       const d = new Date(normalized);
       const reportDate = Number.isNaN(d.getTime()) ? r.created_at.slice(0, 10) : easternDateYmd(d);
@@ -809,7 +1181,7 @@ export default function DashboardPage() {
         : dateMode === "single"
           ? dateSingleYmd
           : `${dateRangeStartYmd}_to_${dateRangeEndYmd}`;
-    a.download = `flagged_suppliers_${dateSuffix}.csv`;
+    a.download = `flagged_suppliers_consolidated_${sourceFilter}_${dateSuffix}.csv`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -819,10 +1191,19 @@ export default function DashboardPage() {
     router.push("/login");
   }
 
+  const hasMyReview = useMemo(() => {
+    if (!user?.id) return false;
+    if (selectedConsolidatedRecord) {
+      return supplierReviews.some((r) => sameReviewerId(r.reviewer_id, user.id));
+    }
+    return supplierReviews.some(
+      (r) => sameReviewerId(r.reviewer_id, user.id) && (r.source ?? "").trim() === reviewAgentLabel.trim()
+    );
+  }, [user, supplierReviews, reviewAgentLabel, selectedConsolidatedRecord]);
+
   if (!user || appRole === null) return null;
 
   const sortQuery = sortStateToQuery(tableSortState);
-  const hasMyReview = supplierReviews.some((r) => sameReviewerId(r.reviewer_id, user.id));
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-zinc-950">
@@ -847,7 +1228,7 @@ export default function DashboardPage() {
           </div>
         )}
         {/* Filters */}
-        <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 mb-6 grid grid-cols-2 md:grid-cols-6 gap-3">
+        <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 mb-6 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
           <div>
             <label className={LABEL}>Date</label>
             <select
@@ -912,12 +1293,25 @@ export default function DashboardPage() {
           </div>
           <div>
             <label className={LABEL}>Agent</label>
-            <select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)}
+            <select value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value as AgentFilterKey)}
               className={FIELD_FULL}>
-              <option value="all">All Agents</option>
-              {Object.entries(SOURCE_LABELS).map(([key, label]) => (
-                <option key={key} value={key}>{label}</option>
-              ))}
+              <option value="decision_agent">Decision Agent</option>
+              <option value="health_report">Health Agent</option>
+              <option value="json_report">JSON Agent</option>
+              <option value="ship_tracking">Shipment Agent</option>
+              <option value="daily_summary_report">Daily Summary Agent</option>
+            </select>
+          </div>
+          <div>
+            <label className={LABEL}>Review status</label>
+            <select
+              value={reviewStatusFilter}
+              onChange={(e) => setReviewStatusFilter(e.target.value as ReviewStatusFilter)}
+              className={FIELD_FULL}
+            >
+              <option value="all">All</option>
+              <option value="pending">Pending</option>
+              <option value="reviewed">Reviewed</option>
             </select>
           </div>
           <div>
@@ -937,15 +1331,6 @@ export default function DashboardPage() {
                 onChange={(e) => setScoreMax(Number(e.target.value))}
                 className={FIELD_NARROW} />
             </div>
-          </div>
-          <div>
-            <label className={LABEL}>Status</label>
-            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}
-              className={FIELD_FULL}>
-              <option value="all">All</option>
-              <option value="pending_review">Pending Review</option>
-              <option value="reviewed">Reviewed</option>
-            </select>
           </div>
           <div className="flex items-end">
             <button
@@ -970,7 +1355,9 @@ export default function DashboardPage() {
                 : ""
             }`}
           >
-            <div className="text-2xl font-bold text-gray-900 dark:text-zinc-100">{records.length}</div>
+            <div className="text-2xl font-bold text-gray-900 dark:text-zinc-100">
+              {isDecisionView ? decisionRecords.length : consolidatedRecords.length}
+            </div>
             <div className="text-xs text-gray-500 dark:text-zinc-400">Flagged Total</div>
           </button>
           <button
@@ -984,24 +1371,34 @@ export default function DashboardPage() {
             }`}
           >
             <div className="text-2xl font-bold text-red-600 dark:text-red-400">
-              {records.filter((r) => r.overall_risk_score >= 8).length}
+              {isDecisionView
+                ? decisionRecords.filter((r) => (r.final_score ?? 0) >= 8).length
+                : consolidatedRecords.filter((r) => r.overall_risk_score >= 8).length}
             </div>
             <div className="text-xs text-gray-500 dark:text-zinc-400">Critical (8-10)</div>
           </button>
           <button
             type="button"
-            onClick={() => onSummaryCardClick("pending_review")}
-            aria-pressed={summaryQuickFilter === "pending_review"}
+            onClick={() => onSummaryCardClick(isDecisionView ? "flagged" : "pending_review")}
+            aria-pressed={summaryQuickFilter === (isDecisionView ? "flagged" : "pending_review")}
             className={`rounded-lg shadow border p-4 text-center cursor-pointer transition w-full bg-white dark:bg-zinc-900 border-gray-200 dark:border-zinc-800 hover:bg-gray-50 dark:hover:bg-zinc-800/80 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 ${
-              summaryQuickFilter === "pending_review"
+              summaryQuickFilter === (isDecisionView ? "flagged" : "pending_review")
                 ? "ring-2 ring-blue-600 ring-offset-2 ring-offset-gray-50 dark:ring-blue-400 dark:ring-offset-zinc-950"
                 : ""
             }`}
           >
             <div className="text-2xl font-bold text-yellow-600 dark:text-yellow-500">
-              {records.filter((r) => r.status === "pending_review").length}
+              {isDecisionView
+                ? decisionRecords.filter((r) => {
+                    const a = r.agent_scores as any;
+                    if (!a || typeof a !== "object") return false;
+                    return Object.values(a).some((v: any) => Boolean(v?.flagged));
+                  }).length
+                : consolidatedRecords.filter((r) => r.status === "pending_review").length}
             </div>
-            <div className="text-xs text-gray-500 dark:text-zinc-400">Pending Review</div>
+            <div className="text-xs text-gray-500 dark:text-zinc-400">
+              {isDecisionView ? "Flagged (any agent)" : "Pending Review"}
+            </div>
           </button>
           <button
             type="button"
@@ -1014,7 +1411,12 @@ export default function DashboardPage() {
             }`}
           >
             <div className="text-2xl font-bold text-green-600 dark:text-green-400">
-              {records.filter((r) => r.status === "reviewed").length}
+              {isDecisionView
+                ? decisionRecords.filter((r) => {
+                    const pairKey = `${String(r.supplier_key ?? "").trim()}__${String(r.report_date ?? "").trim().slice(0, 10)}`;
+                    return pairKey.length > 2 && decisionReviewedPairSet.has(pairKey);
+                  }).length
+                : consolidatedRecords.filter((r) => r.status === "reviewed").length}
             </div>
             <div className="text-xs text-gray-500 dark:text-zinc-400">Reviewed</div>
           </button>
@@ -1067,53 +1469,102 @@ export default function DashboardPage() {
             <tbody className="divide-y divide-gray-200 dark:divide-zinc-700">
               {loading ? (
                 <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">Loading...</td></tr>
-              ) : records.length === 0 ? (
+              ) : (isDecisionView ? decisionRecords.length === 0 : consolidatedRecords.length === 0) ? (
                 <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">No records found</td></tr>
-              ) : displayRecords.length === 0 ? (
+              ) : (isDecisionView ? displayDecisionRecords.length === 0 : displayConsolidatedRecords.length === 0) ? (
                 <tr>
                   <td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">
                     No rows match this summary filter. Click the same card again or choose &quot;Flagged Total&quot; to show all.
                   </td>
                 </tr>
+              ) : (isDecisionView ? tableDecisionRecords.length === 0 : tableConsolidatedRecords.length === 0) ? (
+                <tr>
+                  <td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">
+                    No rows match this review status filter. Choose &quot;All&quot; or another option to show rows.
+                  </td>
+                </tr>
               ) : (
-                displayRecords.map((r) => (
-                  <tr key={r.id} onClick={() => openDetail(r)} className="hover:bg-blue-50 dark:hover:bg-zinc-800 cursor-pointer">
-                    <td className="px-4 py-3 text-gray-600 dark:text-zinc-300">{formatEastern(r.created_at)}</td>
-                    <td className="px-4 py-3 font-medium text-gray-900 dark:text-zinc-100">{r.supplier_name}</td>
-                    <td className="px-4 py-3 text-gray-500 dark:text-zinc-400 font-mono text-xs">{r.supplier_key.slice(0, 8)}...</td>
-                    <td className="px-4 py-3">
-                      <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-bold ${
-                        r.overall_risk_score >= 8 ? "bg-red-100 text-red-800 dark:bg-red-950/50 dark:text-red-300" :
-                        r.overall_risk_score >= 5 ? "bg-yellow-100 text-yellow-800 dark:bg-yellow-950/40 dark:text-yellow-300" :
-                        "bg-green-100 text-green-800 dark:bg-green-950/50 dark:text-green-300"
-                      }`}>{r.overall_risk_score}</span>
-                    </td>
-                    <td className="px-4 py-3 relative">
-                      <span className="text-blue-600 dark:text-blue-400 underline cursor-help"
-                        onMouseEnter={() => setHoveredAgent(r.source)}
-                        onMouseLeave={() => setHoveredAgent(null)}>
-                        {SOURCE_LABELS[r.source] ?? r.source}
-                      </span>
-                      {hoveredAgent === r.source && agentMeta[r.source] && (
-                        <div className="absolute z-50 bg-gray-900 text-white p-3 rounded-lg text-xs w-72 left-0 top-full mt-1 shadow-lg">
-                          <div className="font-bold mb-1">{agentMeta[r.source].display_name}</div>
-                          <div className="mb-1">{agentMeta[r.source].description}</div>
-                          <div className="text-gray-300">Rules: {agentMeta[r.source].active_rules}</div>
-                          <div className="text-gray-400 mt-1">Updated: {formatEastern(agentMeta[r.source].last_updated)}</div>
-                        </div>
-                      )}
-                    </td>
-                    <td className="px-4 py-3 text-gray-600 dark:text-zinc-300 text-xs max-w-xs truncate">
-                      {Array.isArray(r.reasons) ? r.reasons[0] : ""}
-                    </td>
-                    <td className="px-4 py-3">
-                      <span className={`inline-flex px-2 py-0.5 rounded text-xs ${
-                        r.status === "reviewed"
-                          ? "bg-green-100 text-green-700 dark:bg-green-950/50 dark:text-green-300"
-                          : "bg-orange-100 text-orange-700 dark:bg-orange-950/40 dark:text-orange-300"
-                      }`}>{r.status === "reviewed" ? "Reviewed" : "Pending"}</span>
-                    </td>
-                  </tr>
+                (isDecisionView ? tableDecisionRecords : tableConsolidatedRecords).map((r) => (
+                  isDecisionView ? (
+                    <tr key={(r as DecisionAgentDailyRecord).id} onClick={() => openDecisionDetail(r as DecisionAgentDailyRecord)} className="hover:bg-blue-50 dark:hover:bg-zinc-800 cursor-pointer">
+                      <td className="px-4 py-3 text-gray-600 dark:text-zinc-300">{(r as DecisionAgentDailyRecord).report_date ?? "—"}</td>
+                      <td className="px-4 py-3 font-medium text-gray-900 dark:text-zinc-100">{(r as DecisionAgentDailyRecord).supplier_name ?? "—"}</td>
+                      <td className="px-4 py-3 text-gray-500 dark:text-zinc-400 font-mono text-xs">
+                        {String((r as DecisionAgentDailyRecord).supplier_key ?? "").slice(0, 8)}{(r as DecisionAgentDailyRecord).supplier_key ? "..." : ""}
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-bold ${
+                          (((r as DecisionAgentDailyRecord).final_score ?? 0) >= 8) ? "bg-red-100 text-red-800 dark:bg-red-950/50 dark:text-red-300" :
+                          (((r as DecisionAgentDailyRecord).final_score ?? 0) >= 5) ? "bg-yellow-100 text-yellow-800 dark:bg-yellow-950/40 dark:text-yellow-300" :
+                          "bg-green-100 text-green-800 dark:bg-green-950/50 dark:text-green-300"
+                        }`}>{(r as DecisionAgentDailyRecord).final_score ?? "—"}</span>
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className="text-gray-700 dark:text-zinc-200 text-xs font-medium">Decision Agent</span>
+                      </td>
+                      <td className="px-4 py-3 text-gray-600 dark:text-zinc-300 text-xs max-w-xs truncate">
+                        {(r as DecisionAgentDailyRecord).reason ?? ""}
+                      </td>
+                      <td className="px-4 py-3">
+                        {(() => {
+                          const dr = r as DecisionAgentDailyRecord;
+                          const pairKey = `${String(dr.supplier_key ?? "").trim()}__${String(dr.report_date ?? "").trim().slice(0, 10)}`;
+                          const isReviewed = pairKey.length > 2 && decisionReviewedPairSet.has(pairKey);
+                          return (
+                            <span
+                              className={`inline-flex px-2 py-0.5 rounded text-xs ${
+                                isReviewed
+                                  ? "bg-green-100 text-green-700 dark:bg-green-950/50 dark:text-green-300"
+                                  : "bg-orange-100 text-orange-700 dark:bg-orange-950/40 dark:text-orange-300"
+                              }`}
+                            >
+                              {isReviewed ? "Reviewed" : "Pending"}
+                            </span>
+                          );
+                        })()}
+                      </td>
+                    </tr>
+                  ) : (
+                    <tr key={(r as ConsolidatedFlaggedRecord).id} onClick={() => openConsolidatedDetail(r as ConsolidatedFlaggedRecord)} className="hover:bg-blue-50 dark:hover:bg-zinc-800 cursor-pointer">
+                      <td className="px-4 py-3 text-gray-600 dark:text-zinc-300">{formatEastern((r as ConsolidatedFlaggedRecord).created_at)}</td>
+                      <td className="px-4 py-3 font-medium text-gray-900 dark:text-zinc-100">{(r as ConsolidatedFlaggedRecord).supplier_name}</td>
+                      <td className="px-4 py-3 text-gray-500 dark:text-zinc-400 font-mono text-xs">{(r as ConsolidatedFlaggedRecord).supplier_key.slice(0, 8)}...</td>
+                      <td className="px-4 py-3">
+                        <span className={`inline-flex px-2 py-0.5 rounded-full text-xs font-bold ${
+                          (r as ConsolidatedFlaggedRecord).overall_risk_score >= 8 ? "bg-red-100 text-red-800 dark:bg-red-950/50 dark:text-red-300" :
+                          (r as ConsolidatedFlaggedRecord).overall_risk_score >= 5 ? "bg-yellow-100 text-yellow-800 dark:bg-yellow-950/40 dark:text-yellow-300" :
+                          "bg-green-100 text-green-800 dark:bg-green-950/50 dark:text-green-300"
+                        }`}>{(r as ConsolidatedFlaggedRecord).overall_risk_score}</span>
+                      </td>
+                      <td className="px-4 py-3 relative">
+                        <span
+                          className="text-blue-600 dark:text-blue-400 underline cursor-help"
+                          onMouseEnter={() => setHoveredAgent((r as ConsolidatedFlaggedRecord).source)}
+                          onMouseLeave={() => setHoveredAgent(null)}
+                        >
+                          {SOURCE_LABELS[(r as ConsolidatedFlaggedRecord).source] ?? (r as ConsolidatedFlaggedRecord).source}
+                        </span>
+                        {hoveredAgent === (r as ConsolidatedFlaggedRecord).source && agentMeta[(r as ConsolidatedFlaggedRecord).source] && (
+                          <div className="absolute z-50 bg-gray-900 text-white p-3 rounded-lg text-xs w-72 left-0 top-full mt-1 shadow-lg">
+                            <div className="font-bold mb-1">{agentMeta[(r as ConsolidatedFlaggedRecord).source].display_name}</div>
+                            <div className="mb-1">{agentMeta[(r as ConsolidatedFlaggedRecord).source].description}</div>
+                            <div className="text-gray-300">Rules: {agentMeta[(r as ConsolidatedFlaggedRecord).source].active_rules}</div>
+                            <div className="text-gray-400 mt-1">Updated: {formatEastern(agentMeta[(r as ConsolidatedFlaggedRecord).source].last_updated)}</div>
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-gray-600 dark:text-zinc-300 text-xs max-w-xs truncate">
+                        {Array.isArray((r as ConsolidatedFlaggedRecord).reasons) ? (r as ConsolidatedFlaggedRecord).reasons[0] : ""}
+                      </td>
+                      <td className="px-4 py-3">
+                        <span className={`inline-flex px-2 py-0.5 rounded text-xs ${
+                          (r as ConsolidatedFlaggedRecord).status === "reviewed"
+                            ? "bg-green-100 text-green-700 dark:bg-green-950/50 dark:text-green-300"
+                            : "bg-orange-100 text-orange-700 dark:bg-orange-950/40 dark:text-orange-300"
+                        }`}>{(r as ConsolidatedFlaggedRecord).status === "reviewed" ? "Reviewed" : "Pending"}</span>
+                      </td>
+                    </tr>
+                  )
                 ))
               )}
             </tbody>
@@ -1121,102 +1572,428 @@ export default function DashboardPage() {
         </div>
       </div>
 
-      {/* Detail Modal */}
-      {selectedRecord && (
+      {/* Detail Modal (Decision daily report or single-agent consolidated flag) */}
+      {(selectedDecisionRecord || selectedConsolidatedRecord) && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
           <div className="bg-white dark:bg-zinc-900 rounded-lg shadow-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto border border-gray-200 dark:border-zinc-800">
             <div className="p-6">
-              <div className="flex justify-between items-start mb-4">
-                <div>
-                  <h2 className="text-lg font-bold text-gray-900 dark:text-zinc-100">{selectedRecord.supplier_name}</h2>
-                  <p className="text-sm text-gray-500 dark:text-zinc-400 font-mono">{selectedRecord.supplier_key}</p>
-                </div>
-                <button type="button" onClick={closeDetail} className="text-gray-400 dark:text-zinc-500 hover:text-gray-600 dark:hover:text-zinc-300 text-2xl leading-none">&times;</button>
-              </div>
-
-              {/* Risk Score Trend */}
-              <div className="mb-6">
-                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Risk Score Trend</h3>
-                <div className="flex items-end gap-1 h-24 bg-gray-50 dark:bg-zinc-800 rounded p-2">
-                  {riskHistory.map((h: any, i: number) => (
-                    <div key={i} className="flex flex-col items-center flex-1">
-                      <div className={`w-full rounded-t ${
-                        h.overall_risk_score >= 8 ? "bg-red-500" :
-                        h.overall_risk_score >= 5 ? "bg-yellow-500" : "bg-green-500"
-                      }`} style={{ height: `${(h.overall_risk_score / 10) * 80}px` }}
-                      title={`${h.source}: ${h.overall_risk_score} (${formatEastern(h.created_at, { dateOnly: true })})`} />
-                      <span className="text-[9px] text-gray-400 dark:text-zinc-500 mt-1">{formatEastern(h.created_at, { dateOnly: true })}</span>
+              <div className="-mx-6 -mt-6 px-6 py-4 sticky top-0 z-10 bg-white/95 dark:bg-zinc-900/95 backdrop-blur border-b border-gray-200 dark:border-zinc-800">
+                <div className="flex justify-between items-start gap-4">
+                  <div className="min-w-0">
+                    <h2 className="text-lg font-bold text-gray-900 dark:text-zinc-100 truncate">
+                      {selectedDecisionRecord
+                        ? (selectedDecisionRecord.supplier_name ?? "—")
+                        : selectedConsolidatedRecord!.supplier_name}
+                    </h2>
+                    <p className="text-sm text-gray-500 dark:text-zinc-400 font-mono truncate">
+                      {selectedDecisionRecord
+                        ? (selectedDecisionRecord.supplier_key ?? "—")
+                        : selectedConsolidatedRecord!.supplier_key}
+                    </p>
+                    <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-gray-500 dark:text-zinc-400">
+                      <span>
+                        Date:{" "}
+                        <span className="font-medium text-gray-700 dark:text-zinc-200">
+                          {selectedDecisionRecord
+                            ? (selectedDecisionRecord.report_date ?? "—")
+                            : consolidatedReportYmd(selectedConsolidatedRecord!)}
+                        </span>
+                      </span>
+                      <span>
+                        Agent:{" "}
+                        <span className="font-medium text-gray-700 dark:text-zinc-200">
+                          {selectedDecisionRecord
+                            ? "Decision Agent"
+                            : SOURCE_LABELS[selectedConsolidatedRecord!.source] ?? selectedConsolidatedRecord!.source}
+                        </span>
+                      </span>
                     </div>
-                  ))}
-                  {riskHistory.length === 0 && <span className="text-gray-400 dark:text-zinc-500 text-xs m-auto">No history</span>}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={closeDetail}
+                    className="shrink-0 text-gray-400 dark:text-zinc-500 hover:text-gray-600 dark:hover:text-zinc-300 text-2xl leading-none"
+                    aria-label="Close"
+                  >
+                    &times;
+                  </button>
                 </div>
               </div>
 
-              {/* Agent Scores Breakdown */}
+              {selectedDecisionRecord && (
+              <>
+              {/* Decision Agent Summary */}
+              <div className="mb-6 pt-4">
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Decision Agent</h3>
+                <div className="flex flex-wrap items-center gap-3">
+                  <div className="bg-gray-50 dark:bg-zinc-800 rounded-lg border border-gray-200 dark:border-zinc-700 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-zinc-400">Final score</div>
+                    <div className="text-lg font-bold text-gray-900 dark:text-zinc-100">{selectedDecisionRecord.final_score ?? "—"}</div>
+                  </div>
+                  <div className="bg-gray-50 dark:bg-zinc-800 rounded-lg border border-gray-200 dark:border-zinc-700 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-zinc-400">Resonance</div>
+                    <div className="text-lg font-bold text-gray-900 dark:text-zinc-100">{selectedDecisionRecord.resonance_count ?? "—"}</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Agent Scores (from agent_scores jsonb) */}
               <div className="mb-6">
                 <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Agent Scores</h3>
-                <div className="grid grid-cols-5 gap-1.5 sm:gap-2 min-w-0">
-                  {Object.entries(SOURCE_LABELS).map(([src, label]) => {
-                    const latest = riskHistory.filter((h: any) => h.source === src).slice(-1)[0];
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {Object.entries(SOURCE_LABELS).filter(([agentKey]) => agentKey !== "decision_agent").map(([agentKey, label]) => {
+                    const entry = (selectedDecisionRecord.agent_scores ?? {})[agentKey] as any;
+                    const score = entry?.score;
+                    const flagged = Boolean(entry?.flagged);
                     return (
-                      <div key={src} className="bg-gray-50 dark:bg-zinc-800 rounded p-1.5 sm:p-2 text-center min-w-0">
-                        <div className="text-[10px] sm:text-xs text-gray-500 dark:text-zinc-400 leading-tight line-clamp-2" title={label}>
+                      <button
+                        key={agentKey}
+                        type="button"
+                        onClick={() => {
+                          setAgentDetailKey(agentKey);
+                          setReviewAgentLabel(label);
+                        }}
+                        className={`text-left rounded-lg border px-3 py-2 bg-gray-50 dark:bg-zinc-800 hover:bg-gray-100 dark:hover:bg-zinc-700/60 transition ${
+                          flagged
+                            ? "border-red-300 dark:border-red-700"
+                            : "border-gray-200 dark:border-zinc-700"
+                        }`}
+                        title={entry?.reason ?? label}
+                      >
+                        <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-zinc-400">
                           {label}
                         </div>
                         <div className={`text-lg font-bold ${
-                          latest?.overall_risk_score >= 8 ? "text-red-600 dark:text-red-400" :
-                          latest?.overall_risk_score >= 5 ? "text-yellow-600 dark:text-yellow-500" :
-                          latest ? "text-green-600 dark:text-green-400" : "text-gray-300 dark:text-zinc-600"
-                        }`}>{latest?.overall_risk_score ?? "—"}</div>
+                          score == null ? "text-gray-300 dark:text-zinc-600" :
+                          Number(score) >= 8 ? "text-red-600 dark:text-red-400" :
+                          Number(score) >= 5 ? "text-yellow-600 dark:text-yellow-500" :
+                          "text-green-600 dark:text-green-400"
+                        }`}>{score ?? "—"}</div>
+                        {flagged && (
+                          <div className="mt-0.5 text-[10px] font-medium text-red-600 dark:text-red-400">
+                            Flagged
+                          </div>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* History Summary (from history_summary jsonb) */}
+              <div className="mb-6">
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">History Summary</h3>
+                <div className="space-y-3">
+                  {Object.entries(SOURCE_LABELS).map(([agentKey, label]) => {
+                    const rows = ((selectedDecisionRecord.history_summary ?? {})[agentKey] ?? []) as any[];
+                    if (!Array.isArray(rows) || rows.length === 0) return null;
+                    return (
+                      <div key={agentKey} className="rounded-lg border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800/70 p-3">
+                        <div className="text-xs font-semibold text-gray-700 dark:text-zinc-200 mb-2">{label}</div>
+                        <div className="space-y-2">
+                          {rows.slice(-5).reverse().map((it, idx) => (
+                            <div key={idx} className="text-xs text-gray-700 dark:text-zinc-300">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className="font-mono text-gray-500 dark:text-zinc-400">{it?.date ?? "—"}</span>
+                                <span className="font-semibold">{it?.score ?? "—"}</span>
+                                {it?.flagged ? (
+                                  <span className="inline-flex items-center rounded px-1.5 py-0.5 bg-red-100 text-red-700 dark:bg-red-950/40 dark:text-red-300">
+                                    Flagged
+                                  </span>
+                                ) : (
+                                  <span className="inline-flex items-center rounded px-1.5 py-0.5 bg-gray-100 text-gray-600 dark:bg-zinc-900/40 dark:text-zinc-400">
+                                    —
+                                  </span>
+                                )}
+                              </div>
+                              {it?.reason && (
+                                <div className="mt-1 text-gray-600 dark:text-zinc-400 leading-snug">
+                                  {String(it.reason)}
+                                </div>
+                              )}
+                            </div>
+                          ))}
+                        </div>
                       </div>
                     );
                   })}
                 </div>
               </div>
 
-              {/* Triggered Metrics */}
-              <div className="mb-6">
-                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Triggered Metrics</h3>
-                <div className="space-y-2">
-                  {(Array.isArray(selectedRecord.metrics) ? selectedRecord.metrics : []).map((m: any, i: number) => (
-                    <div key={i} className="bg-gray-50 dark:bg-zinc-800 rounded p-2 flex justify-between text-sm">
-                      <span className="font-mono text-gray-700 dark:text-zinc-300">{m.metric_id}</span>
-                      <span className="text-gray-900 dark:text-zinc-100 font-medium">
-                        {m.value != null
-                          ? m.unit != null && String(m.unit).trim() !== ""
-                            ? `${m.value} ${m.unit}`
-                            : `${m.value}`
-                          : "N/A"}
-                      </span>
+              {/* Agent Detail Popup */}
+              {selectedDecisionRecord && agentDetailKey && (
+                <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
+                  <button
+                    type="button"
+                    className="absolute inset-0 bg-black/50"
+                    onClick={() => setAgentDetailKey(null)}
+                    aria-label="Close agent detail"
+                  />
+                  <div className="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded-lg border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-xl p-4">
+                    <div className="flex items-start justify-between gap-4 mb-3">
+                      <div>
+                        <div className="text-sm font-bold text-gray-900 dark:text-zinc-100">
+                          {SOURCE_LABELS[agentDetailKey] ?? agentDetailKey}
+                        </div>
+                        <div className="text-xs text-gray-500 dark:text-zinc-400">
+                          {selectedDecisionRecord.supplier_key ?? "—"} · {selectedDecisionRecord.report_date ?? "—"}
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setAgentDetailKey(null)}
+                        className="text-gray-400 dark:text-zinc-500 hover:text-gray-600 dark:hover:text-zinc-300 text-2xl leading-none"
+                        aria-label="Close"
+                      >
+                        &times;
+                      </button>
                     </div>
-                  ))}
+                    {(() => {
+                      const e = (selectedDecisionRecord.agent_scores ?? {})[agentDetailKey] as any;
+                      const metricsRows = agentEntryMetrics(e);
+                      const sortedMetrics = [...metricsRows].sort(
+                        (a, b) => Number(metricTriggered(b)) - Number(metricTriggered(a))
+                      );
+                      const hasTriggeredMetric = sortedMetrics.some(metricTriggered);
+                      return (
+                        <div className="space-y-3 text-sm">
+                          <div className="flex flex-wrap gap-3">
+                            <div className="rounded border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800 px-3 py-2">
+                              <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-zinc-400">Score</div>
+                              <div className="text-lg font-bold text-gray-900 dark:text-zinc-100">{e?.score ?? "—"}</div>
+                            </div>
+                            <div className="rounded border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800 px-3 py-2">
+                              <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-zinc-400">Flagged</div>
+                              <div className="text-lg font-bold text-gray-900 dark:text-zinc-100">{e?.flagged ? "true" : "false"}</div>
+                            </div>
+                          </div>
+                          {sortedMetrics.length > 0 && (
+                            <div>
+                              <div className="text-xs font-semibold text-gray-700 dark:text-zinc-200 mb-2">
+                                {hasTriggeredMetric ? "Trigger metrics" : "Metrics"}
+                              </div>
+                              <ul className="space-y-2">
+                                {sortedMetrics.map((m, idx) => {
+                                  const id =
+                                    m.metric_id != null
+                                      ? String(m.metric_id)
+                                      : m.name != null
+                                        ? String(m.name)
+                                        : `metric-${idx}`;
+                                  const trig = metricTriggered(m);
+                                  const sev =
+                                    m.severity != null && String(m.severity) !== "NONE"
+                                      ? String(m.severity)
+                                      : null;
+                                  const contrib = m.score_contribution;
+                                  const contribStr =
+                                    typeof contrib === "number" && Number.isFinite(contrib)
+                                      ? String(contrib)
+                                      : contrib != null
+                                        ? String(contrib)
+                                        : null;
+                                  return (
+                                    <li
+                                      key={`${id}-${idx}`}
+                                      className={`rounded-lg border px-3 py-2 ${
+                                        trig
+                                          ? "border-red-300 dark:border-red-800 bg-red-50/80 dark:bg-red-950/25"
+                                          : "border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800/60"
+                                      }`}
+                                    >
+                                      <div className="flex flex-wrap items-center gap-2 mb-1">
+                                        <span className="font-mono text-xs font-semibold text-gray-900 dark:text-zinc-100">
+                                          {id}
+                                        </span>
+                                        {trig ? (
+                                          <span className="inline-flex rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide bg-red-200 text-red-900 dark:bg-red-900/50 dark:text-red-100">
+                                            Triggered
+                                          </span>
+                                        ) : null}
+                                        {sev ? (
+                                          <span className="text-[10px] text-gray-600 dark:text-zinc-400">{sev}</span>
+                                        ) : null}
+                                      </div>
+                                      <div className="text-xs text-gray-700 dark:text-zinc-300">
+                                        <span className="font-medium">Value:</span>{" "}
+                                        {formatAgentMetricValue(m)}
+                                        {contribStr != null && (
+                                          <span className="ml-2 text-gray-500 dark:text-zinc-500">
+                                            · contribution {contribStr}
+                                          </span>
+                                        )}
+                                      </div>
+                                      {m.explanation != null && String(m.explanation).trim() !== "" && (
+                                        <p className="mt-1 text-xs text-gray-600 dark:text-zinc-400 leading-snug">
+                                          {String(m.explanation)}
+                                        </p>
+                                      )}
+                                    </li>
+                                  );
+                                })}
+                              </ul>
+                            </div>
+                          )}
+                          <div>
+                            <div className="text-xs font-semibold text-gray-700 dark:text-zinc-200 mb-1">Reason</div>
+                            <div className="text-sm text-gray-700 dark:text-zinc-300 whitespace-pre-wrap">
+                              {e?.reason ? String(e.reason) : "—"}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                </div>
+              )}
+
+              {/* Decision Agent Reason */}
+              <div className="mb-6">
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Flag Reason</h3>
+                <p className="text-sm text-gray-700 dark:text-zinc-300 whitespace-pre-wrap">
+                  {selectedDecisionRecord.reason ?? "—"}
+                </p>
+              </div>
+              </>
+              )}
+
+              {selectedConsolidatedRecord && (
+              <>
+              <div className="mb-6 pt-4">
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">
+                  {SOURCE_LABELS[selectedConsolidatedRecord.source] ?? selectedConsolidatedRecord.source}
+                </h3>
+                <div className="flex flex-wrap items-center gap-3">
+                  <div className="bg-gray-50 dark:bg-zinc-800 rounded-lg border border-gray-200 dark:border-zinc-700 px-3 py-2">
+                    <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-zinc-400">Risk score</div>
+                    <div className="text-lg font-bold text-gray-900 dark:text-zinc-100">
+                      {selectedConsolidatedRecord.overall_risk_score ?? "—"}
+                    </div>
+                  </div>
+                  <div
+                    className={`rounded-lg border px-3 py-2 ${
+                      selectedConsolidatedRecord.status === "reviewed"
+                        ? "border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-950/30"
+                        : "border-orange-200 dark:border-orange-800 bg-orange-50 dark:bg-orange-950/25"
+                    }`}
+                  >
+                    <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-zinc-400">Review status</div>
+                    <div
+                      className={`text-lg font-bold capitalize ${
+                        selectedConsolidatedRecord.status === "reviewed"
+                          ? "text-green-700 dark:text-green-300"
+                          : "text-orange-700 dark:text-orange-300"
+                      }`}
+                    >
+                      {selectedConsolidatedRecord.status === "reviewed"
+                        ? "Reviewed"
+                        : selectedConsolidatedRecord.status === "pending_review"
+                          ? "Pending"
+                          : (selectedConsolidatedRecord.status?.replace(/_/g, " ") ?? "—")}
+                    </div>
+                  </div>
                 </div>
               </div>
 
-              {/* Full Reasons */}
+              {(() => {
+                const metricsRows = consolidatedMetricsRows(selectedConsolidatedRecord);
+                const sortedMetrics = [...metricsRows].sort(
+                  (a, b) => Number(metricTriggered(b)) - Number(metricTriggered(a))
+                );
+                const hasTriggeredMetric = sortedMetrics.some(metricTriggered);
+                if (sortedMetrics.length === 0) return null;
+                return (
+                  <div className="mb-6">
+                    <div className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">
+                      {hasTriggeredMetric ? "Trigger metrics" : "Metrics"}
+                    </div>
+                    <ul className="space-y-2">
+                      {sortedMetrics.map((m, idx) => {
+                        const id =
+                          m.metric_id != null
+                            ? String(m.metric_id)
+                            : m.name != null
+                              ? String(m.name)
+                              : `metric-${idx}`;
+                        const trig = metricTriggered(m);
+                        const sev =
+                          m.severity != null && String(m.severity) !== "NONE"
+                            ? String(m.severity)
+                            : null;
+                        const contrib = m.score_contribution;
+                        const contribStr =
+                          typeof contrib === "number" && Number.isFinite(contrib)
+                            ? String(contrib)
+                            : contrib != null
+                              ? String(contrib)
+                              : null;
+                        return (
+                          <li
+                            key={`${id}-${idx}`}
+                            className={`rounded-lg border px-3 py-2 text-sm ${
+                              trig
+                                ? "border-red-300 dark:border-red-800 bg-red-50/80 dark:bg-red-950/25"
+                                : "border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800/60"
+                            }`}
+                          >
+                            <div className="flex flex-wrap items-center gap-2 mb-1">
+                              <span className="font-mono text-xs font-semibold text-gray-900 dark:text-zinc-100">
+                                {id}
+                              </span>
+                              {trig ? (
+                                <span className="inline-flex rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide bg-red-200 text-red-900 dark:bg-red-900/50 dark:text-red-100">
+                                  Triggered
+                                </span>
+                              ) : null}
+                              {sev ? (
+                                <span className="text-[10px] text-gray-600 dark:text-zinc-400">{sev}</span>
+                              ) : null}
+                            </div>
+                            <div className="text-xs text-gray-700 dark:text-zinc-300">
+                              <span className="font-medium">Value:</span> {formatAgentMetricValue(m)}
+                              {contribStr != null && (
+                                <span className="ml-2 text-gray-500 dark:text-zinc-500">
+                                  · contribution {contribStr}
+                                </span>
+                              )}
+                            </div>
+                            {m.explanation != null && String(m.explanation).trim() !== "" && (
+                              <p className="mt-1 text-xs text-gray-600 dark:text-zinc-400 leading-snug">
+                                {String(m.explanation)}
+                              </p>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </div>
+                );
+              })()}
+
               <div className="mb-6">
-                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Flag Reasons</h3>
-                <ul className="text-sm text-gray-600 dark:text-zinc-300 space-y-1">
-                  {(Array.isArray(selectedRecord.reasons) ? selectedRecord.reasons : []).map((r: string, i: number) => (
-                    <li key={i} className="flex gap-2">
-                      <span className="text-red-500 dark:text-red-400 flex-shrink-0">•</span>
-                      <span>{r}</span>
-                    </li>
-                  ))}
-                </ul>
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Flag reasons</h3>
+                {Array.isArray(selectedConsolidatedRecord.reasons) && selectedConsolidatedRecord.reasons.length > 0 ? (
+                  <ul className="list-disc list-inside space-y-1 text-sm text-gray-700 dark:text-zinc-300">
+                    {selectedConsolidatedRecord.reasons.map((reason, i) => (
+                      <li key={i} className="leading-snug">
+                        {reason}
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="text-sm text-gray-500 dark:text-zinc-400">—</p>
+                )}
               </div>
+              </>
+              )}
 
               {/* Review Section — reviewers/admins can submit; viewers see history only */}
               <div className="border-t border-gray-200 dark:border-zinc-700 pt-4 space-y-4">
-                {selectedRecord.status === "reviewed" ? (
-                  <p className="text-sm text-green-600 dark:text-green-400">
-                    Flag marked reviewed (last update {formatEastern(selectedRecord.reviewed_at)})
-                  </p>
-                ) : (
-                  <p className="text-sm text-orange-600 dark:text-orange-400">
-                    Pending review — other reviewers can add their review below (one review per person).
-                  </p>
-                )}
+                <p className="text-sm text-gray-600 dark:text-zinc-400">
+                  {selectedDecisionRecord
+                    ? "Reviews are associated with this supplier and report date, and can target Decision Agent or a specific sub-agent."
+                    : "Reviews are stored for this flagged record and listed by reviewer. One review per user per flag."}
+                </p>
 
                 <div>
                   <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Review history</h3>
@@ -1230,7 +2007,14 @@ export default function DashboardPage() {
                           className="rounded-lg border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800/80 p-3 text-sm"
                         >
                           <div className="flex flex-wrap justify-between gap-2 text-xs text-gray-500 dark:text-zinc-400">
-                            <span className="font-medium text-gray-700 dark:text-zinc-300">{r.reviewer_email}</span>
+                            <span className="font-medium text-gray-700 dark:text-zinc-300">
+                              {r.reviewer_email}
+                              {r.source?.trim() && (
+                                <span className="ml-2 inline-flex items-center rounded border border-gray-200 dark:border-zinc-600 bg-white/60 dark:bg-zinc-900/40 px-1.5 py-0.5 text-[10px] text-gray-600 dark:text-zinc-300">
+                                  {r.source}
+                                </span>
+                              )}
+                            </span>
                             <span className="text-right">
                               <span className="block">{formatEastern(r.created_at)}</span>
                               {r.updated_at &&
@@ -1293,10 +2077,35 @@ export default function DashboardPage() {
                     <p className="text-sm text-gray-600 dark:text-zinc-400 mb-3">{NO_PERMISSION}</p>
                   ) : (
                     <>
+                  {selectedDecisionRecord ? (
+                    <div className="mb-3">
+                      <label className={LABEL}>Agent</label>
+                      <select
+                        value={reviewAgentLabel}
+                        onChange={(e) => setReviewAgentLabel(e.target.value)}
+                        className={FIELD_FULL}
+                      >
+                        {Object.entries(SOURCE_LABELS).map(([k, label]) => (
+                          <option key={k} value={label}>
+                            {label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-gray-600 dark:text-zinc-400 mb-3">
+                      Agent for this review:{" "}
+                      <span className="font-medium text-gray-800 dark:text-zinc-200">
+                        {SOURCE_LABELS[selectedConsolidatedRecord!.source] ?? selectedConsolidatedRecord!.source}
+                      </span>
+                    </p>
+                  )}
                   {hasMyReview && !editingReviewId && (
                     <p className="text-sm text-gray-600 dark:text-zinc-400 mb-3">
-                      You already submitted a review for this flag. Use <strong>Edit</strong> or <strong>Delete</strong>{" "}
-                      in the list above to change it. Submit is disabled until you delete that review.
+                      {selectedConsolidatedRecord
+                        ? "You already submitted a review for this flag. Use Edit or Delete in the list above."
+                        : "You already submitted a review for this agent. Use Edit or Delete in the list above."}{" "}
+                      Submit is disabled until you delete that review.
                     </p>
                   )}
                   <div className="flex gap-4 mb-3 flex-wrap">
