@@ -141,7 +141,7 @@ Hard rules represent clear, directional risk signals. Each hard rule sets the sc
 | `ACCOUNT_STATUS` | Account not OK or Active | 8 |
 | `LOAN_PAST_DUE` | Past-due loan amount > $0 | 9 |
 | `ORDER_DEFECT_RATE` | Seller-fulfilled ODR > 1% (from Performance Over Time SF rows only; FBA-only or no SF data → skipped) | 8 |
-| `LATE_SHIPMENT_RATE` | LSR > 4% (Amazon red line) | 8 |
+| ~~`LATE_SHIPMENT_RATE`~~ | *Removed — no total order count available; single late shipment distorts rate for low-volume sellers* | 8 |
 | `NEG_FEEDBACK_TREND` | 30d neg rate ≥ 10pp above 60d window (min 10 orders) | 7 |
 | ~~`POLICY_COMPLIANCE_INCREASE`~~ | *Temporarily disabled — violations not distinguished by health impact* | 7 |
 | `ACCOUNT_LEVEL_RESERVE` | Reserve/revenue ratio increased ≥ 50% vs 90-day average (closed statements only, gross revenue ≥ $200) | 7 |
@@ -154,7 +154,7 @@ Soft rules add penalty points to the score. They represent weaker signals that a
 |---|---|---|---|
 | Fulfillment | Cancellation rate | > 2.5% / 1.5–2.5% | +2 / +1 |
 | Fulfillment | Valid tracking rate | < 95% | +2 |
-| Fulfillment | Delivered on time | < 90% | +1 |
+| Fulfillment | Delivered on time | < 85% | +1 |
 | Fulfillment | Two-step verification | Inactive | +1 |
 | Feedback | 30d negative rate | > 50% (min 10 orders) | +2 |
 | Feedback | 30d negative rate | 30–50% (min 10 orders) | +1 |

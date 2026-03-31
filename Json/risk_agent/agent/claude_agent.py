@@ -61,7 +61,7 @@ OUTPUT FORMAT — respond ONLY with a valid JSON object, no markdown, no preambl
 }
 
 REQUIRED metrics to include (use null if data is unavailable):
-  order_defect_rate, late_shipment_rate, cancellation_rate,
+  order_defect_rate, cancellation_rate,
   valid_tracking_rate, delivered_on_time,
   feedback_negative_30d, feedback_negative_60d_window, feedback_negative_trend_delta,
   feedback_count_30d,
@@ -98,7 +98,12 @@ IMPORTANT JUDGEMENT GUIDELINES:
      a disproportionate share of recent revenue, which is a risk signal.
    - A large but stable reserve on a high-volume account is normal operational behaviour.
 
-5. Policy compliance:
+5. Late shipment rate (late_shipment_rate_pct):
+   - This metric is provided for context only — do NOT use it to drive the risk score.
+   - Without total order count, a single late shipment can produce a misleadingly high rate
+     for low-volume sellers. Treat it as a weak signal at most.
+
+6. Policy compliance:
    - Policy violation counts are provided for context ONLY — do NOT use them to drive
      the risk score up. The rule engine has disabled policy compliance scoring because
      violations cannot yet be distinguished by whether they impact account health.
@@ -516,7 +521,6 @@ _RULE_METRIC_MAP: dict[str, list[str]] = {
     "ACCOUNT_STATUS":           ["account_status"],
     "LOAN_PAST_DUE":            ["past_due_amount", "outstanding_loan_amount"],
     "ORDER_DEFECT_RATE":        ["order_defect_rate"],
-    "LATE_SHIPMENT_RATE":       ["late_shipment_rate"],
     "NEG_FEEDBACK_TREND":       ["feedback_negative_30d", "feedback_negative_60d_window", "feedback_negative_trend_delta", "feedback_count_30d"],
     "POLICY_COMPLIANCE":        ["policy_compliance_total", "policy_compliance_delta"],
     "ACCOUNT_LEVEL_RESERVE":    ["stmt_reserve_latest_ratio", "stmt_reserve_avg_ratio", "stmt_reserve_change_pct"],

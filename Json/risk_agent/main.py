@@ -48,12 +48,12 @@ TABLE_NAME = f"{settings.BQ_PROJECT_ID}.{settings.BQ_DATASET}.{settings.BQ_TABLE
 _lock = threading.Lock()
 
 # ── Checkpoint helpers ────────────────────────────────────────────────────────
-def _checkpoint_path(date_filter: str | None) -> pathlib.Path:
-    label = date_filter or datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    return pathlib.Path(__file__).parent / "checkpoints" / f"{label}.txt"
+def _checkpoint_path(date_filter: str | None, label: str | None = None) -> pathlib.Path:
+    key = label or date_filter or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return pathlib.Path(__file__).parent / "checkpoints" / f"{key}.txt"
 
-def _load_checkpoint(date_filter: str | None) -> set[str]:
-    cp = _checkpoint_path(date_filter)
+def _load_checkpoint(date_filter: str | None, label: str | None = None) -> set[str]:
+    cp = _checkpoint_path(date_filter, label)
     if cp.exists():
         keys = {line.strip() for line in cp.read_text().splitlines() if line.strip()}
         if keys:
@@ -61,8 +61,8 @@ def _load_checkpoint(date_filter: str | None) -> set[str]:
         return keys
     return set()
 
-def _save_checkpoint(date_filter: str | None, supplier_key: str) -> None:
-    cp = _checkpoint_path(date_filter)
+def _save_checkpoint(date_filter: str | None, supplier_key: str, label: str | None = None) -> None:
+    cp = _checkpoint_path(date_filter, label)
     cp.parent.mkdir(parents=True, exist_ok=True)
     with _lock:
         with cp.open("a") as f:
@@ -80,8 +80,8 @@ def _process_row(row: dict, dry_run: bool = False) -> tuple[str, str, RiskReport
         # Step 1: Feature extraction
         fs = extract_features(row)
 
-        # Skip suspended or missing account status — no assessment needed
-        if not fs.account_status or "suspend" in fs.account_status.lower():
+        # Skip only explicitly suspended accounts
+        if fs.account_status and "suspend" in fs.account_status.lower():
             log.info(
                 "[%s] %s — skipped (account_status=%r)",
                 supplier_key[:8],
@@ -185,8 +185,15 @@ def run_pipeline(
 
     log.info("Loaded %d rows. Starting concurrent processing ...", len(rows))
 
-    # ── Resume from checkpoint if available ──────────────────────────────────
-    done_keys = _load_checkpoint(date_filter)
+    _dry = dry_run or settings.DRY_RUN
+
+    # Derive checkpoint label: use input filename stem for dry-run, date otherwise
+    _checkpoint_label: str | None = None
+    if _dry and input_file:
+        _checkpoint_label = pathlib.Path(input_file).stem  # e.g. "TrueNegativeList"
+
+    # ── Resume from checkpoint ────────────────────────────────────────────────
+    done_keys = _load_checkpoint(date_filter, label=_checkpoint_label)
     pending_rows = [r for r in rows if r.get("mp_sup_key") not in done_keys]
     if done_keys:
         log.info("Skipping %d already-processed rows, %d remaining", len(done_keys), len(pending_rows))
@@ -195,8 +202,6 @@ def run_pipeline(
     errors = 0
     skipped = 0
     scores: list[float] = []
-
-    _dry = dry_run or settings.DRY_RUN
 
     # Prepare output file for dry-run
     _dry_results: list[dict] = []
@@ -220,12 +225,10 @@ def run_pipeline(
                     scores.append(report.overall_risk_score)
                     if _dry:
                         _dry_results.append(report.to_supabase_dict())
-                if not _dry:
-                    _save_checkpoint(date_filter, supplier_key)
+                _save_checkpoint(date_filter, supplier_key, label=_checkpoint_label)
             elif status == "skipped":
                 skipped += 1
-                if not _dry:
-                    _save_checkpoint(date_filter, supplier_key)
+                _save_checkpoint(date_filter, supplier_key, label=_checkpoint_label)
             else:
                 errors += 1
 

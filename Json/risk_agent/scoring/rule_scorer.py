@@ -123,9 +123,8 @@ def score(fs: FeatureSet) -> PreScoreResult:
         if _odr > cfg("odr_threshold_pct"):
             hard(cfg_int("floor_order_defect_rate"), f"ORDER_DEFECT_RATE: {_odr:.2f}% > {cfg('odr_threshold_pct')}% (Amazon red line, seller-fulfilled)")
 
-    if fs.late_shipment_rate is not None:
-        if fs.late_shipment_rate > cfg("late_shipment_threshold_pct"):
-            hard(cfg_int("floor_late_shipment_rate"), f"LATE_SHIPMENT_RATE: {fs.late_shipment_rate:.2f}% > {cfg('late_shipment_threshold_pct')}% (Amazon red line)")
+    # LATE_SHIPMENT_RATE rule removed — no total order count available,
+    # so a single late shipment can produce artificially high rates for low-volume sellers
 
     if fs.cancellation_rate is not None:
         if fs.cancellation_rate > cfg("cancellation_threshold_pct"):
