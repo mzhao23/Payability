@@ -46,7 +46,17 @@ _ERROR_PATTERNS: dict[str, str] = {
 
 
 def classify_error(data_str: str) -> Optional[str]:
-    """Return an error class string if the data column signals a known error, else None."""
+    """Return an error class string if the data column signals a known error, else None.
+    If the JSON contains a top-level 'Error' field, returns 'scraper_error' immediately.
+    """
+    # Check for top-level Error field in JSON first
+    try:
+        d = json.loads(data_str)
+        if isinstance(d, dict) and d.get("Error"):
+            return "scraper_error"
+    except (json.JSONDecodeError, TypeError):
+        pass
+
     lower = data_str.lower()
     for label, pattern in _ERROR_PATTERNS.items():
         if re.search(pattern, lower):
@@ -156,6 +166,8 @@ class FeatureSet:
     unavailable_balance_amount: float = 0.0               # max unavailable seen across statements
     failed_disbursement_count: int = 0                    # count of cancelled/failed transfers in statements (90d)
     failed_disbursement_most_recent: bool = False         # True if most recent closed statement is a failed disbursement
+    negative_deposit_latest: bool = False                 # True if most recent closed statement has negative Deposit Total
+    negative_deposit_consecutive: int = 0                 # count of consecutive closed statements with negative Deposit Total
 
     # policy compliance trend (cross-period)
     curr_policy_total: Optional[int] = None       # sum of all policy_compliance fields
@@ -179,6 +191,8 @@ class FeatureSet:
     notification_titles: list[str] = field(default_factory=list)
     notification_count: int = 0
     high_risk_notification_count: int = 0   # computed during extraction
+    inv_credit_card_notification: bool = False  # credit card notification on report date or day before
+    acc_deactivation_notification: bool = False  # account deactivation risk notification on report date or day before
 
     # inventory
     inv_report_value: Optional[float] = None
@@ -235,12 +249,15 @@ def _pct_str_to_float(s: str) -> Optional[float]:
 
 
 def _money_to_float(s: str) -> Optional[float]:
-    """Convert '$147,940.31' → 147940.31."""
+    """Convert '$147,940.31' → 147940.31, '-$921.25' → -921.25."""
     if not s:
         return None
+    s = s.strip()
+    negative = s.startswith("-")
     cleaned = re.sub(r"[^\d.]", "", s.replace(",", ""))
     try:
-        return float(cleaned)
+        val = float(cleaned)
+        return -val if negative else val
     except ValueError:
         return None
 
@@ -565,10 +582,21 @@ def extract_features(row: dict) -> FeatureSet:
             fs.failed_disbursement_count += 1
 
         # Check if most recent closed statement is a failed disbursement
-        if not fs.failed_disbursement_most_recent:
-            stmt_status = det.get("Status", "") or stmt.get("ProcessingStatus", "") or ""
-            if stmt_status.lower() == "closed":
+        stmt_status = det.get("Status", "") or stmt.get("ProcessingStatus", "") or ""
+        if stmt_status.lower() == "closed":
+            if not fs.failed_disbursement_most_recent:
                 fs.failed_disbursement_most_recent = is_failed
+
+            # Track negative Deposit Total on closed statements (streak from most recent)
+            deposit_amt = _money_to_float(stmt.get("Deposit Total", "") or "") or 0.0
+            _streak_broken = getattr(fs, "_neg_deposit_streak_broken", False)
+            if not _streak_broken:
+                if deposit_amt < 0:
+                    fs.negative_deposit_consecutive += 1
+                    if fs.negative_deposit_consecutive == 1:
+                        fs.negative_deposit_latest = True
+                else:
+                    fs._neg_deposit_streak_broken = True  # type: ignore
 
         # Build statements_detail for LLM context (most recent 8)
         if len(fs.statements_detail) < 8:
@@ -689,6 +717,35 @@ def extract_features(row: dict) -> FeatureSet:
         fs.notification_titles = notif_titles
         fs.notification_count = len(notif_titles)
         fs.high_risk_notification_count = _count_risky_notifications(notif_titles)
+
+        # Check for credit card notification on report date or previous day
+        try:
+            from datetime import date as _date_cls, timedelta as _td
+            _report_dt = _date_cls.fromisoformat(fs.report_date) if fs.report_date else None
+            if _report_dt:
+                _window = {_report_dt, _report_dt - _td(days=1)}
+                for title in notif_titles:
+                    title_lower = title.lower()
+                    # Parse date from title: "March 15, 2026: ..."
+                    try:
+                        _date_part = title.split(":")[0].strip()
+                        _notif_dt = _date_cls.fromisoformat(
+                            datetime.strptime(_date_part, "%B %d, %Y").strftime("%Y-%m-%d")
+                        )
+                    except (ValueError, IndexError):
+                        continue
+                    if _notif_dt not in _window:
+                        continue
+                    if "credit card" in title_lower:
+                        fs.inv_credit_card_notification = True
+                    if (
+                        "at risk of deactivation" in title_lower
+                        or "account is at risk" in title_lower
+                        or "selling account" in title_lower and "deactivat" in title_lower
+                    ):
+                        fs.acc_deactivation_notification = True
+        except Exception:
+            pass
 
     # ── 14. Inventory ─────────────────────────────────────────────────────────
     fs.inv_report_value = _bq_float("inv_report_value")

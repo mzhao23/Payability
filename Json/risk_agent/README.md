@@ -141,10 +141,14 @@ Hard rules represent clear, directional risk signals. Each hard rule sets the sc
 | `ACCOUNT_STATUS` | Account not OK or Active | 8 |
 | `LOAN_PAST_DUE` | Past-due loan amount > $0 | 9 |
 | `ORDER_DEFECT_RATE` | Seller-fulfilled ODR > 1% (from Performance Over Time SF rows only; FBA-only or no SF data → skipped) | 8 |
-| `LATE_SHIPMENT_RATE` | LSR > 4% (Amazon red line) | 8 |
+| ~~`LATE_SHIPMENT_RATE`~~ | *Removed — no total order count available; single late shipment distorts rate for low-volume sellers* | 8 |
 | `NEG_FEEDBACK_TREND` | 30d neg rate ≥ 10pp above 60d window (min 10 orders) | 7 |
 | ~~`POLICY_COMPLIANCE_INCREASE`~~ | *Temporarily disabled — violations not distinguished by health impact* | 7 |
 | `ACCOUNT_LEVEL_RESERVE` | Reserve/revenue ratio increased ≥ 50% vs 90-day average (closed statements only, gross revenue ≥ $200) | 7 |
+| `ACC_DEACTIVATION` | Account at risk of deactivation notification on report date or previous day | 9 |
+| `NEGATIVE_DEPOSIT` | Most recent closed statement has negative Deposit Total (Amazon charging seller) | 7 |
+| `NEGATIVE_DEPOSIT` | ≥ 2 consecutive closed statements with negative Deposit Total | 8 |
+| `INV_CREDIT_CARD` | Credit card update required notification on report date or previous day | 8 |
 | `FAILED_DISBURSEMENT` | Most recent closed statement is a failed disbursement | 7 |
 
 ### Soft Rules — additive penalty points
@@ -154,7 +158,7 @@ Soft rules add penalty points to the score. They represent weaker signals that a
 |---|---|---|---|
 | Fulfillment | Cancellation rate | > 2.5% / 1.5–2.5% | +2 / +1 |
 | Fulfillment | Valid tracking rate | < 95% | +2 |
-| Fulfillment | Delivered on time | < 90% | +1 |
+| Fulfillment | Delivered on time | < 85% | +1 |
 | Fulfillment | Two-step verification | Inactive | +1 |
 | Feedback | 30d negative rate | > 50% (min 10 orders) | +2 |
 | Feedback | 30d negative rate | 30–50% (min 10 orders) | +1 |
@@ -205,15 +209,19 @@ ODR is only evaluated using seller-fulfilled data from the `Performance Over Tim
 - **No SF data available**: ODR skipped — no fallback to global ODR field
 
 ### Data Quality Short-Circuit
-If the data collection returned an error flag, the supplier is scored directly — no rules evaluated, no LLM called:
+If the data collection returned an error flag, the supplier is scored directly — no rules evaluated. Most flags skip the LLM entirely; pipeline errors (`internal_error`) are the exception and do go through the LLM with a score floor of 8.
 
 | Flag | Score |
 |---|---|
+| `scraper_error` | 8 |
 | `not_authorized` | 8 |
 | `login_error` / `wrong_password` | 7 |
-| `bank_page_error` | 5 |
-| `internal_error` / `json_parse_error` | 4 |
+| `bank_page_error` | 8 |
+| `json_parse_error` | 4 |
 | `advance_only` / `onboarding_only` | 2 |
+
+`scraper_error` is triggered when the scraped JSON contains a top-level `Error` field, indicating the scraper encountered an access or processing error (e.g. bank page not loaded, access diverted).
+
 
 ### LLM Usage
 Claude AI is only called when the rule engine pre-score is **≥ 5**. Rows scoring below 5 receive a rule-engine-only report. The LLM may adjust the final score up or down from the pre-score based on contextual analysis.
@@ -248,6 +256,10 @@ UPDATE json_risk_agent_config SET value = 10  WHERE key = 'llm_score_threshold';
 | `floor_neg_feedback_trend` | 7 | Hard rule floor — feedback spike |
 | `floor_policy_compliance` | 7 | Hard rule floor — policy violations increase |
 | `floor_reserve_consecutive` | 7 | Hard rule floor — reserve/revenue ratio spike |
+| `floor_acc_deactivation` | 9 | Hard rule floor — account deactivation risk notification on/before report date |
+| `floor_negative_deposit_single` | 7 | Hard rule floor — most recent closed statement negative Deposit Total |
+| `floor_negative_deposit_consecutive` | 8 | Hard rule floor — 2+ consecutive negative Deposit Total |
+| `floor_inv_credit_card` | 8 | Hard rule floor — credit card notification on/before report date |
 | `floor_failed_disbursement` | 7 | Hard rule floor — most recent statement failed |
 | `odr_threshold_pct` | 1.0 | ODR % to trigger hard rule |
 | `late_shipment_threshold_pct` | 4.0 | LSR % to trigger hard rule |
@@ -260,7 +272,13 @@ UPDATE json_risk_agent_config SET value = 10  WHERE key = 'llm_score_threshold';
 | `score_max` | 10.0 | Absolute score ceiling |
 | `dq_score_not_authorized` | 8 | Score for not_authorized data quality flag |
 | `dq_score_login_error` | 7 | Score for login_error data quality flag |
+| `dq_score_scraper_error` | 8 | Score for scraper_error (JSON with top-level Error field) |
+| `dq_score_bank_page_error` | 8 | Score for bank_page_error data quality flag |
+| `dq_score_json_parse_error` | 4 | Score for json_parse_error data quality flag |
+| `dq_score_advance_only` | 2 | Score for advance_only data quality flag |
+| `dq_score_onboarding_only` | 2 | Score for onboarding_only data quality flag |
 | `dq_score_default` | 3 | Default score for unknown data quality flags |
+| ~~`dq_score_internal_error`~~ | *No longer used — internal errors go through LLM with floor 8* | |
 
 ## Risk Score Guide
 

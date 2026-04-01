@@ -102,7 +102,31 @@ def score(fs: FeatureSet) -> PreScoreResult:
                 f"threshold +{cfg('reserve_ratio_change_hard_pct'):.0f}%)"
             ))
 
-    # ── 7. Failed / cancelled disbursement ───────────────────────────────────
+    # ── 7. Account deactivation risk notification ────────────────────────────
+    if fs.acc_deactivation_notification:
+        hard(cfg_int("floor_acc_deactivation"), (
+            "ACC_DEACTIVATION: account at risk of deactivation notification on or before report date"
+        ))
+
+    # ── 7b. Negative deposit (Amazon charging seller instead of paying) ────────
+    if fs.negative_deposit_consecutive >= 2:
+        hard(cfg_int("floor_negative_deposit_consecutive"), (
+            f"NEGATIVE_DEPOSIT: {fs.negative_deposit_consecutive} consecutive closed statements "
+            f"with negative Deposit Total (Amazon charging seller)"
+        ))
+    elif fs.negative_deposit_latest:
+        hard(cfg_int("floor_negative_deposit_single"), (
+            "NEGATIVE_DEPOSIT: most recent closed statement has negative Deposit Total "
+            "(Amazon charging seller)"
+        ))
+
+    # ── 7c. Credit card notification (invoice/payment issue) ─────────────────
+    if fs.inv_credit_card_notification:
+        hard(cfg_int("floor_inv_credit_card"), (
+            "INV_CREDIT_CARD: credit card update required notification on or before report date"
+        ))
+
+    # ── 8. Failed / cancelled disbursement ───────────────────────────────────
     # Most recent closed statement is a failed disbursement → active risk
     if fs.failed_disbursement_most_recent:
         hard(cfg_int("floor_failed_disbursement"), "FAILED_DISBURSEMENT: most recent closed statement is a failed disbursement")
@@ -123,9 +147,8 @@ def score(fs: FeatureSet) -> PreScoreResult:
         if _odr > cfg("odr_threshold_pct"):
             hard(cfg_int("floor_order_defect_rate"), f"ORDER_DEFECT_RATE: {_odr:.2f}% > {cfg('odr_threshold_pct')}% (Amazon red line, seller-fulfilled)")
 
-    if fs.late_shipment_rate is not None:
-        if fs.late_shipment_rate > cfg("late_shipment_threshold_pct"):
-            hard(cfg_int("floor_late_shipment_rate"), f"LATE_SHIPMENT_RATE: {fs.late_shipment_rate:.2f}% > {cfg('late_shipment_threshold_pct')}% (Amazon red line)")
+    # LATE_SHIPMENT_RATE rule removed — no total order count available,
+    # so a single late shipment can produce artificially high rates for low-volume sellers
 
     if fs.cancellation_rate is not None:
         if fs.cancellation_rate > cfg("cancellation_threshold_pct"):
