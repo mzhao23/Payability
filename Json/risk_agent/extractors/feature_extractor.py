@@ -166,6 +166,8 @@ class FeatureSet:
     unavailable_balance_amount: float = 0.0               # max unavailable seen across statements
     failed_disbursement_count: int = 0                    # count of cancelled/failed transfers in statements (90d)
     failed_disbursement_most_recent: bool = False         # True if most recent closed statement is a failed disbursement
+    negative_deposit_latest: bool = False                 # True if most recent closed statement has negative Deposit Total
+    negative_deposit_consecutive: int = 0                 # count of consecutive closed statements with negative Deposit Total
 
     # policy compliance trend (cross-period)
     curr_policy_total: Optional[int] = None       # sum of all policy_compliance fields
@@ -247,12 +249,15 @@ def _pct_str_to_float(s: str) -> Optional[float]:
 
 
 def _money_to_float(s: str) -> Optional[float]:
-    """Convert '$147,940.31' → 147940.31."""
+    """Convert '$147,940.31' → 147940.31, '-$921.25' → -921.25."""
     if not s:
         return None
+    s = s.strip()
+    negative = s.startswith("-")
     cleaned = re.sub(r"[^\d.]", "", s.replace(",", ""))
     try:
-        return float(cleaned)
+        val = float(cleaned)
+        return -val if negative else val
     except ValueError:
         return None
 
@@ -577,10 +582,21 @@ def extract_features(row: dict) -> FeatureSet:
             fs.failed_disbursement_count += 1
 
         # Check if most recent closed statement is a failed disbursement
-        if not fs.failed_disbursement_most_recent:
-            stmt_status = det.get("Status", "") or stmt.get("ProcessingStatus", "") or ""
-            if stmt_status.lower() == "closed":
+        stmt_status = det.get("Status", "") or stmt.get("ProcessingStatus", "") or ""
+        if stmt_status.lower() == "closed":
+            if not fs.failed_disbursement_most_recent:
                 fs.failed_disbursement_most_recent = is_failed
+
+            # Track negative Deposit Total on closed statements (streak from most recent)
+            deposit_amt = _money_to_float(stmt.get("Deposit Total", "") or "") or 0.0
+            _streak_broken = getattr(fs, "_neg_deposit_streak_broken", False)
+            if not _streak_broken:
+                if deposit_amt < 0:
+                    fs.negative_deposit_consecutive += 1
+                    if fs.negative_deposit_consecutive == 1:
+                        fs.negative_deposit_latest = True
+                else:
+                    fs._neg_deposit_streak_broken = True  # type: ignore
 
         # Build statements_detail for LLM context (most recent 8)
         if len(fs.statements_detail) < 8:

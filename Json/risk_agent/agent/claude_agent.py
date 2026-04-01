@@ -76,6 +76,13 @@ You may add additional metrics if they are significant for the risk assessment.
 Do NOT include the raw_error or data_quality_flag in the metrics array.
 
 IMPORTANT JUDGEMENT GUIDELINES:
+0. **Hard rule floor transparency**: The `rule_engine_preliminary_score` reflects hard
+   rule floors that fired. If your `overall_risk_score` is lower than the preliminary
+   score, you MUST explicitly explain in `trigger_reason` why the hard rule signals do
+   not constitute material risk in this case (e.g. the issue is historical and resolved,
+   the account is otherwise healthy, etc.). Unexplained downward adjustments from hard
+   rule floors are not acceptable.
+
 1. Rule engine signals are alerts, not conclusions. Use them as starting points, not as
    mechanical score inputs. Weigh them against the full picture.
 
@@ -172,6 +179,8 @@ def _build_user_message(
         "stmt_reserve_change_pct": fs.stmt_reserve_change_pct,
         "failed_disbursement_count": fs.failed_disbursement_count,
         "failed_disbursement_most_recent": fs.failed_disbursement_most_recent,
+        "negative_deposit_latest":        fs.negative_deposit_latest,
+        "negative_deposit_consecutive":   fs.negative_deposit_consecutive,
         "unavailable_balance_usd": fs.unavailable_balance_amount,
         "statements_detail": fs.statements_detail,         # per-statement: period, reserve, deposit, infobox
         "stmt_reserve_periods_usd": fs.stmt_reserve_periods,  # reserve amounts most-recent-first
@@ -525,6 +534,7 @@ _RULE_METRIC_MAP: dict[str, list[str]] = {
     "POLICY_COMPLIANCE":        ["policy_compliance_total", "policy_compliance_delta"],
     "ACCOUNT_LEVEL_RESERVE":    ["stmt_reserve_latest_ratio", "stmt_reserve_avg_ratio", "stmt_reserve_change_pct"],
     "FAILED_DISBURSEMENT":      ["failed_disbursement_count"],
+    "NEGATIVE_DEPOSIT":         ["negative_deposit_consecutive"],
     "HIGH_RISK_NOTIFICATION":   ["high_risk_notification_count"],
     "CANCELLATION":             ["cancellation_rate"],
     "VALID_TRACKING":           ["valid_tracking_rate"],
@@ -571,6 +581,8 @@ def _metrics_for_triggered_rules(fs: FeatureSet, triggered_rules: list[str]) -> 
         "stmt_reserve_avg_ratio":          Metric(metric_id="stmt_reserve_avg_ratio",          value=fs.stmt_reserve_avg_ratio,            unit="ratio"),
         "stmt_reserve_change_pct":         Metric(metric_id="stmt_reserve_change_pct",         value=fs.stmt_reserve_change_pct,           unit="%"),
         "failed_disbursement_count":       Metric(metric_id="failed_disbursement_count",       value=fs.failed_disbursement_count or None, unit=None),
+        "negative_deposit_latest":         Metric(metric_id="negative_deposit_latest",         value=fs.negative_deposit_latest if fs.negative_deposit_latest else None,           unit=None),
+        "negative_deposit_consecutive":    Metric(metric_id="negative_deposit_consecutive",    value=fs.negative_deposit_consecutive if fs.negative_deposit_consecutive > 0 else None, unit="periods"),
         "high_risk_notification_count":    Metric(metric_id="high_risk_notification_count",    value=fs.high_risk_notification_count,      unit=None),
         "account_status":                  Metric(metric_id="account_status",                  value=fs.account_status,                    unit=None),
         "unavailable_balance":             Metric(metric_id="unavailable_balance",             value=fs.unavailable_balance_amount or None, unit="USD"),

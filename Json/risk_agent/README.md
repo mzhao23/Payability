@@ -146,6 +146,8 @@ Hard rules represent clear, directional risk signals. Each hard rule sets the sc
 | ~~`POLICY_COMPLIANCE_INCREASE`~~ | *Temporarily disabled — violations not distinguished by health impact* | 7 |
 | `ACCOUNT_LEVEL_RESERVE` | Reserve/revenue ratio increased ≥ 50% vs 90-day average (closed statements only, gross revenue ≥ $200) | 7 |
 | `ACC_DEACTIVATION` | Account at risk of deactivation notification on report date or previous day | 9 |
+| `NEGATIVE_DEPOSIT` | Most recent closed statement has negative Deposit Total (Amazon charging seller) | 7 |
+| `NEGATIVE_DEPOSIT` | ≥ 2 consecutive closed statements with negative Deposit Total | 8 |
 | `INV_CREDIT_CARD` | Credit card update required notification on report date or previous day | 8 |
 | `FAILED_DISBURSEMENT` | Most recent closed statement is a failed disbursement | 7 |
 
@@ -255,6 +257,8 @@ UPDATE json_risk_agent_config SET value = 10  WHERE key = 'llm_score_threshold';
 | `floor_policy_compliance` | 7 | Hard rule floor — policy violations increase |
 | `floor_reserve_consecutive` | 7 | Hard rule floor — reserve/revenue ratio spike |
 | `floor_acc_deactivation` | 9 | Hard rule floor — account deactivation risk notification on/before report date |
+| `floor_negative_deposit_single` | 7 | Hard rule floor — most recent closed statement negative Deposit Total |
+| `floor_negative_deposit_consecutive` | 8 | Hard rule floor — 2+ consecutive negative Deposit Total |
 | `floor_inv_credit_card` | 8 | Hard rule floor — credit card notification on/before report date |
 | `floor_failed_disbursement` | 7 | Hard rule floor — most recent statement failed |
 | `odr_threshold_pct` | 1.0 | ODR % to trigger hard rule |

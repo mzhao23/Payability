@@ -108,7 +108,19 @@ def score(fs: FeatureSet) -> PreScoreResult:
             "ACC_DEACTIVATION: account at risk of deactivation notification on or before report date"
         ))
 
-    # ── 7b. Credit card notification (invoice/payment issue) ─────────────────
+    # ── 7b. Negative deposit (Amazon charging seller instead of paying) ────────
+    if fs.negative_deposit_consecutive >= 2:
+        hard(cfg_int("floor_negative_deposit_consecutive"), (
+            f"NEGATIVE_DEPOSIT: {fs.negative_deposit_consecutive} consecutive closed statements "
+            f"with negative Deposit Total (Amazon charging seller)"
+        ))
+    elif fs.negative_deposit_latest:
+        hard(cfg_int("floor_negative_deposit_single"), (
+            "NEGATIVE_DEPOSIT: most recent closed statement has negative Deposit Total "
+            "(Amazon charging seller)"
+        ))
+
+    # ── 7c. Credit card notification (invoice/payment issue) ─────────────────
     if fs.inv_credit_card_notification:
         hard(cfg_int("floor_inv_credit_card"), (
             "INV_CREDIT_CARD: credit card update required notification on or before report date"

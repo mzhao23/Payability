@@ -31,6 +31,8 @@ _DEFAULTS: dict[str, float] = {
     "floor_failed_disbursement":      7,
     "floor_acc_deactivation":          9,  # account deactivation risk notification on/before report date
     "floor_inv_credit_card":           8,  # credit card notification on/before report date
+    "floor_negative_deposit_single":   7,  # most recent closed statement has negative Deposit Total
+    "floor_negative_deposit_consecutive": 8,  # 2+ consecutive closed statements with negative Deposit Total
     # Hard rule thresholds
     "odr_threshold_pct":              1.0,
     "late_shipment_threshold_pct":    4.0,
