@@ -74,6 +74,13 @@ function followUpSummary(r: SupplierReview) {
   return parts.length ? parts.join(", ") : "—";
 }
 
+/** `supplier_key__YYYY-MM-DD` from decision table row pair key (first `__` separator). */
+function parseDecisionPairKey(pairKey: string): { sk: string; rd: string } | null {
+  const i = pairKey.indexOf("__");
+  if (i <= 0) return null;
+  return { sk: pairKey.slice(0, i), rd: pairKey.slice(i + 2) };
+}
+
 /** RFC 4180-style CSV field (always quoted; doubles internal quotes). */
 function csvEscapeCell(value: unknown): string {
   if (value === null || value === undefined) return '""';
@@ -88,6 +95,23 @@ const iconSvg = {
   strokeWidth: 1.5,
   stroke: "currentColor" as const,
 };
+
+/** Compact verdict label for main records table (pill style). */
+function TableVerdictPill({ verdict }: { verdict: ReviewVerdict }) {
+  const isTrue = verdict === VERDICT_TRUE;
+  return (
+    <span
+      title={verdict}
+      className={`inline-flex px-2 py-0.5 rounded-full text-[10px] font-semibold whitespace-nowrap ${
+        isTrue
+          ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950/55 dark:text-emerald-200"
+          : "bg-red-100 text-red-800 dark:bg-red-950/50 dark:text-red-200"
+      }`}
+    >
+      {verdict}
+    </span>
+  );
+}
 
 function VerdictIconBadge({ verdict }: { verdict: ReviewVerdict }) {
   const isTrue = verdict === VERDICT_TRUE;
@@ -521,6 +545,37 @@ type SummaryQuickFilter = "all" | "critical" | "flagged" | "pending_review" | "r
 /** Narrow table by human review state (Decision: any supplier_reviews row; Consolidated: row status). */
 type ReviewStatusFilter = "all" | "pending" | "reviewed";
 
+/** Client-side filters on displayed “last review” summary columns. */
+type TableVerdictFilter = "all" | "true_positive" | "false_positive";
+type TableFollowUpFilter = "all" | "none" | "any" | "suspended" | "emailed" | "monitored";
+
+function decisionPairKeyFromRecord(r: DecisionAgentDailyRecord): string {
+  return `${String(r.supplier_key ?? "").trim()}__${String(r.report_date ?? "").trim().slice(0, 10)}`;
+}
+
+function matchesTableVerdictFilter(lr: SupplierReview | undefined, f: TableVerdictFilter): boolean {
+  if (f === "all") return true;
+  if (!lr) return false;
+  const v = normalizeVerdictFromDb(lr.verdict);
+  if (f === "true_positive") return v === VERDICT_TRUE;
+  if (f === "false_positive") return v === VERDICT_FALSE;
+  return true;
+}
+
+function matchesTableFollowUpFilter(lr: SupplierReview | undefined, f: TableFollowUpFilter): boolean {
+  if (f === "all") return true;
+  if (!lr) {
+    return f === "none";
+  }
+  const hasAny = Boolean(lr.suspended || lr.emailed || lr.monitored);
+  if (f === "none") return !hasAny;
+  if (f === "any") return hasAny;
+  if (f === "suspended") return Boolean(lr.suspended);
+  if (f === "emailed") return Boolean(lr.emailed);
+  if (f === "monitored") return Boolean(lr.monitored);
+  return true;
+}
+
 const DECISION_TABLE_ORDER_COLUMN: Record<TableSortColumn, string> = {
   date: "report_date",
   supplier: "supplier_name",
@@ -660,6 +715,13 @@ export default function DashboardPage() {
   const [tableSortState, setTableSortState] = useState<TableSortState>({ mode: "default" });
   const [summaryQuickFilter, setSummaryQuickFilter] = useState<SummaryQuickFilter>("all");
   const [reviewStatusFilter, setReviewStatusFilter] = useState<ReviewStatusFilter>("all");
+  const [tableVerdictFilter, setTableVerdictFilter] = useState<TableVerdictFilter>("all");
+  const [tableFollowUpFilter, setTableFollowUpFilter] = useState<TableFollowUpFilter>("all");
+  /** Client-side sort by last human review time (ISO string). Inactive = keep server `tableSortState` order. */
+  const [lastReviewSort, setLastReviewSort] = useState<{ active: boolean; ascending: boolean }>({
+    active: false,
+    ascending: false,
+  });
 
   const [selectedDecisionRecord, setSelectedDecisionRecord] = useState<DecisionAgentDailyRecord | null>(null);
   const [selectedConsolidatedRecord, setSelectedConsolidatedRecord] = useState<ConsolidatedFlaggedRecord | null>(null);
@@ -689,6 +751,15 @@ export default function DashboardPage() {
   const [appRole, setAppRole] = useState<AppRole | null>(null);
   /** `(supplier_key)__(report_date)` with any supplier_reviews row — Decision table Status. */
   const [decisionReviewedPairSet, setDecisionReviewedPairSet] = useState<Set<string>>(() => new Set());
+  /**
+   * For decision rows: latest review for that exact calendar day if any; else latest prior-day review
+   * for the same `supplier_key` (`report_date` < row date). Status still uses only exact-day reviews.
+   */
+  const [decisionDisplayReviewByPair, setDecisionDisplayReviewByPair] = useState<Record<string, SupplierReview>>({});
+  /** Latest review per `flagged_record_id` for consolidated table rows. */
+  const [consolidatedLastReviewByFlagId, setConsolidatedLastReviewByFlagId] = useState<
+    Record<string, SupplierReview>
+  >({});
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [myReviewsOpen, setMyReviewsOpen] = useState(false);
   const [myReviewsRows, setMyReviewsRows] = useState<SupplierReview[]>([]);
@@ -927,6 +998,7 @@ export default function DashboardPage() {
   useEffect(() => {
     if (!user || !isDecisionView || decisionRecords.length === 0) {
       setDecisionReviewedPairSet(new Set());
+      setDecisionDisplayReviewByPair({});
       return;
     }
     let cancelled = false;
@@ -938,41 +1010,112 @@ export default function DashboardPage() {
         new Set(decisionRecords.map((r) => String(r.report_date ?? "").trim()).filter(Boolean))
       );
       if (keys.length === 0 || dates.length === 0) {
-        if (!cancelled) setDecisionReviewedPairSet(new Set());
+        if (!cancelled) {
+          setDecisionReviewedPairSet(new Set());
+          setDecisionDisplayReviewByPair({});
+        }
         return;
       }
       const sorted = dates.slice().sort();
-      const lo = sorted[0];
       const hi = sorted[sorted.length - 1];
+      /** All reviews for these suppliers on or before the latest date shown — includes prior days for fallback. */
       const { data, error } = await supabase
         .from("supplier_reviews")
-        .select("supplier_key,report_date")
+        .select("*")
         .in("supplier_key", keys)
-        .gte("report_date", lo)
         .lte("report_date", hi);
       if (cancelled) return;
       if (error) {
         console.error("Load decision review status:", error);
         setDecisionReviewedPairSet(new Set());
+        setDecisionDisplayReviewByPair({});
         return;
       }
+      const rows = (data ?? []) as SupplierReview[];
       const validPairs = new Set(
         decisionRecords.map(
           (r) => `${String(r.supplier_key ?? "").trim()}__${String(r.report_date ?? "").trim().slice(0, 10)}`
         )
       );
-      const reviewed = new Set<string>();
-      for (const row of data ?? []) {
-        const d = row.report_date != null ? String(row.report_date).trim().slice(0, 10) : "";
-        const k = `${String(row.supplier_key ?? "").trim()}__${d}`;
-        if (d && validPairs.has(k)) reviewed.add(k);
+      const lastExactByPair: Record<string, SupplierReview> = {};
+      for (const rev of rows) {
+        const d = rev.report_date != null ? String(rev.report_date).trim().slice(0, 10) : "";
+        const k = `${String(rev.supplier_key ?? "").trim()}__${d}`;
+        if (!d || !validPairs.has(k)) continue;
+        const prev = lastExactByPair[k];
+        if (!prev || String(rev.created_at) > String(prev.created_at)) lastExactByPair[k] = rev;
+      }
+      const reviewed = new Set(Object.keys(lastExactByPair));
+      const displayByPair: Record<string, SupplierReview> = {};
+      for (const pairKey of validPairs) {
+        const exact = lastExactByPair[pairKey];
+        if (exact) {
+          displayByPair[pairKey] = exact;
+          continue;
+        }
+        const parsed = parseDecisionPairKey(pairKey);
+        if (!parsed) continue;
+        let best: SupplierReview | null = null;
+        for (const rev of rows) {
+          if (String(rev.supplier_key ?? "").trim() !== parsed.sk) continue;
+          const revRd = rev.report_date != null ? String(rev.report_date).trim().slice(0, 10) : "";
+          if (!revRd || revRd >= parsed.rd) continue;
+          if (!best || String(rev.created_at) > String(best.created_at)) best = rev;
+        }
+        if (best) displayByPair[pairKey] = best;
       }
       setDecisionReviewedPairSet(reviewed);
+      setDecisionDisplayReviewByPair(displayByPair);
     })();
     return () => {
       cancelled = true;
     };
   }, [user, isDecisionView, decisionRecords, supabase]);
+
+  useEffect(() => {
+    if (!user || isDecisionView || consolidatedRecords.length === 0) {
+      setConsolidatedLastReviewByFlagId({});
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const ids = [
+        ...new Set(
+          consolidatedRecords
+            .map((r) => r.id)
+            .filter((id): id is number => typeof id === "number" && Number.isFinite(id))
+        ),
+      ];
+      if (ids.length === 0) {
+        if (!cancelled) setConsolidatedLastReviewByFlagId({});
+        return;
+      }
+      const { data, error } = await supabase
+        .from("supplier_reviews")
+        .select("*")
+        .in("flagged_record_id", ids);
+      if (cancelled) return;
+      if (error) {
+        console.error("Load consolidated review summary:", error);
+        setConsolidatedLastReviewByFlagId({});
+        return;
+      }
+      const idSet = new Set(ids);
+      const lastByFlag: Record<string, SupplierReview> = {};
+      for (const row of data ?? []) {
+        const rev = row as SupplierReview;
+        const fid = rev.flagged_record_id;
+        if (typeof fid !== "number" || !Number.isFinite(fid) || !idSet.has(fid)) continue;
+        const key = String(fid);
+        const prev = lastByFlag[key];
+        if (!prev || String(rev.created_at) > String(prev.created_at)) lastByFlag[key] = rev;
+      }
+      setConsolidatedLastReviewByFlagId(lastByFlag);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user, isDecisionView, consolidatedRecords, supabase]);
 
   function requestTableSort(column: TableSortColumn) {
     setTableSortState((prev) => {
@@ -1043,6 +1186,68 @@ export default function DashboardPage() {
     }
     return displayConsolidatedRecords.filter((r) => r.status !== "reviewed");
   }, [displayConsolidatedRecords, reviewStatusFilter]);
+
+  const filteredByReviewSummaryDecision = useMemo(() => {
+    return tableDecisionRecords.filter((r) => {
+      const lr = decisionDisplayReviewByPair[decisionPairKeyFromRecord(r)];
+      return (
+        matchesTableVerdictFilter(lr, tableVerdictFilter) &&
+        matchesTableFollowUpFilter(lr, tableFollowUpFilter)
+      );
+    });
+  }, [tableDecisionRecords, decisionDisplayReviewByPair, tableVerdictFilter, tableFollowUpFilter]);
+
+  const filteredByReviewSummaryConsolidated = useMemo(() => {
+    return tableConsolidatedRecords.filter((r) => {
+      const lr = consolidatedLastReviewByFlagId[String(r.id)];
+      return (
+        matchesTableVerdictFilter(lr, tableVerdictFilter) &&
+        matchesTableFollowUpFilter(lr, tableFollowUpFilter)
+      );
+    });
+  }, [tableConsolidatedRecords, consolidatedLastReviewByFlagId, tableVerdictFilter, tableFollowUpFilter]);
+
+  const visibleDecisionTableRecords = useMemo(() => {
+    const rows = [...filteredByReviewSummaryDecision];
+    if (!lastReviewSort.active) return rows;
+    const asc = lastReviewSort.ascending;
+    rows.sort((a, b) => {
+      const ta = decisionDisplayReviewByPair[decisionPairKeyFromRecord(a)]?.created_at ?? "";
+      const tb = decisionDisplayReviewByPair[decisionPairKeyFromRecord(b)]?.created_at ?? "";
+      if (!ta && !tb) return (a.id as number) - (b.id as number);
+      if (!ta) return 1;
+      if (!tb) return -1;
+      const c = String(ta).localeCompare(String(tb));
+      if (c !== 0) return asc ? c : -c;
+      return (a.id as number) - (b.id as number);
+    });
+    return rows;
+  }, [filteredByReviewSummaryDecision, lastReviewSort, decisionDisplayReviewByPair]);
+
+  const visibleConsolidatedTableRecords = useMemo(() => {
+    const rows = [...filteredByReviewSummaryConsolidated];
+    if (!lastReviewSort.active) return rows;
+    const asc = lastReviewSort.ascending;
+    rows.sort((a, b) => {
+      const ta = consolidatedLastReviewByFlagId[String(a.id)]?.created_at ?? "";
+      const tb = consolidatedLastReviewByFlagId[String(b.id)]?.created_at ?? "";
+      if (!ta && !tb) return a.id - b.id;
+      if (!ta) return 1;
+      if (!tb) return -1;
+      const c = String(ta).localeCompare(String(tb));
+      if (c !== 0) return asc ? c : -c;
+      return a.id - b.id;
+    });
+    return rows;
+  }, [filteredByReviewSummaryConsolidated, lastReviewSort, consolidatedLastReviewByFlagId]);
+
+  function requestLastReviewSort() {
+    setLastReviewSort((prev) => {
+      if (!prev.active) return { active: true, ascending: false };
+      if (!prev.ascending) return { active: true, ascending: true };
+      return { active: false, ascending: false };
+    });
+  }
 
   function onSummaryCardClick(filter: SummaryQuickFilter) {
     if (filter === "all") {
@@ -1799,7 +2004,7 @@ export default function DashboardPage() {
           </div>
         )}
         {/* Filters */}
-        <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 mb-6 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
+        <div className="bg-white dark:bg-zinc-900 rounded-lg shadow border border-gray-200 dark:border-zinc-800 p-4 mb-6 grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-8 gap-3">
           <div>
             <label className={LABEL}>Date</label>
             <select
@@ -1883,6 +2088,33 @@ export default function DashboardPage() {
               <option value="all">All</option>
               <option value="pending">Pending</option>
               <option value="reviewed">Reviewed</option>
+            </select>
+          </div>
+          <div>
+            <label className={LABEL}>Review verdict</label>
+            <select
+              value={tableVerdictFilter}
+              onChange={(e) => setTableVerdictFilter(e.target.value as TableVerdictFilter)}
+              className={FIELD_FULL}
+            >
+              <option value="all">All</option>
+              <option value="true_positive">True Positive</option>
+              <option value="false_positive">False Positive</option>
+            </select>
+          </div>
+          <div>
+            <label className={LABEL}>Follow-up</label>
+            <select
+              value={tableFollowUpFilter}
+              onChange={(e) => setTableFollowUpFilter(e.target.value as TableFollowUpFilter)}
+              className={FIELD_FULL}
+            >
+              <option value="all">All</option>
+              <option value="none">None</option>
+              <option value="any">Any</option>
+              <option value="suspended">Suspended</option>
+              <option value="emailed">Emailed</option>
+              <option value="monitored">Monitored</option>
             </select>
           </div>
           <div>
@@ -2033,29 +2265,88 @@ export default function DashboardPage() {
                   ascending={sortQuery.ascending}
                   onRequestSort={requestTableSort}
                 />
-                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Reason</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400 w-[1%] max-w-[6rem] sm:max-w-[9rem] whitespace-nowrap">
+                  Reason
+                </th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Status</th>
+                <th
+                  scope="col"
+                  className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400"
+                >
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      requestLastReviewSort();
+                    }}
+                    className="inline-flex items-center gap-0.5 rounded -mx-1 px-1 py-0.5 text-left hover:bg-gray-200/80 dark:hover:bg-zinc-700/80"
+                    aria-label={`Sort by last review time, ${
+                      lastReviewSort.active
+                        ? lastReviewSort.ascending
+                          ? "ascending"
+                          : "descending"
+                        : "inactive"
+                    }`}
+                    aria-sort={
+                      lastReviewSort.active
+                        ? lastReviewSort.ascending
+                          ? "ascending"
+                          : "descending"
+                        : "none"
+                    }
+                  >
+                    <span>Last review</span>
+                    <span
+                      className={`text-[10px] tabular-nums ${
+                        lastReviewSort.active
+                          ? "text-gray-800 dark:text-zinc-200"
+                          : "text-gray-400 dark:text-zinc-500"
+                      }`}
+                      aria-hidden
+                    >
+                      {lastReviewSort.active ? (lastReviewSort.ascending ? "↑" : "↓") : "↕"}
+                    </span>
+                  </button>
+                </th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Verdict</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">Follow-up</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-200 dark:divide-zinc-700">
               {loading ? (
-                <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">Loading...</td></tr>
+                <tr>
+                  <td colSpan={10} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">
+                    Loading...
+                  </td>
+                </tr>
               ) : (isDecisionView ? decisionRecords.length === 0 : consolidatedRecords.length === 0) ? (
-                <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">No records found</td></tr>
+                <tr>
+                  <td colSpan={10} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">
+                    No records found
+                  </td>
+                </tr>
               ) : (isDecisionView ? displayDecisionRecords.length === 0 : displayConsolidatedRecords.length === 0) ? (
                 <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">
+                  <td colSpan={10} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">
                     No rows match this summary filter. Click the same card again or choose &quot;Flagged Total&quot; to show all.
                   </td>
                 </tr>
               ) : (isDecisionView ? tableDecisionRecords.length === 0 : tableConsolidatedRecords.length === 0) ? (
                 <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">
+                  <td colSpan={10} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">
                     No rows match this review status filter. Choose &quot;All&quot; or another option to show rows.
                   </td>
                 </tr>
+              ) : (isDecisionView
+                  ? filteredByReviewSummaryDecision.length === 0
+                  : filteredByReviewSummaryConsolidated.length === 0) ? (
+                <tr>
+                  <td colSpan={10} className="px-4 py-8 text-center text-gray-400 dark:text-zinc-500">
+                    No rows match the review verdict or follow-up filters. Set both to &quot;All&quot; to show rows.
+                  </td>
+                </tr>
               ) : (
-                (isDecisionView ? tableDecisionRecords : tableConsolidatedRecords).map((r) => (
+                (isDecisionView ? visibleDecisionTableRecords : visibleConsolidatedTableRecords).map((r) => (
                   isDecisionView ? (
                     <tr key={(r as DecisionAgentDailyRecord).id} onClick={() => openDecisionDetail(r as DecisionAgentDailyRecord)} className="hover:bg-blue-50 dark:hover:bg-zinc-800 cursor-pointer">
                       <td className="px-4 py-3 text-gray-600 dark:text-zinc-300">{(r as DecisionAgentDailyRecord).report_date ?? "—"}</td>
@@ -2073,8 +2364,22 @@ export default function DashboardPage() {
                       <td className="px-4 py-3">
                         <span className="text-gray-700 dark:text-zinc-200 text-xs font-medium">Decision Agent</span>
                       </td>
-                      <td className="px-4 py-3 text-gray-600 dark:text-zinc-300 text-xs max-w-xs truncate">
-                        {(r as DecisionAgentDailyRecord).reason ?? ""}
+                      <td className="px-2 py-3 text-gray-600 dark:text-zinc-300 text-xs w-0 max-w-[5rem] sm:max-w-[8rem] align-top">
+                        {(() => {
+                          const dr = r as DecisionAgentDailyRecord;
+                          const full =
+                            dr.reason != null && String(dr.reason).trim() !== ""
+                              ? String(dr.reason).trim()
+                              : "";
+                          return (
+                            <span
+                              className="block min-w-0 truncate cursor-default"
+                              title={full || undefined}
+                            >
+                              {full || "—"}
+                            </span>
+                          );
+                        })()}
                       </td>
                       <td className="px-4 py-3">
                         {(() => {
@@ -2094,6 +2399,28 @@ export default function DashboardPage() {
                           );
                         })()}
                       </td>
+                      {(() => {
+                        const dr = r as DecisionAgentDailyRecord;
+                        const pairKey = `${String(dr.supplier_key ?? "").trim()}__${String(dr.report_date ?? "").trim().slice(0, 10)}`;
+                        const lr = decisionDisplayReviewByPair[pairKey];
+                        return (
+                          <>
+                            <td className="px-4 py-3 text-gray-600 dark:text-zinc-300 text-xs whitespace-nowrap">
+                              {lr ? formatEastern(lr.created_at) : "—"}
+                            </td>
+                            <td className="px-4 py-3 text-xs align-middle">
+                              {lr ? (
+                                <TableVerdictPill verdict={normalizeVerdictFromDb(lr.verdict)} />
+                              ) : (
+                                <span className="text-gray-400 dark:text-zinc-500">—</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 text-gray-600 dark:text-zinc-400 text-xs">
+                              {lr ? followUpSummary(lr) : "—"}
+                            </td>
+                          </>
+                        );
+                      })()}
                     </tr>
                   ) : (
                     <tr key={(r as ConsolidatedFlaggedRecord).id} onClick={() => openConsolidatedDetail(r as ConsolidatedFlaggedRecord)} className="hover:bg-blue-50 dark:hover:bg-zinc-800 cursor-pointer">
@@ -2124,8 +2451,23 @@ export default function DashboardPage() {
                           </div>
                         )}
                       </td>
-                      <td className="px-4 py-3 text-gray-600 dark:text-zinc-300 text-xs max-w-xs truncate">
-                        {Array.isArray((r as ConsolidatedFlaggedRecord).reasons) ? (r as ConsolidatedFlaggedRecord).reasons[0] : ""}
+                      <td className="px-2 py-3 text-gray-600 dark:text-zinc-300 text-xs w-0 max-w-[5rem] sm:max-w-[8rem] align-top">
+                        {(() => {
+                          const cr = r as ConsolidatedFlaggedRecord;
+                          const parts = Array.isArray(cr.reasons)
+                            ? cr.reasons.filter((x) => x != null && String(x).trim() !== "").map(String)
+                            : [];
+                          const full = parts.join(" · ");
+                          const preview = parts[0] ?? "";
+                          return (
+                            <span
+                              className="block min-w-0 truncate cursor-default"
+                              title={full || undefined}
+                            >
+                              {preview || "—"}
+                            </span>
+                          );
+                        })()}
                       </td>
                       <td className="px-4 py-3">
                         <span className={`inline-flex px-2 py-0.5 rounded text-xs ${
@@ -2134,6 +2476,27 @@ export default function DashboardPage() {
                             : "bg-orange-100 text-orange-700 dark:bg-orange-950/40 dark:text-orange-300"
                         }`}>{(r as ConsolidatedFlaggedRecord).status === "reviewed" ? "Reviewed" : "Pending"}</span>
                       </td>
+                      {(() => {
+                        const cr = r as ConsolidatedFlaggedRecord;
+                        const lr = consolidatedLastReviewByFlagId[String(cr.id)];
+                        return (
+                          <>
+                            <td className="px-4 py-3 text-gray-600 dark:text-zinc-300 text-xs whitespace-nowrap">
+                              {lr ? formatEastern(lr.created_at) : "—"}
+                            </td>
+                            <td className="px-4 py-3 text-xs align-middle">
+                              {lr ? (
+                                <TableVerdictPill verdict={normalizeVerdictFromDb(lr.verdict)} />
+                              ) : (
+                                <span className="text-gray-400 dark:text-zinc-500">—</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 text-gray-600 dark:text-zinc-400 text-xs">
+                              {lr ? followUpSummary(lr) : "—"}
+                            </td>
+                          </>
+                        );
+                      })()}
                     </tr>
                   )
                 ))
