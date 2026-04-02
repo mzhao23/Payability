@@ -756,7 +756,7 @@ export default function DashboardPage() {
    * for the same `supplier_key` (`report_date` < row date). Status still uses only exact-day reviews.
    */
   const [decisionDisplayReviewByPair, setDecisionDisplayReviewByPair] = useState<Record<string, SupplierReview>>({});
-  /** Latest review per `flagged_record_id` for consolidated table rows. */
+  /** Per consolidated row id → latest `supplier_reviews` row for that row's `supplier_key` (by `created_at`). */
   const [consolidatedLastReviewByFlagId, setConsolidatedLastReviewByFlagId] = useState<
     Record<string, SupplierReview>
   >({});
@@ -1079,36 +1079,37 @@ export default function DashboardPage() {
     }
     let cancelled = false;
     (async () => {
-      const ids = [
-        ...new Set(
-          consolidatedRecords
-            .map((r) => r.id)
-            .filter((id): id is number => typeof id === "number" && Number.isFinite(id))
-        ),
+      const keys = [
+        ...new Set(consolidatedRecords.map((r) => String(r.supplier_key ?? "").trim()).filter(Boolean)),
       ];
-      if (ids.length === 0) {
+      if (keys.length === 0) {
         if (!cancelled) setConsolidatedLastReviewByFlagId({});
         return;
       }
       const { data, error } = await supabase
         .from("supplier_reviews")
         .select("*")
-        .in("flagged_record_id", ids);
+        .in("supplier_key", keys)
+        .order("created_at", { ascending: false })
+        .limit(8000);
       if (cancelled) return;
       if (error) {
         console.error("Load consolidated review summary:", error);
         setConsolidatedLastReviewByFlagId({});
         return;
       }
-      const idSet = new Set(ids);
-      const lastByFlag: Record<string, SupplierReview> = {};
+      const latestBySupplierKey: Record<string, SupplierReview> = {};
       for (const row of data ?? []) {
         const rev = row as SupplierReview;
-        const fid = rev.flagged_record_id;
-        if (typeof fid !== "number" || !Number.isFinite(fid) || !idSet.has(fid)) continue;
-        const key = String(fid);
-        const prev = lastByFlag[key];
-        if (!prev || String(rev.created_at) > String(prev.created_at)) lastByFlag[key] = rev;
+        const sk = String(rev.supplier_key ?? "").trim();
+        if (!sk) continue;
+        if (!latestBySupplierKey[sk]) latestBySupplierKey[sk] = rev;
+      }
+      const lastByFlag: Record<string, SupplierReview> = {};
+      for (const cr of consolidatedRecords) {
+        const sk = String(cr.supplier_key ?? "").trim();
+        const lr = sk ? latestBySupplierKey[sk] : undefined;
+        if (lr) lastByFlag[String(cr.id)] = lr;
       }
       setConsolidatedLastReviewByFlagId(lastByFlag);
     })();
