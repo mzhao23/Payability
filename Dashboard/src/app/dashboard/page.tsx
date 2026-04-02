@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useCallback, useMemo, type ReactNode } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef, type ReactNode } from "react";
 import { getSupabaseBrowser } from "@/lib/supabase-browser";
 import { EASTERN_TZ, easternDateYmd, easternYmdToUtcRange } from "@/lib/eastern-date";
 import { useRouter } from "next/navigation";
@@ -38,6 +38,8 @@ type SupplierReview = {
   flagged_record_id?: number | null;
   decision_daily_report_id?: number | null;
   supplier_key: string;
+  /** Set on insert if present in DB; otherwise filled when loading “My review history”. */
+  supplier_name?: string | null;
   report_date?: string | null;
   reviewer_id: string;
   reviewer_email: string;
@@ -586,6 +588,56 @@ function TableSortHeader({
   );
 }
 
+type MyReviewSortColumn =
+  | "time"
+  | "supplier_name"
+  | "supplier_key"
+  | "report_date"
+  | "agent"
+  | "verdict"
+  | "follow_up"
+  | "comment";
+
+function MyReviewSortHeader({
+  label,
+  column,
+  activeColumn,
+  ascending,
+  onRequestSort,
+}: {
+  label: string;
+  column: MyReviewSortColumn;
+  activeColumn: MyReviewSortColumn;
+  ascending: boolean;
+  onRequestSort: (column: MyReviewSortColumn) => void;
+}) {
+  const active = activeColumn === column;
+  return (
+    <th scope="col" className="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-zinc-400">
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onRequestSort(column);
+        }}
+        className="inline-flex items-center gap-0.5 rounded -mx-1 px-1 py-0.5 text-left hover:bg-gray-200/80 dark:hover:bg-zinc-700/80"
+        aria-label={`Sort by ${label}, ${active ? (ascending ? "ascending" : "descending") : "not sorted"}`}
+        aria-sort={active ? (ascending ? "ascending" : "descending") : "none"}
+      >
+        <span>{label}</span>
+        <span
+          className={`text-[10px] tabular-nums ${
+            active ? "text-gray-800 dark:text-zinc-200" : "text-gray-400 dark:text-zinc-500"
+          }`}
+          aria-hidden
+        >
+          {active ? (ascending ? "↑" : "↓") : "↕"}
+        </span>
+      </button>
+    </th>
+  );
+}
+
 export default function DashboardPage() {
   /** Single client for the page lifetime — avoids unstable reference in effect deps (see decision review Set). */
   const supabase = useMemo(() => getSupabaseBrowser(), []);
@@ -637,6 +689,71 @@ export default function DashboardPage() {
   const [appRole, setAppRole] = useState<AppRole | null>(null);
   /** `(supplier_key)__(report_date)` with any supplier_reviews row — Decision table Status. */
   const [decisionReviewedPairSet, setDecisionReviewedPairSet] = useState<Set<string>>(() => new Set());
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [myReviewsOpen, setMyReviewsOpen] = useState(false);
+  const [myReviewsRows, setMyReviewsRows] = useState<SupplierReview[]>([]);
+  const [myReviewsLoading, setMyReviewsLoading] = useState(false);
+  const [myReviewsError, setMyReviewsError] = useState("");
+  /** Client-side sort for “My review history” (default: time desc = newest first). */
+  const [myReviewsSort, setMyReviewsSort] = useState<{
+    column: MyReviewSortColumn;
+    ascending: boolean;
+  }>({ column: "time", ascending: false });
+  const accountMenuRef = useRef<HTMLDivElement | null>(null);
+
+  const requestMyReviewSort = useCallback((column: MyReviewSortColumn) => {
+    setMyReviewsSort((prev) => {
+      if (prev.column === column) return { column, ascending: !prev.ascending };
+      return { column, ascending: column === "time" ? false : true };
+    });
+  }, []);
+
+  const myReviewsDisplayed = useMemo(() => {
+    const rows = [...myReviewsRows];
+    const { column, ascending } = myReviewsSort;
+    const dir = ascending ? 1 : -1;
+    const strCmp = (a: unknown, b: unknown) => {
+      const sa = String(a ?? "").trim().toLowerCase();
+      const sb = String(b ?? "").trim().toLowerCase();
+      if (sa < sb) return -1;
+      if (sa > sb) return 1;
+      return 0;
+    };
+    rows.sort((a, b) => {
+      let cmp = 0;
+      switch (column) {
+        case "time":
+          cmp = new Date(a.created_at).getTime() - new Date(b.created_at).getTime();
+          break;
+        case "supplier_name":
+          cmp = strCmp(a.supplier_name, b.supplier_name);
+          break;
+        case "supplier_key":
+          cmp = strCmp(a.supplier_key, b.supplier_key);
+          break;
+        case "report_date":
+          cmp = strCmp(a.report_date, b.report_date);
+          break;
+        case "agent":
+          cmp = strCmp(a.source, b.source);
+          break;
+        case "verdict":
+          cmp = strCmp(normalizeVerdictFromDb(a.verdict), normalizeVerdictFromDb(b.verdict));
+          break;
+        case "follow_up":
+          cmp = strCmp(followUpSummary(a), followUpSummary(b));
+          break;
+        case "comment":
+          cmp = strCmp(a.comment, b.comment);
+          break;
+        default:
+          break;
+      }
+      if (cmp !== 0) return cmp * dir;
+      return strCmp(a.id, b.id);
+    });
+    return rows;
+  }, [myReviewsRows, myReviewsSort]);
 
   const canReview = appRole === "reviewer" || appRole === "admin";
   const isAdmin = appRole === "admin";
@@ -721,6 +838,17 @@ export default function DashboardPage() {
     selectedDecisionRecord?.supplier_key,
     selectedDecisionRecord?.report_date,
   ]);
+
+  useEffect(() => {
+    if (!accountMenuOpen) return;
+    function onDocMouseDown(e: MouseEvent) {
+      if (accountMenuRef.current && !accountMenuRef.current.contains(e.target as Node)) {
+        setAccountMenuOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", onDocMouseDown);
+    return () => document.removeEventListener("mousedown", onDocMouseDown);
+  }, [accountMenuOpen]);
 
   useEffect(() => {
     if (user) loadRecords();
@@ -1021,6 +1149,61 @@ export default function DashboardPage() {
     setDetailBaseMetricsLoading(false);
     setRiskHistory([]);
     await loadReviewsForConsolidatedRecord(record);
+  }
+
+  /** Open main detail modal from a row in My review history (by FK or supplier_key + report_date). */
+  async function openDetailFromReviewRow(r: SupplierReview) {
+    setMyReviewsOpen(false);
+    setAccountMenuOpen(false);
+
+    const decisionId = r.decision_daily_report_id;
+    if (typeof decisionId === "number" && Number.isFinite(decisionId)) {
+      const { data, error } = await supabase
+        .from("decision_agent_daily_report")
+        .select("*")
+        .eq("id", decisionId)
+        .maybeSingle();
+      if (!error && data) {
+        await openDecisionDetail(data as DecisionAgentDailyRecord);
+        setReviewAgentLabel(r.source?.trim() ? r.source : "Decision Agent");
+        return;
+      }
+    }
+
+    const flaggedId = r.flagged_record_id;
+    if (typeof flaggedId === "number" && Number.isFinite(flaggedId)) {
+      const { data, error } = await supabase
+        .from("consolidated_flagged_supplier_list")
+        .select("*")
+        .eq("id", flaggedId)
+        .maybeSingle();
+      if (!error && data) {
+        await openConsolidatedDetail(data as ConsolidatedFlaggedRecord);
+        return;
+      }
+    }
+
+    const sk = String(r.supplier_key ?? "").trim();
+    const rd = String(r.report_date ?? "").trim().slice(0, 10);
+    if (sk && /^\d{4}-\d{2}-\d{2}$/.test(rd)) {
+      const { data, error } = await supabase
+        .from("decision_agent_daily_report")
+        .select("*")
+        .eq("supplier_key", sk)
+        .eq("report_date", rd)
+        .order("id", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (!error && data) {
+        await openDecisionDetail(data as DecisionAgentDailyRecord);
+        setReviewAgentLabel(r.source?.trim() ? r.source : "Decision Agent");
+        return;
+      }
+    }
+
+    window.alert(
+      "Could not open this record. It may have been removed, or your filters/permissions may differ."
+    );
   }
 
   function validateReviewFields() {
@@ -1418,6 +1601,127 @@ export default function DashboardPage() {
     router.push("/login");
   }
 
+  const loadMyReviews = useCallback(async () => {
+    if (!user?.id) return;
+    setMyReviewsLoading(true);
+    setMyReviewsError("");
+    const { data, error } = await supabase
+      .from("supplier_reviews")
+      .select("*")
+      .eq("reviewer_id", user.id)
+      .order("created_at", { ascending: false })
+      .limit(500);
+    if (error) {
+      setMyReviewsLoading(false);
+      setMyReviewsError(mapSupabasePermissionError(error));
+      setMyReviewsRows([]);
+      return;
+    }
+    const rows = (data as SupplierReview[]) ?? [];
+
+    const decisionIds = [
+      ...new Set(
+        rows
+          .map((r) => r.decision_daily_report_id)
+          .filter((x): x is number => typeof x === "number" && Number.isFinite(x))
+      ),
+    ];
+    const flaggedIds = [
+      ...new Set(
+        rows
+          .map((r) => r.flagged_record_id)
+          .filter((x): x is number => typeof x === "number" && Number.isFinite(x))
+      ),
+    ];
+
+    const nameByDecisionId = new Map<number, string | null>();
+    const nameByFlagId = new Map<number, string | null>();
+
+    if (decisionIds.length > 0) {
+      const { data: dRows, error: dErr } = await supabase
+        .from("decision_agent_daily_report")
+        .select("id,supplier_name")
+        .in("id", decisionIds);
+      if (!dErr) {
+        for (const row of dRows ?? []) {
+          const rec = row as { id: number; supplier_name: string | null };
+          if (rec && typeof rec.id === "number") nameByDecisionId.set(rec.id, rec.supplier_name ?? null);
+        }
+      }
+    }
+    if (flaggedIds.length > 0) {
+      const { data: fRows, error: fErr } = await supabase
+        .from("consolidated_flagged_supplier_list")
+        .select("id,supplier_name")
+        .in("id", flaggedIds);
+      if (!fErr) {
+        for (const row of fRows ?? []) {
+          const rec = row as { id: number; supplier_name: string | null };
+          if (rec && typeof rec.id === "number") nameByFlagId.set(rec.id, rec.supplier_name ?? null);
+        }
+      }
+    }
+
+    let enriched: SupplierReview[] = rows.map((r) => {
+      const fromDb = r.supplier_name;
+      if (fromDb != null && String(fromDb).trim() !== "") return r;
+      let supplier_name: string | null | undefined = fromDb ?? null;
+      const did = r.decision_daily_report_id;
+      if (typeof did === "number" && nameByDecisionId.has(did)) supplier_name = nameByDecisionId.get(did) ?? null;
+      const fid = r.flagged_record_id;
+      if (
+        (supplier_name == null || String(supplier_name).trim() === "") &&
+        typeof fid === "number" &&
+        nameByFlagId.has(fid)
+      ) {
+        supplier_name = nameByFlagId.get(fid) ?? null;
+      }
+      return { ...r, supplier_name: supplier_name ?? null };
+    });
+
+    const stillMissing = enriched.filter(
+      (r) =>
+        (r.supplier_name == null || String(r.supplier_name).trim() === "") &&
+        String(r.supplier_key ?? "").trim() &&
+        r.report_date
+    );
+    if (stillMissing.length > 0) {
+      const keys = [...new Set(stillMissing.map((r) => String(r.supplier_key).trim()))];
+      const ymds = stillMissing
+        .map((r) => String(r.report_date).trim().slice(0, 10))
+        .filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d));
+      if (keys.length > 0 && ymds.length > 0) {
+        const lo = ymds.slice().sort()[0];
+        const hi = ymds.slice().sort()[ymds.length - 1];
+        const { data: decFallback } = await supabase
+          .from("decision_agent_daily_report")
+          .select("supplier_key,report_date,supplier_name")
+          .in("supplier_key", keys)
+          .gte("report_date", lo)
+          .lte("report_date", hi);
+        const pairToName = new Map<string, string | null>();
+        for (const row of decFallback ?? []) {
+          const rec = row as { supplier_key: string; report_date: string; supplier_name: string | null };
+          const sk = String(rec.supplier_key ?? "").trim();
+          const rd = String(rec.report_date ?? "").slice(0, 10);
+          if (sk && rd) pairToName.set(`${sk}__${rd}`, rec.supplier_name ?? null);
+        }
+        enriched = enriched.map((r) => {
+          if (r.supplier_name != null && String(r.supplier_name).trim() !== "") return r;
+          const sk = String(r.supplier_key ?? "").trim();
+          const rd = String(r.report_date ?? "").slice(0, 10);
+          if (!sk || !rd) return r;
+          const pair = `${sk}__${rd}`;
+          if (pairToName.has(pair)) return { ...r, supplier_name: pairToName.get(pair) ?? null };
+          return r;
+        });
+      }
+    }
+
+    setMyReviewsRows(enriched);
+    setMyReviewsLoading(false);
+  }, [user?.id, supabase]);
+
   const hasMyReview = useMemo(() => {
     if (!user?.id) return false;
     if (selectedConsolidatedRecord) {
@@ -1441,10 +1745,50 @@ export default function DashboardPage() {
           <span className="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-zinc-400 px-2 py-0.5 rounded border border-gray-200 dark:border-zinc-600">
             {appRole}
           </span>
-          <span className="text-sm text-gray-500 dark:text-zinc-400">{user.email}</span>
-          <button onClick={handleLogout} className="text-sm text-red-600 dark:text-red-400 hover:underline">
-            Sign Out
-          </button>
+          <div className="relative" ref={accountMenuRef}>
+            <button
+              type="button"
+              onClick={() => setAccountMenuOpen((o) => !o)}
+              className="flex items-center gap-1 max-w-[min(100vw-12rem,16rem)] rounded-md border border-transparent px-2 py-1 text-sm text-gray-700 dark:text-zinc-200 hover:border-gray-200 hover:bg-gray-50 dark:hover:border-zinc-600 dark:hover:bg-zinc-800/80"
+              aria-expanded={accountMenuOpen}
+              aria-haspopup="menu"
+            >
+              <span className="truncate">{user.email ?? "Account"}</span>
+              <span className="shrink-0 text-gray-400 dark:text-zinc-500" aria-hidden>
+                ▾
+              </span>
+            </button>
+            {accountMenuOpen && (
+              <div
+                role="menu"
+                className="absolute right-0 mt-1 w-56 rounded-lg border border-gray-200 dark:border-zinc-600 bg-white dark:bg-zinc-900 py-1 shadow-lg z-[100]"
+              >
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="w-full text-left px-3 py-2 text-sm text-gray-800 dark:text-zinc-200 hover:bg-gray-50 dark:hover:bg-zinc-800"
+                  onClick={() => {
+                    setAccountMenuOpen(false);
+                    setMyReviewsOpen(true);
+                    void loadMyReviews();
+                  }}
+                >
+                  My review history
+                </button>
+                <button
+                  type="button"
+                  role="menuitem"
+                  className="w-full text-left px-3 py-2 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30"
+                  onClick={() => {
+                    setAccountMenuOpen(false);
+                    void handleLogout();
+                  }}
+                >
+                  Sign out
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </header>
 
@@ -2568,6 +2912,159 @@ export default function DashboardPage() {
                   )}
                 </div>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {myReviewsOpen && (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
+          <button
+            type="button"
+            className="absolute inset-0 bg-black/50"
+            onClick={() => setMyReviewsOpen(false)}
+            aria-label="Close review history"
+          />
+          <div className="relative w-full max-w-5xl max-h-[90vh] overflow-hidden flex flex-col rounded-lg border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-xl">
+            <div className="flex items-start justify-between gap-3 border-b border-gray-200 dark:border-zinc-700 px-4 py-3 shrink-0">
+              <div>
+                <h2 className="text-lg font-bold text-gray-900 dark:text-zinc-100">My review history</h2>
+                <p className="text-xs text-gray-500 dark:text-zinc-400 mt-0.5">
+                  Reviews you submitted (newest first). Click a row to open the supplier detail card. Use dashboard
+                  filters if the row is not in the current table list.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setMyReviewsOpen(false)}
+                className="text-gray-400 dark:text-zinc-500 hover:text-gray-600 dark:hover:text-zinc-300 text-2xl leading-none"
+                aria-label="Close"
+              >
+                &times;
+              </button>
+            </div>
+            <div className="overflow-auto flex-1 p-4">
+              {myReviewsLoading && (
+                <p className="text-sm text-gray-500 dark:text-zinc-400 py-8 text-center">Loading…</p>
+              )}
+              {!myReviewsLoading && myReviewsError && (
+                <p className="text-sm text-red-600 dark:text-red-400 py-4">{myReviewsError}</p>
+              )}
+              {!myReviewsLoading && !myReviewsError && myReviewsRows.length === 0 && (
+                <p className="text-sm text-gray-500 dark:text-zinc-400 py-8 text-center">
+                  No reviews found for your account.
+                </p>
+              )}
+              {!myReviewsLoading && !myReviewsError && myReviewsRows.length > 0 && (
+                <div className="overflow-x-auto rounded border border-gray-200 dark:border-zinc-700">
+                  <table className="w-full text-sm">
+                    <thead className="bg-gray-50 dark:bg-zinc-800 border-b border-gray-200 dark:border-zinc-700">
+                      <tr>
+                        <MyReviewSortHeader
+                          label="Time"
+                          column="time"
+                          activeColumn={myReviewsSort.column}
+                          ascending={myReviewsSort.ascending}
+                          onRequestSort={requestMyReviewSort}
+                        />
+                        <MyReviewSortHeader
+                          label="Supplier name"
+                          column="supplier_name"
+                          activeColumn={myReviewsSort.column}
+                          ascending={myReviewsSort.ascending}
+                          onRequestSort={requestMyReviewSort}
+                        />
+                        <MyReviewSortHeader
+                          label="Supplier key"
+                          column="supplier_key"
+                          activeColumn={myReviewsSort.column}
+                          ascending={myReviewsSort.ascending}
+                          onRequestSort={requestMyReviewSort}
+                        />
+                        <MyReviewSortHeader
+                          label="Report date"
+                          column="report_date"
+                          activeColumn={myReviewsSort.column}
+                          ascending={myReviewsSort.ascending}
+                          onRequestSort={requestMyReviewSort}
+                        />
+                        <MyReviewSortHeader
+                          label="Agent"
+                          column="agent"
+                          activeColumn={myReviewsSort.column}
+                          ascending={myReviewsSort.ascending}
+                          onRequestSort={requestMyReviewSort}
+                        />
+                        <MyReviewSortHeader
+                          label="Verdict"
+                          column="verdict"
+                          activeColumn={myReviewsSort.column}
+                          ascending={myReviewsSort.ascending}
+                          onRequestSort={requestMyReviewSort}
+                        />
+                        <MyReviewSortHeader
+                          label="Follow-up"
+                          column="follow_up"
+                          activeColumn={myReviewsSort.column}
+                          ascending={myReviewsSort.ascending}
+                          onRequestSort={requestMyReviewSort}
+                        />
+                        <MyReviewSortHeader
+                          label="Comment"
+                          column="comment"
+                          activeColumn={myReviewsSort.column}
+                          ascending={myReviewsSort.ascending}
+                          onRequestSort={requestMyReviewSort}
+                        />
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-gray-200 dark:divide-zinc-700">
+                      {myReviewsDisplayed.map((r) => (
+                        <tr
+                          key={r.id}
+                          role="button"
+                          tabIndex={0}
+                          onClick={() => void openDetailFromReviewRow(r)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              void openDetailFromReviewRow(r);
+                            }
+                          }}
+                          className="hover:bg-gray-50 dark:hover:bg-zinc-800/50 cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2 dark:focus-visible:ring-offset-zinc-900"
+                        >
+                          <td className="px-3 py-2 text-gray-600 dark:text-zinc-300 whitespace-nowrap">
+                            {formatEastern(r.created_at)}
+                          </td>
+                          <td className="px-3 py-2 text-gray-900 dark:text-zinc-100 font-medium max-w-[12rem] truncate">
+                            {r.supplier_name != null && String(r.supplier_name).trim() !== ""
+                              ? r.supplier_name
+                              : "—"}
+                          </td>
+                          <td className="px-3 py-2 font-mono text-xs text-gray-700 dark:text-zinc-200 max-w-[10rem] truncate">
+                            {r.supplier_key ?? "—"}
+                          </td>
+                          <td className="px-3 py-2 text-gray-600 dark:text-zinc-300 whitespace-nowrap">
+                            {r.report_date ?? "—"}
+                          </td>
+                          <td className="px-3 py-2 text-gray-700 dark:text-zinc-200">{r.source ?? "—"}</td>
+                          <td className="px-3 py-2 text-gray-700 dark:text-zinc-200">
+                            {normalizeVerdictFromDb(r.verdict)}
+                          </td>
+                          <td className="px-3 py-2 text-gray-600 dark:text-zinc-400 text-xs">
+                            {followUpSummary(r)}
+                          </td>
+                          <td className="px-3 py-2 text-gray-600 dark:text-zinc-300 max-w-xs">
+                            <span className="line-clamp-2" title={r.comment ?? undefined}>
+                              {r.comment?.trim() ? r.comment : "—"}
+                            </span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           </div>
         </div>
