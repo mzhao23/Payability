@@ -330,6 +330,14 @@ const AGENT_METRICS_TIE_BREAK_COLUMN: Partial<Record<string, "id" | "created_at"
   health_report: "created_at",
 };
 
+/** `YYYY-MM-DD` from a history row `date` field (plain date or ISO timestamp). */
+function normalizeHistoryReportDate(raw: unknown): string | null {
+  const s = String(raw ?? "").trim();
+  if (!s) return null;
+  const m = /^(\d{4}-\d{2}-\d{2})/.exec(s);
+  return m ? m[1] : null;
+}
+
 /** `report_date` YYYY-MM-DD as a UTC calendar day (00:00:00.000Z … 23:59:59.999Z). */
 function utcYmdDayBounds(ymd: string): { startIso: string; endIso: string } | null {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd ?? "").trim());
@@ -614,6 +622,14 @@ export default function DashboardPage() {
   const [supplierReviews, setSupplierReviews] = useState<SupplierReview[]>([]);
   const [editingReviewId, setEditingReviewId] = useState<string | null>(null);
   const [agentDetailKey, setAgentDetailKey] = useState<string | null>(null);
+  /** When set (history row), fetch base-table metrics for this date instead of the decision's `report_date`. */
+  const [agentDetailReportDateOverride, setAgentDetailReportDateOverride] = useState<string | null>(null);
+  /** Snapshot from a history_summary row for score / flagged / reason in the agent popup. */
+  const [agentDetailEntryOverride, setAgentDetailEntryOverride] = useState<{
+    score?: unknown;
+    flagged?: boolean;
+    reason?: unknown;
+  } | null>(null);
   /** Metrics json from sub-agent base table (`json_risk_report`, etc.); null = loading or N/A. */
   const [detailBaseMetrics, setDetailBaseMetrics] = useState<Record<string, unknown>[] | null>(null);
   const [detailBaseMetricsLoading, setDetailBaseMetricsLoading] = useState(false);
@@ -671,7 +687,7 @@ export default function DashboardPage() {
       return;
     }
     const sk = String(selectedDecisionRecord.supplier_key ?? "").trim();
-    const rd = String(selectedDecisionRecord.report_date ?? "").trim();
+    const rd = String(agentDetailReportDateOverride ?? selectedDecisionRecord.report_date ?? "").trim();
     if (!sk || !rd) {
       setDetailBaseMetrics([]);
       setDetailBaseMetricsLoading(false);
@@ -697,7 +713,14 @@ export default function DashboardPage() {
     return () => {
       cancelled = true;
     };
-  }, [supabase, agentDetailKey, selectedDecisionRecord?.id, selectedDecisionRecord?.supplier_key, selectedDecisionRecord?.report_date]);
+  }, [
+    supabase,
+    agentDetailKey,
+    agentDetailReportDateOverride,
+    selectedDecisionRecord?.id,
+    selectedDecisionRecord?.supplier_key,
+    selectedDecisionRecord?.report_date,
+  ]);
 
   useEffect(() => {
     if (user) loadRecords();
@@ -911,12 +934,18 @@ export default function DashboardPage() {
     setEditingReviewId(null);
   }
 
+  function closeAgentDetailPopup() {
+    setAgentDetailKey(null);
+    setAgentDetailReportDateOverride(null);
+    setAgentDetailEntryOverride(null);
+  }
+
   function closeDetail() {
     setSelectedDecisionRecord(null);
     setSelectedConsolidatedRecord(null);
     setSupplierReviews([]);
     resetReviewForm();
-    setAgentDetailKey(null);
+    closeAgentDetailPopup();
     setDetailBaseMetrics(null);
     setDetailBaseMetricsLoading(false);
   }
@@ -970,6 +999,8 @@ export default function DashboardPage() {
     resetReviewForm();
     setReviewAgentLabel("Decision Agent");
     setAgentDetailKey(null);
+    setAgentDetailReportDateOverride(null);
+    setAgentDetailEntryOverride(null);
     setDetailBaseMetrics(null);
     setDetailBaseMetricsLoading(false);
 
@@ -984,6 +1015,8 @@ export default function DashboardPage() {
     resetReviewForm();
     setReviewAgentLabel(SOURCE_LABELS[record.source] ?? record.source);
     setAgentDetailKey(null);
+    setAgentDetailReportDateOverride(null);
+    setAgentDetailEntryOverride(null);
     setDetailBaseMetrics(null);
     setDetailBaseMetricsLoading(false);
     setRiskHistory([]);
@@ -1834,6 +1867,12 @@ export default function DashboardPage() {
               {/* Agent Scores (from agent_scores jsonb) */}
               <div className="mb-6">
                 <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Agent Scores of Today</h3>
+                <p className="text-xs text-gray-500 dark:text-zinc-400 leading-relaxed mb-3 max-w-3xl">
+                  Scores are not comparable across agents—each uses its own scale. Flagged agents show a red
+                  border and a{" "}
+                  <span className="font-semibold text-red-600 dark:text-red-400">Flagged</span>{" "}
+                  label.
+                </p>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                   {Object.entries(SOURCE_LABELS).filter(([agentKey]) => agentKey !== "decision_agent").map(([agentKey, label]) => {
                     const entry = (selectedDecisionRecord.agent_scores ?? {})[agentKey] as any;
@@ -1845,6 +1884,8 @@ export default function DashboardPage() {
                         type="button"
                         onClick={() => {
                           setAgentDetailKey(agentKey);
+                          setAgentDetailReportDateOverride(null);
+                          setAgentDetailEntryOverride(null);
                           setReviewAgentLabel(label);
                         }}
                         className={`text-left rounded-lg border px-3 py-2 bg-gray-50 dark:bg-zinc-800 hover:bg-gray-100 dark:hover:bg-zinc-700/60 transition ${
@@ -1894,6 +1935,8 @@ export default function DashboardPage() {
                             type="button"
                             onClick={() => {
                               setAgentDetailKey(agentKey);
+                              setAgentDetailReportDateOverride(null);
+                              setAgentDetailEntryOverride(null);
                               setReviewAgentLabel(label);
                             }}
                             title="View metrics and details"
@@ -1925,28 +1968,66 @@ export default function DashboardPage() {
                       <div key={agentKey} className="rounded-lg border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800/70 p-3">
                         <div className="text-xs font-semibold text-gray-700 dark:text-zinc-200 mb-2">{label}</div>
                         <div className="space-y-2">
-                          {rows.slice(-5).reverse().map((it, idx) => (
-                            <div key={idx} className="text-xs text-gray-700 dark:text-zinc-300">
-                              <div className="flex flex-wrap items-center gap-2">
-                                <span className="font-mono text-gray-500 dark:text-zinc-400">{it?.date ?? "—"}</span>
-                                <span className="font-semibold">{it?.score ?? "—"}</span>
-                                {it?.flagged ? (
-                                  <span className="inline-flex items-center rounded px-1.5 py-0.5 bg-red-100 text-red-700 dark:bg-red-950/40 dark:text-red-300">
-                                    Flagged
-                                  </span>
-                                ) : (
-                                  <span className="inline-flex items-center rounded px-1.5 py-0.5 bg-gray-100 text-gray-600 dark:bg-zinc-900/40 dark:text-zinc-400">
-                                    —
-                                  </span>
-                                )}
-                              </div>
-                              {it?.reason && (
-                                <div className="mt-1 text-gray-600 dark:text-zinc-400 leading-snug">
-                                  {String(it.reason)}
+                          {rows.slice(-5).reverse().map((it, idx) => {
+                            const rowDate = normalizeHistoryReportDate(it?.date);
+                            const canOpenMetrics = Boolean(rowDate);
+                            return (
+                              <button
+                                key={idx}
+                                type="button"
+                                disabled={!canOpenMetrics}
+                                title={
+                                  canOpenMetrics
+                                    ? "View metrics for this history date"
+                                    : "History row needs a YYYY-MM-DD date to load metrics"
+                                }
+                                onClick={() => {
+                                  if (!rowDate) return;
+                                  setAgentDetailKey(agentKey);
+                                  setAgentDetailReportDateOverride(rowDate);
+                                  setAgentDetailEntryOverride({
+                                    score: it?.score,
+                                    flagged: Boolean(it?.flagged),
+                                    reason: it?.reason,
+                                  });
+                                  setReviewAgentLabel(label);
+                                }}
+                                className={`w-full text-left rounded-lg border px-3 py-2 transition ${
+                                  canOpenMetrics
+                                    ? "border-gray-200 dark:border-zinc-600 bg-white dark:bg-zinc-900/40 hover:bg-gray-50 dark:hover:bg-zinc-800/80 cursor-pointer"
+                                    : "border-gray-100 dark:border-zinc-800 opacity-60 cursor-not-allowed"
+                                }`}
+                              >
+                                <div className="text-xs text-gray-700 dark:text-zinc-300">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="font-mono text-gray-500 dark:text-zinc-400">
+                                      {it?.date ?? "—"}
+                                    </span>
+                                    <span className="font-semibold">{it?.score ?? "—"}</span>
+                                    {it?.flagged ? (
+                                      <span className="inline-flex items-center rounded px-1.5 py-0.5 bg-red-100 text-red-700 dark:bg-red-950/40 dark:text-red-300">
+                                        Flagged
+                                      </span>
+                                    ) : (
+                                      <span className="inline-flex items-center rounded px-1.5 py-0.5 bg-gray-100 text-gray-600 dark:bg-zinc-900/40 dark:text-zinc-400">
+                                        —
+                                      </span>
+                                    )}
+                                  </div>
+                                  {it?.reason && (
+                                    <div className="mt-1 text-gray-600 dark:text-zinc-400 leading-snug">
+                                      {String(it.reason)}
+                                    </div>
+                                  )}
+                                  {canOpenMetrics && (
+                                    <div className="mt-2 text-[10px] font-medium text-gray-500 dark:text-zinc-500">
+                                      View metrics →
+                                    </div>
+                                  )}
                                 </div>
-                              )}
-                            </div>
-                          ))}
+                              </button>
+                            );
+                          })}
                         </div>
                       </div>
                     );
@@ -1960,7 +2041,7 @@ export default function DashboardPage() {
                   <button
                     type="button"
                     className="absolute inset-0 bg-black/50"
-                    onClick={() => setAgentDetailKey(null)}
+                    onClick={closeAgentDetailPopup}
                     aria-label="Close agent detail"
                   />
                   <div className="relative w-full max-w-2xl max-h-[85vh] overflow-y-auto rounded-lg border border-gray-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-xl p-4">
@@ -1970,12 +2051,18 @@ export default function DashboardPage() {
                           {SOURCE_LABELS[agentDetailKey] ?? agentDetailKey}
                         </div>
                         <div className="text-xs text-gray-500 dark:text-zinc-400">
-                          {selectedDecisionRecord.supplier_key ?? "—"} · {selectedDecisionRecord.report_date ?? "—"}
+                          {selectedDecisionRecord.supplier_key ?? "—"} ·{" "}
+                          {agentDetailReportDateOverride ?? selectedDecisionRecord.report_date ?? "—"}
+                          {agentDetailReportDateOverride != null && (
+                            <span className="ml-1 text-[10px] font-normal text-gray-400 dark:text-zinc-500">
+                              (history date; decision {selectedDecisionRecord.report_date ?? "—"})
+                            </span>
+                          )}
                         </div>
                       </div>
                       <button
                         type="button"
-                        onClick={() => setAgentDetailKey(null)}
+                        onClick={closeAgentDetailPopup}
                         className="text-gray-400 dark:text-zinc-500 hover:text-gray-600 dark:hover:text-zinc-300 text-2xl leading-none"
                         aria-label="Close"
                       >
@@ -1983,8 +2070,11 @@ export default function DashboardPage() {
                       </button>
                     </div>
                     {(() => {
-                      const e = (selectedDecisionRecord.agent_scores ?? {})[agentDetailKey] as any;
-                      const embeddedMetrics = agentEntryMetricsForAgentKey(agentDetailKey, e);
+                      const scoresEntry = (selectedDecisionRecord.agent_scores ?? {})[agentDetailKey] as any;
+                      const fromHistory = agentDetailEntryOverride != null;
+                      const embeddedMetrics = fromHistory
+                        ? agentEntryMetricsForAgentKey(agentDetailKey, agentDetailEntryOverride)
+                        : agentEntryMetricsForAgentKey(agentDetailKey, scoresEntry);
                       const baseTable = AGENT_SUB_METRICS_TABLE[agentDetailKey];
                       const waitBase = Boolean(baseTable) && detailBaseMetricsLoading;
                       const useBase =
@@ -2001,11 +2091,21 @@ export default function DashboardPage() {
                           <div className="flex flex-wrap gap-3">
                             <div className="rounded border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800 px-3 py-2">
                               <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-zinc-400">Score</div>
-                              <div className="text-lg font-bold text-gray-900 dark:text-zinc-100">{e?.score ?? "—"}</div>
+                              <div className="text-lg font-bold text-gray-900 dark:text-zinc-100">
+                                {fromHistory ? (agentDetailEntryOverride?.score ?? "—") : scoresEntry?.score ?? "—"}
+                              </div>
                             </div>
                             <div className="rounded border border-gray-200 dark:border-zinc-700 bg-gray-50 dark:bg-zinc-800 px-3 py-2">
                               <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-zinc-400">Flagged</div>
-                              <div className="text-lg font-bold text-gray-900 dark:text-zinc-100">{e?.flagged ? "true" : "false"}</div>
+                              <div className="text-lg font-bold text-gray-900 dark:text-zinc-100">
+                                {fromHistory
+                                  ? agentDetailEntryOverride?.flagged
+                                    ? "true"
+                                    : "false"
+                                  : scoresEntry?.flagged
+                                    ? "true"
+                                    : "false"}
+                              </div>
                             </div>
                           </div>
                           {waitBase && baseTable && (
@@ -2086,7 +2186,14 @@ export default function DashboardPage() {
                           <div>
                             <div className="text-xs font-semibold text-gray-700 dark:text-zinc-200 mb-1">Reason</div>
                             <div className="text-sm text-gray-700 dark:text-zinc-300 whitespace-pre-wrap">
-                              {e?.reason ? String(e.reason) : "—"}
+                              {fromHistory
+                                ? agentDetailEntryOverride?.reason != null &&
+                                  String(agentDetailEntryOverride.reason).trim() !== ""
+                                  ? String(agentDetailEntryOverride.reason)
+                                  : "—"
+                                : scoresEntry?.reason
+                                  ? String(scoresEntry.reason)
+                                  : "—"}
                             </div>
                           </div>
                         </div>
