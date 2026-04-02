@@ -1639,7 +1639,7 @@ export default function DashboardPage() {
 
               {/* Agent Scores (from agent_scores jsonb) */}
               <div className="mb-6">
-                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Agent Scores</h3>
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Agent Scores of Today</h3>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                   {Object.entries(SOURCE_LABELS).filter(([agentKey]) => agentKey !== "decision_agent").map(([agentKey, label]) => {
                     const entry = (selectedDecisionRecord.agent_scores ?? {})[agentKey] as any;
@@ -1678,6 +1678,37 @@ export default function DashboardPage() {
                     );
                   })}
                 </div>
+                {(() => {
+                  const flaggedPairs = Object.entries(SOURCE_LABELS).filter(([agentKey]) => agentKey !== "decision_agent").filter(([agentKey]) => {
+                    const e = (selectedDecisionRecord.agent_scores ?? {})[agentKey] as any;
+                    return Boolean(e?.flagged);
+                  });
+                  if (flaggedPairs.length === 0) return null;
+                  return (
+                    <div className="mt-4 space-y-3">
+                      <h4 className="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-zinc-400">
+                        Flagged reasons of sub-agents
+                      </h4>
+                      {flaggedPairs.map(([agentKey, label]) => {
+                        const entry = (selectedDecisionRecord.agent_scores ?? {})[agentKey] as any;
+                        const raw = entry?.reason;
+                        const reasonText =
+                          raw != null && String(raw).trim() !== "" ? String(raw) : "—";
+                        return (
+                          <div
+                            key={agentKey}
+                            className="rounded-lg border border-red-300 dark:border-red-700 bg-red-50/50 dark:bg-red-950/20 p-3"
+                          >
+                            <div className="text-xs font-semibold text-gray-700 dark:text-zinc-200">{label}</div>
+                            <p className="mt-1 text-sm text-gray-700 dark:text-zinc-300 leading-snug whitespace-pre-wrap">
+                              {reasonText}
+                            </p>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
               </div>
 
               {/* History Summary (from history_summary jsonb) */}
@@ -1849,7 +1880,7 @@ export default function DashboardPage() {
 
               {/* Decision Agent Reason */}
               <div className="mb-6">
-                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Flag Reason</h3>
+                <h3 className="text-sm font-semibold text-gray-700 dark:text-zinc-300 mb-2">Flag Reason of Decision Agent</h3>
                 <p className="text-sm text-gray-700 dark:text-zinc-300 whitespace-pre-wrap">
                   {selectedDecisionRecord.reason ?? "—"}
                 </p>
