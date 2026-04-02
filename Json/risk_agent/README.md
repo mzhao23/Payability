@@ -141,7 +141,7 @@ Hard rules represent clear, directional risk signals. Each hard rule sets the sc
 | `ACCOUNT_STATUS` | Account not OK or Active | 8 |
 | `LOAN_PAST_DUE` | Past-due loan amount > $0 | 9 |
 | `ORDER_DEFECT_RATE` | Seller-fulfilled ODR > 1% (from Performance Over Time SF rows only; FBA-only or no SF data → skipped) | 8 |
-| ~~`LATE_SHIPMENT_RATE`~~ | *Removed — no total order count available; single late shipment distorts rate for low-volume sellers* | 8 |
+| `LATE_SHIPMENT_RATE` | LSR > 4% AND fbm_orders_60 ≥ 20 AND fbm_ratio ≥ 10% | 8 |
 | `NEG_FEEDBACK_TREND` | 30d neg rate ≥ 10pp above 60d window (min 10 orders) | 7 |
 | ~~`POLICY_COMPLIANCE_INCREASE`~~ | *Temporarily disabled — violations not distinguished by health impact* | 7 |
 | `ACCOUNT_LEVEL_RESERVE` | Reserve/revenue ratio increased ≥ 50% vs 90-day average (closed statements only, gross revenue ≥ $200) | 7 |
@@ -149,7 +149,7 @@ Hard rules represent clear, directional risk signals. Each hard rule sets the sc
 | `NEGATIVE_DEPOSIT` | Most recent closed statement has negative Deposit Total (Amazon charging seller) | 7 |
 | `NEGATIVE_DEPOSIT` | ≥ 2 consecutive closed statements with negative Deposit Total | 8 |
 | `INV_CREDIT_CARD` | Credit card update required notification on report date or previous day | 8 |
-| `FAILED_DISBURSEMENT` | Most recent closed statement is a failed disbursement | 7 |
+| `FAILED_DISBURSEMENT` | Most recent closed statement is a failed disbursement within 3 days of report date | 7 |
 
 ### Soft Rules — additive penalty points
 Soft rules add penalty points to the score. They represent weaker signals that are only meaningful in combination.

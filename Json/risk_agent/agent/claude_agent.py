@@ -61,7 +61,7 @@ OUTPUT FORMAT — respond ONLY with a valid JSON object, no markdown, no preambl
 }
 
 REQUIRED metrics to include (use null if data is unavailable):
-  order_defect_rate, cancellation_rate,
+  order_defect_rate, late_shipment_rate, cancellation_rate,
   valid_tracking_rate, delivered_on_time,
   feedback_negative_30d, feedback_negative_60d_window, feedback_negative_trend_delta,
   feedback_count_30d,
@@ -106,11 +106,19 @@ IMPORTANT JUDGEMENT GUIDELINES:
    - A large but stable reserve on a high-volume account is normal operational behaviour.
 
 5. Late shipment rate (late_shipment_rate_pct):
-   - This metric is provided for context only — do NOT use it to drive the risk score.
-   - Without total order count, a single late shipment can produce a misleadingly high rate
-     for low-volume sellers. Treat it as a weak signal at most.
+   - This rule only fires when fbm_orders_60 >= 20, ensuring low-volume FBM sellers are
+     not penalized by a single late shipment. If triggered, treat it as a meaningful signal.
 
-6. Policy compliance:
+6. Notifications — date awareness:
+   - `recent_notification_titles` includes the most recent notifications with their dates.
+   - ALWAYS check the date of each notification relative to `report_date`. Notifications
+     older than 3 days before `report_date` are historical context only — do NOT treat
+     them as active current risk unless they are corroborated by other current signals.
+   - A notification about disbursement deactivation from several days ago does not mean
+     disbursements are still deactivated today. If the account status is OK and recent
+     statements show successful transfers, the issue has likely been resolved.
+
+7. Policy compliance:
    - Policy violation counts are provided for context ONLY — do NOT use them to drive
      the risk score up. The rule engine has disabled policy compliance scoring because
      violations cannot yet be distinguished by whether they impact account health.
@@ -530,6 +538,7 @@ _RULE_METRIC_MAP: dict[str, list[str]] = {
     "ACCOUNT_STATUS":           ["account_status"],
     "LOAN_PAST_DUE":            ["past_due_amount", "outstanding_loan_amount"],
     "ORDER_DEFECT_RATE":        ["order_defect_rate"],
+    "LATE_SHIPMENT_RATE":       ["late_shipment_rate", "fbm_orders_60"],
     "NEG_FEEDBACK_TREND":       ["feedback_negative_30d", "feedback_negative_60d_window", "feedback_negative_trend_delta", "feedback_count_30d"],
     "POLICY_COMPLIANCE":        ["policy_compliance_total", "policy_compliance_delta"],
     "ACCOUNT_LEVEL_RESERVE":    ["stmt_reserve_latest_ratio", "stmt_reserve_avg_ratio", "stmt_reserve_change_pct"],
@@ -561,6 +570,8 @@ def _metrics_for_triggered_rules(fs: FeatureSet, triggered_rules: list[str]) -> 
 
     # Full metric pool to pick from
     all_metrics: dict[str, Metric] = {
+        "late_shipment_rate":              Metric(metric_id="late_shipment_rate",              value=fs.late_shipment_rate,                unit="%"),
+        "fbm_orders_60":                   Metric(metric_id="fbm_orders_60",                   value=fs.fbm_orders_60 or None,             unit="orders"),
         "order_defect_rate":               Metric(metric_id="order_defect_rate",               value=fs.seller_fulfilled_odr,              unit="%"),
         "late_shipment_rate":              Metric(metric_id="late_shipment_rate",              value=fs.late_shipment_rate,                unit="%"),
         "cancellation_rate":               Metric(metric_id="cancellation_rate",               value=fs.cancellation_rate,                 unit="%"),

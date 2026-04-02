@@ -21,6 +21,25 @@ import pathlib as _pathlib
 _SUPPLIER_KEY_CACHE_FILE = _pathlib.Path(__file__).parent.parent / "input" / "supplier_key_cache.json"
 _supplier_key_cache: dict[str, str] | None = None
 
+# ── Order metrics cache (FBA/FBM counts) ──────────────────────────────────────
+_order_metrics_cache: dict[str, dict] | None = None
+
+def _get_order_metrics() -> dict[str, dict]:
+    """Load the most recent order_metrics_<date>.json from input/ directory."""
+    global _order_metrics_cache
+    if _order_metrics_cache is None:
+        input_dir = _pathlib.Path(__file__).parent.parent / "input"
+        files = sorted(input_dir.glob("order_metrics_*.json"), reverse=True)
+        if files:
+            import json as _json2
+            records = _json2.loads(files[0].read_text())
+            _order_metrics_cache = {r["mp_sup_key"]: r for r in records if r.get("mp_sup_key")}
+            log.info("Loaded order metrics for %d suppliers from %s", len(_order_metrics_cache), files[0].name)
+        else:
+            _order_metrics_cache = {}
+            log.warning("No order_metrics_*.json found in input/ — FBM order counts unavailable")
+    return _order_metrics_cache
+
 def _get_supplier_key_cache() -> dict[str, str]:
     global _supplier_key_cache
     if _supplier_key_cache is None:
@@ -192,6 +211,11 @@ class FeatureSet:
     notification_count: int = 0
     high_risk_notification_count: int = 0   # computed during extraction
     inv_credit_card_notification: bool = False  # credit card notification on report date or day before
+    # Order volume (from BQ order_metrics)
+    fba_orders_60: int = 0
+    fbm_orders_60: int = 0
+    total_orders_60: int = 0
+    fbm_ratio: float = 0.0
     acc_deactivation_notification: bool = False  # account deactivation risk notification on report date or day before
 
     # inventory
@@ -581,11 +605,16 @@ def extract_features(row: dict) -> FeatureSet:
         if within_window and is_failed:
             fs.failed_disbursement_count += 1
 
-        # Check if most recent closed statement is a failed disbursement
+        # Check if most recent closed statement is a failed disbursement (within 3 days)
         stmt_status = det.get("Status", "") or stmt.get("ProcessingStatus", "") or ""
         if stmt_status.lower() == "closed":
             if not fs.failed_disbursement_most_recent:
-                fs.failed_disbursement_most_recent = is_failed
+                _hard_disb_cutoff = _now - timedelta(days=3)
+                try:
+                    within_hard_window = stmt_end >= _hard_disb_cutoff
+                except Exception:
+                    within_hard_window = True
+                fs.failed_disbursement_most_recent = is_failed and within_hard_window
 
             # Track negative Deposit Total on closed statements (streak from most recent)
             deposit_amt = _money_to_float(stmt.get("Deposit Total", "") or "") or 0.0
@@ -710,6 +739,16 @@ def extract_features(row: dict) -> FeatureSet:
                 fs.active_loans_count += 1
                 fs.outstanding_loan_amount += float(loan.get("outstandingLoanAmount", 0) or 0)
                 fs.past_due_amount += float(loan.get("pastDueAmount", 0) or 0)
+
+    # ── 12b. Order metrics (FBA/FBM counts from BQ snapshot) ────────────────
+    _order_metrics = _get_order_metrics()
+    mp_key = row.get("mp_sup_key", "")
+    if mp_key and mp_key in _order_metrics:
+        om = _order_metrics[mp_key]
+        fs.fba_orders_60   = int(om.get("fba_orders_60", 0) or 0)
+        fs.fbm_orders_60   = int(om.get("fbm_orders_60", 0) or 0)
+        fs.total_orders_60 = int(om.get("total_orders_60", 0) or 0)
+        fs.fbm_ratio       = float(om.get("fbm_ratio", 0.0) or 0.0)
 
     # ── 13. Notifications ─────────────────────────────────────────────────────
     notif_titles = d.get("Last Notification Titles", [])

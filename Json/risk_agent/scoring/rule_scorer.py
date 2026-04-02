@@ -72,6 +72,8 @@ def score(fs: FeatureSet) -> PreScoreResult:
         fs.feedback_negative_trend_delta is not None
         and _neg_sample >= cfg_int("neg_feedback_min_sample")
         and fs.feedback_negative_trend_delta >= cfg("neg_feedback_trend_hard_pp")
+        and fs.fbm_orders_60 >= cfg_int("fbm_min_orders_threshold")
+        and fs.fbm_ratio >= cfg("fbm_min_ratio_feedback")
     ):
         neg_30 = fs.feedback_negative_30d or 0
         prior  = neg_30 - fs.feedback_negative_trend_delta
@@ -147,30 +149,58 @@ def score(fs: FeatureSet) -> PreScoreResult:
         if _odr > cfg("odr_threshold_pct"):
             hard(cfg_int("floor_order_defect_rate"), f"ORDER_DEFECT_RATE: {_odr:.2f}% > {cfg('odr_threshold_pct')}% (Amazon red line, seller-fulfilled)")
 
-    # LATE_SHIPMENT_RATE rule removed — no total order count available,
-    # so a single late shipment can produce artificially high rates for low-volume sellers
+    # ── Late shipment rate ────────────────────────────────────────────────────
+    if (
+        fs.late_shipment_rate is not None
+        and fs.late_shipment_rate > cfg("late_shipment_threshold_pct")
+        and fs.fbm_orders_60 >= cfg_int("fbm_min_orders_threshold")
+        and fs.fbm_ratio >= cfg("fbm_min_ratio_feedback")
+    ):
+        hard(cfg_int("floor_late_shipment_rate"), (
+            f"LATE_SHIPMENT_RATE: {fs.late_shipment_rate:.2f}% > {cfg('late_shipment_threshold_pct')}% "
+            f"(fbm_orders_60={fs.fbm_orders_60}, fbm_ratio={fs.fbm_ratio:.1%})"
+        ))
 
-    if fs.cancellation_rate is not None:
+    if (
+        fs.cancellation_rate is not None
+        and fs.fbm_orders_60 >= cfg_int("fbm_min_orders_threshold")
+        and fs.fbm_ratio >= cfg("fbm_min_ratio_feedback")
+    ):
         if fs.cancellation_rate > cfg("cancellation_threshold_pct"):
-            soft(2, f"CANCELLATION_RATE: {fs.cancellation_rate:.2f}% > {cfg('cancellation_threshold_pct')}%")
+            soft(2, f"CANCELLATION_RATE: {fs.cancellation_rate:.2f}% > {cfg('cancellation_threshold_pct')}% (fbm_orders_60={fs.fbm_orders_60}, fbm_ratio={fs.fbm_ratio:.1%})")
         elif fs.cancellation_rate > cfg("cancellation_elevated_pct"):
-            soft(1, f"CANCELLATION_RATE: {fs.cancellation_rate:.2f}% (elevated)")
+            soft(1, f"CANCELLATION_RATE: {fs.cancellation_rate:.2f}% (elevated, fbm_orders_60={fs.fbm_orders_60}, fbm_ratio={fs.fbm_ratio:.1%})")
 
-    if fs.valid_tracking_rate is not None and fs.valid_tracking_rate < cfg("valid_tracking_min_pct"):
-        soft(2, f"VALID_TRACKING_RATE: {fs.valid_tracking_rate:.2f}% < {cfg('valid_tracking_min_pct')}%")
+    if (
+        fs.valid_tracking_rate is not None
+        and fs.valid_tracking_rate < cfg("valid_tracking_min_pct")
+        and fs.fbm_orders_60 >= cfg_int("fbm_min_orders_threshold")
+        and fs.fbm_ratio >= cfg("fbm_min_ratio_feedback")
+    ):
+        soft(2, f"VALID_TRACKING_RATE: {fs.valid_tracking_rate:.2f}% < {cfg('valid_tracking_min_pct')}% (fbm_orders_60={fs.fbm_orders_60}, fbm_ratio={fs.fbm_ratio:.1%})")
 
-    if fs.delivered_on_time is not None and fs.delivered_on_time < cfg("delivered_on_time_min_pct"):
-        soft(1, f"DELIVERED_ON_TIME: {fs.delivered_on_time:.1f}% < {cfg('delivered_on_time_min_pct')}%")
+    if (
+        fs.delivered_on_time is not None
+        and fs.delivered_on_time < cfg("delivered_on_time_min_pct")
+        and fs.fbm_orders_60 >= cfg_int("fbm_min_orders_threshold")
+        and fs.fbm_ratio >= cfg("fbm_min_ratio_feedback")
+    ):
+        soft(1, f"DELIVERED_ON_TIME: {fs.delivered_on_time:.1f}% < {cfg('delivered_on_time_min_pct')}% (fbm_orders_60={fs.fbm_orders_60}, fbm_ratio={fs.fbm_ratio:.1%})")
 
     if fs.two_step_verification and fs.two_step_verification.lower() not in ("active", ""):
         soft(1, f"TWO_STEP_VERIFICATION: status='{fs.two_step_verification}'")
 
     # ── Feedback ──────────────────────────────────────────────────────────────
-    if fs.feedback_negative_30d is not None and _neg_sample >= cfg_int("neg_feedback_min_sample"):
+    if (
+        fs.feedback_negative_30d is not None
+        and _neg_sample >= cfg_int("neg_feedback_min_sample")
+        and fs.fbm_orders_60 >= cfg_int("fbm_min_orders_threshold")
+        and fs.fbm_ratio >= cfg("fbm_min_ratio_feedback")
+    ):
         if fs.feedback_negative_30d > cfg("negative_feedback_high_pct"):
-            soft(2, f"NEGATIVE_FEEDBACK_30D: {fs.feedback_negative_30d:.1f}% (n={_neg_sample})")
+            soft(2, f"NEGATIVE_FEEDBACK_30D: {fs.feedback_negative_30d:.1f}% (n={_neg_sample}, fbm_orders={fs.fbm_orders_60})")
         elif fs.feedback_negative_30d > cfg("negative_feedback_elev_pct"):
-            soft(1, f"NEGATIVE_FEEDBACK_30D: {fs.feedback_negative_30d:.1f}% (elevated, n={_neg_sample})")
+            soft(1, f"NEGATIVE_FEEDBACK_30D: {fs.feedback_negative_30d:.1f}% (elevated, n={_neg_sample}, fbm_orders={fs.fbm_orders_60})")
 
     # ── Loans ─────────────────────────────────────────────────────────────────
     if fs.outstanding_loan_amount > 0:

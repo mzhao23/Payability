@@ -38,6 +38,8 @@ _DEFAULTS: dict[str, float] = {
     "late_shipment_threshold_pct":    4.0,
     "neg_feedback_trend_hard_pp":     10.0,
     "neg_feedback_min_sample":        10,
+    "fbm_min_orders_threshold":       20,   # min FBM orders in 60d to apply FBM-sensitive rules
+    "fbm_min_ratio_feedback":         0.10, # min FBM ratio to apply feedback rules (10%)
     "policy_delta_hard":              5,
     "stmt_reserve_consec_hard":       2,
     "stmt_reserve_amount_hard_usd":   5000.0,
@@ -85,7 +87,7 @@ _config: dict[str, float] | None = None
 
 def _load_from_supabase() -> dict[str, float]:
     """Fetch all rows from json_risk_agent_config and return as a dict."""
-    client: Client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
+    client: Client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
     result = client.table("json_risk_agent_config").select("key, value").execute()
     loaded = {row["key"]: float(row["value"]) for row in result.data}
     log.info("Loaded %d config params from json_risk_agent_config.", len(loaded))

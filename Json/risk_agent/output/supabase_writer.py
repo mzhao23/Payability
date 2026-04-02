@@ -15,6 +15,7 @@ from __future__ import annotations
 import time
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
+import httpx
 
 from config import settings
 from config.models import RiskReport
@@ -75,12 +76,14 @@ def upsert_report(report: RiskReport) -> None:
                     response,
                 )
             return
-        except APIError as exc:
-            code = int(exc.code) if str(exc.code).isdigit() else 0
-            if code in _RETRY_STATUS_CODES and attempt < _MAX_RETRIES:
+        except (APIError, httpx.ReadError, httpx.ConnectError, httpx.TimeoutException) as exc:
+            is_api_error = isinstance(exc, APIError)
+            code = int(exc.code) if is_api_error and str(exc.code).isdigit() else 0
+            retryable = (not is_api_error) or (code in _RETRY_STATUS_CODES)
+            if retryable and attempt < _MAX_RETRIES:
                 log.warning(
-                    "Supabase %s error for supplier_key=%s (attempt %d/%d) — retrying in %ds",
-                    code, report.supplier_key, attempt, _MAX_RETRIES, _RETRY_DELAY,
+                    "Supabase network error for supplier_key=%s (attempt %d/%d) — retrying in %ds: %s",
+                    report.supplier_key, attempt, _MAX_RETRIES, _RETRY_DELAY, exc,
                 )
                 time.sleep(_RETRY_DELAY)
                 _supabase = None  # reset client to get fresh connection

@@ -130,7 +130,7 @@ def _process_row(row: dict, dry_run: bool = False) -> tuple[str, str, RiskReport
         try:
             fs_err = FeatureSet()
             fs_err.supplier_key = row.get("mp_sup_key", supplier_key)
-            fs_err.report_date = row.get("created_date", "")
+            fs_err.report_date = str(row.get("created_date") or "")
             fs_err.data_quality_flag = "internal_error"
             fs_err.raw_error = str(exc)[:500]
             fs_err.account_status = ""
@@ -149,7 +149,7 @@ def _process_row(row: dict, dry_run: bool = False) -> tuple[str, str, RiskReport
                     supplier_key=row.get("mp_sup_key", supplier_key),
                     mp_sup_key=row.get("mp_sup_key"),
                     supplier_name="",
-                    report_date=row.get("created_date", ""),
+                    report_date=str(row.get("created_date") or ""),
                     metrics=[],
                     trigger_reason=f"Pipeline error — could not complete assessment: {str(exc)[:200]}",
                     overall_risk_score=8.0,
@@ -254,11 +254,8 @@ def run_pipeline(
 
         for future in as_completed(futures):
             supplier_key, status, report = future.result()
-            if status in ("ok", "error"):
-                if status == "ok":
-                    processed += 1
-                else:
-                    errors += 1
+            if status == "ok":
+                processed += 1
                 if report:
                     scores.append(report.overall_risk_score)
                     if _dry:
@@ -267,6 +264,11 @@ def run_pipeline(
             elif status == "skipped":
                 skipped += 1
                 _save_checkpoint(date_filter, supplier_key, label=_checkpoint_label)
+            elif status == "error":
+                errors += 1
+                if report and _dry:
+                    _dry_results.append(report.to_supabase_dict())
+                # errors are NOT saved to checkpoint — will retry on next run
 
     # Write dry-run results to file
     if _dry and _dry_results:
