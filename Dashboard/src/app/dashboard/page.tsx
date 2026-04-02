@@ -270,6 +270,149 @@ function agentEntryMetrics(entry: unknown): Record<string, unknown>[] {
   return raw.filter((m): m is Record<string, unknown> => m != null && typeof m === "object");
 }
 
+function metricsArrayFromUnknown(raw: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((m): m is Record<string, unknown> => m != null && typeof m === "object");
+}
+
+/**
+ * Per-agent nested metrics blobs (e.g. JSON Agent under json_risk_report.metrics), then legacy top-level arrays.
+ */
+function agentEntryMetricsForAgentKey(agentKey: string, entry: unknown): Record<string, unknown>[] {
+  if (entry == null || typeof entry !== "object") return [];
+  const o = entry as Record<string, unknown>;
+  let nestedRaw: unknown;
+  switch (agentKey) {
+    case "json_report":
+      nestedRaw =
+        o.json_risk_report != null && typeof o.json_risk_report === "object"
+          ? (o.json_risk_report as Record<string, unknown>).metrics
+          : undefined;
+      break;
+    case "ship_tracking":
+      nestedRaw =
+        o.ship_risk_scores != null && typeof o.ship_risk_scores === "object"
+          ? (o.ship_risk_scores as Record<string, unknown>).metrics
+          : undefined;
+      break;
+    case "daily_summary_report":
+      nestedRaw =
+        o.daily_summary_report_flagged_suppliers != null &&
+        typeof o.daily_summary_report_flagged_suppliers === "object"
+          ? (o.daily_summary_report_flagged_suppliers as Record<string, unknown>).metrics
+          : undefined;
+      break;
+    case "health_report":
+      nestedRaw =
+        o.health_daily_risk != null && typeof o.health_daily_risk === "object"
+          ? (o.health_daily_risk as Record<string, unknown>).metrics
+          : undefined;
+      break;
+    default:
+      nestedRaw = undefined;
+      break;
+  }
+  const fromNested = metricsArrayFromUnknown(nestedRaw);
+  if (fromNested.length > 0) return fromNested;
+  return agentEntryMetrics(entry);
+}
+
+/** Sub-agent metrics live in these Supabase tables (not in `decision_agent_daily_report.agent_scores`). */
+const AGENT_SUB_METRICS_TABLE: Partial<Record<string, string>> = {
+  json_report: "json_risk_report",
+  ship_tracking: "ship_risk_scores",
+  daily_summary_report: "daily_summary_report_flagged_suppliers",
+  health_report: "health_daily_risk",
+};
+
+/** Tie-break when multiple rows share `supplier_key` (+ `report_date`). `health_daily_risk` has no `id`. */
+const AGENT_METRICS_TIE_BREAK_COLUMN: Partial<Record<string, "id" | "created_at">> = {
+  health_report: "created_at",
+};
+
+/** `report_date` YYYY-MM-DD as a UTC calendar day (00:00:00.000Z … 23:59:59.999Z). */
+function utcYmdDayBounds(ymd: string): { startIso: string; endIso: string } | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd ?? "").trim());
+  if (!m) return null;
+  const [, y, mo, d] = m;
+  return {
+    startIso: `${y}-${mo}-${d}T00:00:00.000Z`,
+    endIso: `${y}-${mo}-${d}T23:59:59.999Z`,
+  };
+}
+
+async function fetchAgentMetricsFromBaseTable(
+  client: ReturnType<typeof getSupabaseBrowser>,
+  agentKey: string,
+  supplierKey: string,
+  reportDate: string
+): Promise<Record<string, unknown>[]> {
+  const table = AGENT_SUB_METRICS_TABLE[agentKey];
+  if (!table) return [];
+
+  const normalize = (raw: unknown) => metricsArrayFromUnknown(raw);
+
+  /**
+   * Daily summary table has no `report_date` column — only `created_at` (timestamptz).
+   * Match `created_at` to the UTC calendar day of decision `report_date` (00:00:00Z–23:59:59.999Z)
+   * for that `supplier_key`; latest row in window if multiple.
+   */
+  if (agentKey === "daily_summary_report") {
+    const bounds = utcYmdDayBounds(reportDate);
+    if (!bounds) return [];
+    const { startIso, endIso } = bounds;
+    const dayRow = await client
+      .from(table)
+      .select("metrics")
+      .eq("supplier_key", supplierKey)
+      .gte("created_at", startIso)
+      .lte("created_at", endIso)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (dayRow.error) {
+      console.error(`[metrics] ${table} created_at in report_date window (UTC day)`, dayRow.error.message);
+      return [];
+    }
+    if (dayRow.data?.metrics == null) return [];
+    return normalize(dayRow.data.metrics);
+  }
+
+  const tieBreak = AGENT_METRICS_TIE_BREAK_COLUMN[agentKey] ?? "id";
+
+  const byDate = await client
+    .from(table)
+    .select("metrics")
+    .eq("supplier_key", supplierKey)
+    .eq("report_date", reportDate)
+    .order(tieBreak, { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (byDate.error) {
+    console.error(`[metrics] ${table} by report_date`, byDate.error.message);
+  } else if (byDate.data?.metrics != null) {
+    const rows = normalize(byDate.data.metrics);
+    if (rows.length > 0) return rows;
+  }
+
+  const latest = await client
+    .from(table)
+    .select("metrics")
+    .eq("supplier_key", supplierKey)
+    .order("report_date", { ascending: false })
+    .order(tieBreak, { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (latest.error) {
+    console.error(`[metrics] ${table} latest`, latest.error.message);
+    return [];
+  }
+  return normalize(latest.data?.metrics);
+}
+
 function formatAgentMetricValue(m: Record<string, unknown>): string {
   const v = m.value;
   const unit = m.unit != null ? String(m.unit) : "";
@@ -471,6 +614,9 @@ export default function DashboardPage() {
   const [supplierReviews, setSupplierReviews] = useState<SupplierReview[]>([]);
   const [editingReviewId, setEditingReviewId] = useState<string | null>(null);
   const [agentDetailKey, setAgentDetailKey] = useState<string | null>(null);
+  /** Metrics json from sub-agent base table (`json_risk_report`, etc.); null = loading or N/A. */
+  const [detailBaseMetrics, setDetailBaseMetrics] = useState<Record<string, unknown>[] | null>(null);
+  const [detailBaseMetricsLoading, setDetailBaseMetricsLoading] = useState(false);
   const [hoveredAgent, setHoveredAgent] = useState<string | null>(null);
   const [appRole, setAppRole] = useState<AppRole | null>(null);
   /** `(supplier_key)__(report_date)` with any supplier_reviews row — Decision table Status. */
@@ -511,6 +657,47 @@ export default function DashboardPage() {
       cancelled = true;
     };
   }, [user]);
+
+  useEffect(() => {
+    if (!selectedDecisionRecord || !agentDetailKey) {
+      setDetailBaseMetrics(null);
+      setDetailBaseMetricsLoading(false);
+      return;
+    }
+    const table = AGENT_SUB_METRICS_TABLE[agentDetailKey];
+    if (!table) {
+      setDetailBaseMetrics(null);
+      setDetailBaseMetricsLoading(false);
+      return;
+    }
+    const sk = String(selectedDecisionRecord.supplier_key ?? "").trim();
+    const rd = String(selectedDecisionRecord.report_date ?? "").trim();
+    if (!sk || !rd) {
+      setDetailBaseMetrics([]);
+      setDetailBaseMetricsLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setDetailBaseMetrics(null);
+    setDetailBaseMetricsLoading(true);
+    fetchAgentMetricsFromBaseTable(supabase, agentDetailKey, sk, rd)
+      .then((rows) => {
+        if (!cancelled) {
+          setDetailBaseMetrics(rows);
+          setDetailBaseMetricsLoading(false);
+        }
+      })
+      .catch((err) => {
+        console.error("[metrics] fetch failed", err);
+        if (!cancelled) {
+          setDetailBaseMetrics([]);
+          setDetailBaseMetricsLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [supabase, agentDetailKey, selectedDecisionRecord?.id, selectedDecisionRecord?.supplier_key, selectedDecisionRecord?.report_date]);
 
   useEffect(() => {
     if (user) loadRecords();
@@ -730,6 +917,8 @@ export default function DashboardPage() {
     setSupplierReviews([]);
     resetReviewForm();
     setAgentDetailKey(null);
+    setDetailBaseMetrics(null);
+    setDetailBaseMetricsLoading(false);
   }
 
   async function loadReviewsForDecisionRecord(record: DecisionAgentDailyRecord) {
@@ -780,6 +969,9 @@ export default function DashboardPage() {
     setSupplierReviews([]);
     resetReviewForm();
     setReviewAgentLabel("Decision Agent");
+    setAgentDetailKey(null);
+    setDetailBaseMetrics(null);
+    setDetailBaseMetricsLoading(false);
 
     await loadReviewsForDecisionRecord(record);
     setRiskHistory([]);
@@ -792,6 +984,8 @@ export default function DashboardPage() {
     resetReviewForm();
     setReviewAgentLabel(SOURCE_LABELS[record.source] ?? record.source);
     setAgentDetailKey(null);
+    setDetailBaseMetrics(null);
+    setDetailBaseMetricsLoading(false);
     setRiskHistory([]);
     await loadReviewsForConsolidatedRecord(record);
   }
@@ -1695,15 +1889,24 @@ export default function DashboardPage() {
                         const reasonText =
                           raw != null && String(raw).trim() !== "" ? String(raw) : "—";
                         return (
-                          <div
+                          <button
                             key={agentKey}
-                            className="rounded-lg border border-red-300 dark:border-red-700 bg-red-50/50 dark:bg-red-950/20 p-3"
+                            type="button"
+                            onClick={() => {
+                              setAgentDetailKey(agentKey);
+                              setReviewAgentLabel(label);
+                            }}
+                            title="View metrics and details"
+                            className="w-full text-left rounded-lg border border-red-300 dark:border-red-700 bg-red-50/50 dark:bg-red-950/20 p-3 hover:bg-red-100/70 dark:hover:bg-red-950/35 transition cursor-pointer"
                           >
                             <div className="text-xs font-semibold text-gray-700 dark:text-zinc-200">{label}</div>
                             <p className="mt-1 text-sm text-gray-700 dark:text-zinc-300 leading-snug whitespace-pre-wrap">
                               {reasonText}
                             </p>
-                          </div>
+                            <div className="mt-2 text-[10px] font-medium text-red-700/90 dark:text-red-400">
+                              View metrics →
+                            </div>
+                          </button>
                         );
                       })}
                     </div>
@@ -1781,7 +1984,14 @@ export default function DashboardPage() {
                     </div>
                     {(() => {
                       const e = (selectedDecisionRecord.agent_scores ?? {})[agentDetailKey] as any;
-                      const metricsRows = agentEntryMetrics(e);
+                      const embeddedMetrics = agentEntryMetricsForAgentKey(agentDetailKey, e);
+                      const baseTable = AGENT_SUB_METRICS_TABLE[agentDetailKey];
+                      const waitBase = Boolean(baseTable) && detailBaseMetricsLoading;
+                      const useBase =
+                        !waitBase &&
+                        detailBaseMetrics != null &&
+                        detailBaseMetrics.length > 0;
+                      const metricsRows = useBase ? detailBaseMetrics : embeddedMetrics;
                       const sortedMetrics = [...metricsRows].sort(
                         (a, b) => Number(metricTriggered(b)) - Number(metricTriggered(a))
                       );
@@ -1798,10 +2008,18 @@ export default function DashboardPage() {
                               <div className="text-lg font-bold text-gray-900 dark:text-zinc-100">{e?.flagged ? "true" : "false"}</div>
                             </div>
                           </div>
+                          {waitBase && baseTable && (
+                            <div className="text-xs text-gray-500 dark:text-zinc-400">
+                              Loading metrics from {baseTable}…
+                            </div>
+                          )}
                           {sortedMetrics.length > 0 && (
                             <div>
                               <div className="text-xs font-semibold text-gray-700 dark:text-zinc-200 mb-2">
                                 {hasTriggeredMetric ? "Trigger metrics" : "Metrics"}
+                                {useBase ? (
+                                  <span className="ml-2 font-normal text-gray-500 dark:text-zinc-500">(source table)</span>
+                                ) : null}
                               </div>
                               <ul className="space-y-2">
                                 {sortedMetrics.map((m, idx) => {
