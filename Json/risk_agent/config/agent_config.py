@@ -26,13 +26,13 @@ _DEFAULTS: dict[str, float] = {
     "floor_late_shipment_rate":       8,
     "floor_neg_feedback_trend":       7,
     "floor_policy_compliance":        7,
-    "floor_reserve_consecutive":      7,
+    "floor_reserve_consecutive":      9,
     "floor_reserve_amount":           7,
-    "floor_failed_disbursement":      7,
+    "floor_failed_disbursement":      9,
     "floor_acc_deactivation":          9,  # account deactivation risk notification on/before report date
-    "floor_inv_credit_card":           8,  # credit card notification on/before report date
+    "floor_inv_credit_card":           9,  # credit card notification on/before report date
     "floor_negative_deposit_single":   7,  # most recent closed statement has negative Deposit Total
-    "floor_negative_deposit_consecutive": 8,  # 2+ consecutive closed statements with negative Deposit Total
+    "floor_negative_deposit_consecutive": 9,  # 2+ consecutive closed statements with negative Deposit Total
     # Hard rule thresholds
     "odr_threshold_pct":              1.0,
     "late_shipment_threshold_pct":    4.0,
@@ -71,7 +71,7 @@ _DEFAULTS: dict[str, float] = {
     "dq_score_login_error":           7,
     "dq_score_wrong_password":        7,
     "dq_score_scraper_error":         8,  # JSON has top-level Error field — score 8
-    "dq_score_bank_page_error":       8,  # raised from 5 — bank page errors indicate access issues
+    "dq_score_bank_page_error":       9,  # raised from 5 — bank page errors indicate access issues
     "dq_score_internal_error":        8,  # no longer used in short-circuit — internal errors now go through LLM with floor 8
     "dq_score_json_parse_error":      4,
     "dq_score_advance_only":          2,
@@ -87,7 +87,7 @@ _config: dict[str, float] | None = None
 
 def _load_from_supabase() -> dict[str, float]:
     """Fetch all rows from json_risk_agent_config and return as a dict."""
-    client: Client = create_client(settings.SUPABASE_URL, settings.SUPABASE_SERVICE_ROLE_KEY)
+    client: Client = create_client(settings.SUPABASE_URL, settings.SUPABASE_KEY)
     result = client.table("json_risk_agent_config").select("key, value").execute()
     loaded = {row["key"]: float(row["value"]) for row in result.data}
     log.info("Loaded %d config params from json_risk_agent_config.", len(loaded))

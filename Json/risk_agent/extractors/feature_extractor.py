@@ -72,6 +72,10 @@ def classify_error(data_str: str) -> Optional[str]:
     try:
         d = json.loads(data_str)
         if isinstance(d, dict) and d.get("Error"):
+            error_msg = str(d["Error"]).lower()
+            # If the error is bank-page related, classify as bank_page_error (floor 9)
+            if any(kw in error_msg for kw in ["bank account page", "data has not been displayed", "bank page"]):
+                return "bank_page_error"
             return "scraper_error"
     except (json.JSONDecodeError, TypeError):
         pass

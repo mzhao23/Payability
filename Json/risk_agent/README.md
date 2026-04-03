@@ -144,12 +144,12 @@ Hard rules represent clear, directional risk signals. Each hard rule sets the sc
 | `LATE_SHIPMENT_RATE` | LSR > 4% AND fbm_orders_60 ≥ 20 AND fbm_ratio ≥ 10% | 8 |
 | `NEG_FEEDBACK_TREND` | 30d neg rate ≥ 10pp above 60d window (min 10 orders) | 7 |
 | ~~`POLICY_COMPLIANCE_INCREASE`~~ | *Temporarily disabled — violations not distinguished by health impact* | 7 |
-| `ACCOUNT_LEVEL_RESERVE` | Reserve/revenue ratio increased ≥ 50% vs 90-day average (closed statements only, gross revenue ≥ $200) | 7 |
+| `ACCOUNT_LEVEL_RESERVE` | Reserve/revenue ratio increased ≥ 50% vs 90-day average (closed statements only, gross revenue ≥ $200) | 9 |
 | `ACC_DEACTIVATION` | Account at risk of deactivation notification on report date or previous day | 9 |
 | `NEGATIVE_DEPOSIT` | Most recent closed statement has negative Deposit Total (Amazon charging seller) | 7 |
-| `NEGATIVE_DEPOSIT` | ≥ 2 consecutive closed statements with negative Deposit Total | 8 |
-| `INV_CREDIT_CARD` | Credit card update required notification on report date or previous day | 8 |
-| `FAILED_DISBURSEMENT` | Most recent closed statement is a failed disbursement within 3 days of report date | 7 |
+| `NEGATIVE_DEPOSIT` | ≥ 2 consecutive closed statements with negative Deposit Total | 9 |
+| `INV_CREDIT_CARD` | Credit card update required notification on report date or previous day | 9 |
+| `FAILED_DISBURSEMENT` | Most recent closed statement is a failed disbursement within 3 days of report date | 9 |
 
 ### Soft Rules — additive penalty points
 Soft rules add penalty points to the score. They represent weaker signals that are only meaningful in combination.
@@ -216,7 +216,7 @@ If the data collection returned an error flag, the supplier is scored directly �
 | `scraper_error` | 8 |
 | `not_authorized` | 8 |
 | `login_error` / `wrong_password` | 7 |
-| `bank_page_error` | 8 |
+| `bank_page_error` | 9 |
 | `json_parse_error` | 4 |
 | `advance_only` / `onboarding_only` | 2 |
 
